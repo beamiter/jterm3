@@ -71,7 +71,11 @@ fn main() -> iced::Result {
         .title(Jterm::title)
         .subscription(Jterm::subscription)
         .theme(Jterm::iced_theme)
-        .antialiasing(true)
+        // MSAA forces wgpu down the multisample path; on Intel/Mesa that triggers
+        // the "manual shader clears for srgb textures" path, which flashes the whole
+        // surface on heavy redraws (e.g. multi-line `ls` output). Glyph and quad
+        // rendering don't benefit from geometry MSAA, so disabling it is free here.
+        .antialiasing(false)
         .window(win)
         .run()
 }

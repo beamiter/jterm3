@@ -2963,10 +2963,6 @@ impl TerminalState {
 
     fn scroll_down(&mut self) {
         if self.grid.rows() > 0 {
-            crate::debug_log!(
-                "[SCROLL] scroll_down() in buffer (alt={})",
-                self.use_alt_buffer
-            );
             let bg_color = self.current_bg;
             let blank_cell = TerminalCell {
                 character: ' ',
