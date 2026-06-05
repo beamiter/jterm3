@@ -893,6 +893,85 @@ impl Theme {
         Color::from_rgb8(rgb[0], rgb[1], rgb[2])
     }
 
+    /// `[r,g,b]` → `"#RRGGBB"` 大写十六进制。
+    pub fn rgb_to_hex(rgb: [u8; 3]) -> String {
+        format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
+    }
+
+    /// 解析 `"#RRGGBB"` 或 `"RRGGBB"`（忽略大小写/前导 #）为 `[r,g,b]`。
+    pub fn hex_to_rgb(s: &str) -> Option<[u8; 3]> {
+        let h = s.trim().trim_start_matches('#');
+        if h.len() != 6 {
+            return None;
+        }
+        let r = u8::from_str_radix(&h[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&h[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&h[4..6], 16).ok()?;
+        Some([r, g, b])
+    }
+
+    /// 可编辑终端调色板的标签（顺序与 hex 缓冲区索引一一对应）。
+    /// 0=前景 1=背景 2=光标，3..=ANSI 0..15。
+    pub fn editable_color_labels() -> Vec<&'static str> {
+        vec![
+            "Foreground",
+            "Background",
+            "Cursor",
+            "ANSI 0 (black)",
+            "ANSI 1 (red)",
+            "ANSI 2 (green)",
+            "ANSI 3 (yellow)",
+            "ANSI 4 (blue)",
+            "ANSI 5 (magenta)",
+            "ANSI 6 (cyan)",
+            "ANSI 7 (white)",
+            "ANSI 8 (br black)",
+            "ANSI 9 (br red)",
+            "ANSI 10 (br green)",
+            "ANSI 11 (br yellow)",
+            "ANSI 12 (br blue)",
+            "ANSI 13 (br magenta)",
+            "ANSI 14 (br cyan)",
+            "ANSI 15 (br white)",
+        ]
+    }
+
+    /// 以编辑顺序导出当前调色板的 hex 字符串（与 [`editable_color_labels`] 对齐）。
+    pub fn editable_color_hexes(&self) -> Vec<String> {
+        let mut v = Vec::with_capacity(19);
+        v.push(Self::rgb_to_hex(self.terminal.foreground));
+        v.push(Self::rgb_to_hex(self.terminal.background));
+        v.push(Self::rgb_to_hex(self.terminal.cursor));
+        for c in &self.terminal.ansi_colors {
+            v.push(Self::rgb_to_hex(*c));
+        }
+        v
+    }
+
+    /// 将编辑索引处的颜色写入对应字段；越界或非法 hex 时返回 false。
+    pub fn set_editable_color(&mut self, index: usize, hex: &str) -> bool {
+        let Some(rgb) = Self::hex_to_rgb(hex) else {
+            return false;
+        };
+        match index {
+            0 => self.terminal.foreground = rgb,
+            1 => self.terminal.background = rgb,
+            2 => self.terminal.cursor = rgb,
+            3..=18 => self.terminal.ansi_colors[index - 3] = rgb,
+            _ => return false,
+        }
+        true
+    }
+
+    /// 自定义主题名（用于选择器，排除内置同名）。
+    pub fn custom_theme_names() -> Vec<String> {
+        Self::load_custom_themes()
+            .into_iter()
+            .map(|t| t.name)
+            .filter(|n| !Self::is_builtin(n))
+            .collect()
+    }
+
     /// 将 RGBA 数组转换为 iced::Color
     #[allow(dead_code)]
     pub fn rgba_to_color32(rgba: [u8; 4]) -> Color {

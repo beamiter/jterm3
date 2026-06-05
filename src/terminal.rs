@@ -3353,12 +3353,21 @@ impl TerminalState {
             let cols = self.grid.row_len();
             let total_rows = scrollback_len + grid_rows;
 
+            let block = matches!(sel.mode, SelectionMode::Block);
             for abs_row in start.0..=end.0.min(total_rows.saturating_sub(1)) {
-                let start_col = if abs_row == start.0 { start.1 } else { 0 };
-                let end_col = if abs_row == end.0 {
-                    end.1.min(cols.saturating_sub(1))
+                let (start_col, end_col) = if block {
+                    // Rectangular: same column span on every row.
+                    let lo = sel.anchor.1.min(sel.active.1);
+                    let hi = sel.anchor.1.max(sel.active.1);
+                    (lo, hi.min(cols.saturating_sub(1)))
                 } else {
-                    cols.saturating_sub(1)
+                    let s = if abs_row == start.0 { start.1 } else { 0 };
+                    let e = if abs_row == end.0 {
+                        end.1.min(cols.saturating_sub(1))
+                    } else {
+                        cols.saturating_sub(1)
+                    };
+                    (s, e)
                 };
 
                 if abs_row < scrollback_len {

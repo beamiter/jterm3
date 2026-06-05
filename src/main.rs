@@ -8,7 +8,10 @@ mod kitty_graphics;
 mod link;
 mod pty;
 mod search;
+mod search_replace;
+mod scripting;
 mod session_persistence;
+mod sidebar;
 mod terminal;
 mod terminal_view;
 mod theme;
@@ -18,7 +21,8 @@ use std::sync::Arc;
 
 use config::Config;
 use iced::widget::{
-    button, column, container, pick_list, row, scrollable, slider, stack, text, Space,
+    button, checkbox, column, container, pick_list, row, scrollable, slider, stack, text,
+    text_input, Space,
 };
 use iced::{keyboard, Element, Length, Size, Subscription, Task};
 use pty::Pty;
@@ -40,6 +44,20 @@ enum SplitMode {
     Vertical,
     /// Two panes stacked (top / bottom).
     Horizontal,
+}
+
+/// Resolve the terminal font from the configured family name. iced resolves
+/// system-installed families by name (via cosmic-text); an empty name or a
+/// missing family falls back to the built-in monospace font. The name is leaked
+/// because `iced::Font::with_name` requires `&'static str`; family changes are
+/// rare so the leak is negligible.
+fn resolve_mono_font(family: &str) -> iced::Font {
+    let f = family.trim();
+    if f.is_empty() {
+        iced::Font::MONOSPACE
+    } else {
+        iced::Font::with_name(Box::leak(f.to_string().into_boxed_str()))
+    }
 }
 
 fn main() -> iced::Result {
@@ -82,11 +100,29 @@ enum Message {
     SetPadding(f32),
     SetScrollback(u32),
     SetScrollSpeed(u32),
+    SetFontFamily(String),
+    SetScrollbarAlways(bool),
+    ThemeEditOpen,
+    ThemeEditClose,
+    ThemeEditName(String),
+    ThemeEditColor(usize, String),
+    ThemeEditSave,
+    ThemeDelete(String),
     ConfigSave,
     ConfigReset,
     ConfigTick,
     ToggleHelp,
     ToggleDebug,
+}
+
+/// In-progress custom theme being edited in the theme editor overlay. UI-chrome
+/// colors are inherited from `base`; only the terminal palette is editable here.
+struct ThemeEditState {
+    base: Theme,
+    name: String,
+    /// Hex buffers aligned with `Theme::editable_color_labels()` (19 entries).
+    hexes: Vec<String>,
+    error: Option<String>,
 }
 
 /// A single terminal session: its own PTY child and terminal state.
@@ -205,6 +241,13 @@ struct Jterm {
     panes: Vec<usize>,
     /// Which pane currently has keyboard focus (index into `panes`).
     focused_pane: usize,
+    /// Active custom-theme editor overlay, or `None` when closed.
+    theme_editor: Option<ThemeEditState>,
+    /// Held for the process lifetime to enforce single-instance behavior. When
+    /// `None`, another instance already holds the lock and this one runs fresh
+    /// (no session restore, no snapshot writes) to avoid clobbering its history.
+    _instance_lock: Option<std::fs::File>,
+    is_first_instance: bool,
 }
 
 impl Jterm {
@@ -217,9 +260,20 @@ impl Jterm {
         let win_size = Size::new(config.initial_width, config.initial_height);
         let config_mtime = Config::config_mtime();
 
-        // Restore prior tabs (their cwds + active index) when enabled; otherwise
-        // start with a single default session.
-        let (sessions, active, next_id) = Self::restore_or_spawn(&config, cols, rows);
+        // Single-instance lock: a second instance starts fresh and never writes
+        // the session snapshot, so it cannot clobber the first instance's history.
+        let instance_lock = session_persistence::try_acquire_instance_lock();
+        let is_first_instance = instance_lock.is_some();
+        if !is_first_instance {
+            eprintln!("[SessionPersistence] Another instance is running, starting fresh");
+        }
+
+        let mono = resolve_mono_font(&config.font_family);
+
+        // Restore prior tabs (their cwds + active index) when enabled and we are
+        // the first instance; otherwise start with a single default session.
+        let (sessions, active, next_id) =
+            Self::restore_or_spawn(&config, cols, rows, is_first_instance);
 
         let app = Jterm {
             config,
@@ -232,7 +286,7 @@ impl Jterm {
             rows,
             focused: true,
             modifiers: keyboard::Modifiers::default(),
-            mono: iced::Font::MONOSPACE,
+            mono,
             search: search::SearchState::new(),
             palette: command_palette::PaletteState::new(),
             config_panel_open: false,
@@ -248,6 +302,9 @@ impl Jterm {
             split_mode: SplitMode::Single,
             panes: vec![active],
             focused_pane: 0,
+            theme_editor: None,
+            _instance_lock: instance_lock,
+            is_first_instance,
         };
         (app, Task::none())
     }
@@ -277,6 +334,7 @@ impl Jterm {
     /// re-resolve the theme, rebuild metrics, and regrid every session.
     fn apply_config(&mut self) {
         self.theme = Theme::get_theme(&self.config.theme).unwrap_or_default();
+        self.mono = resolve_mono_font(&self.config.font_family);
         self.metrics = Metrics::new(
             self.config.font_size,
             self.config.line_spacing,
@@ -312,13 +370,14 @@ impl Jterm {
         config: &Config,
         cols: usize,
         rows: usize,
+        is_first_instance: bool,
     ) -> (Vec<Session>, usize, usize) {
         let default = |id_start: usize| {
             let s = Session::spawn(config, id_start, cols, rows, None)
                 .expect("failed to spawn PTY");
             (vec![s], 0usize, id_start + 1)
         };
-        if !config.restore_session {
+        if !config.restore_session || !is_first_instance {
             return default(0);
         }
         let Ok(path) = Config::session_history_path() else {
@@ -356,7 +415,7 @@ impl Jterm {
     /// Persist the current tabs (live cwd of each + active index) when enabled.
     /// De-duplicated against the last write to avoid redundant disk churn.
     fn save_session_snapshot(&mut self) {
-        if !self.config.restore_session {
+        if !self.config.restore_session || !self.is_first_instance {
             return;
         }
         let snaps: Vec<session_persistence::SessionSnapshot> = self
@@ -908,7 +967,12 @@ impl Jterm {
             return None;
         }
         if let Key::Named(Named::Escape) = key {
-            self.config_panel_open = false;
+            // Esc backs out of the theme editor first, then the panel itself.
+            if self.theme_editor.is_some() {
+                self.theme_editor = None;
+            } else {
+                self.config_panel_open = false;
+            }
         }
         Some(Task::none())
     }
@@ -1196,6 +1260,88 @@ impl Jterm {
             Message::SetScrollSpeed(v) => {
                 self.config.scroll_speed = Config::clamp_scroll_speed(v);
             }
+            Message::SetFontFamily(name) => {
+                self.config.font_family = name;
+                self.apply_config();
+            }
+            Message::SetScrollbarAlways(always) => {
+                self.config.scrollbar_visibility = if always {
+                    config::ScrollbarVisibility::Always
+                } else {
+                    config::ScrollbarVisibility::Auto
+                };
+            }
+            Message::ThemeEditOpen => {
+                // Seed the editor from the current theme; suggest a fresh name so
+                // saving doesn't silently overwrite a builtin.
+                let base = self.theme.clone();
+                let suggested = if Theme::is_builtin(&base.name) {
+                    format!("{}-custom", base.name)
+                } else {
+                    base.name.clone()
+                };
+                let hexes = base.editable_color_hexes();
+                self.theme_editor = Some(ThemeEditState {
+                    base,
+                    name: suggested,
+                    hexes,
+                    error: None,
+                });
+            }
+            Message::ThemeEditClose => {
+                self.theme_editor = None;
+            }
+            Message::ThemeEditName(name) => {
+                if let Some(ed) = &mut self.theme_editor {
+                    ed.name = name;
+                }
+            }
+            Message::ThemeEditColor(idx, hex) => {
+                if let Some(ed) = &mut self.theme_editor {
+                    if let Some(slot) = ed.hexes.get_mut(idx) {
+                        *slot = hex;
+                    }
+                }
+            }
+            Message::ThemeEditSave => {
+                if let Some(ed) = &mut self.theme_editor {
+                    let name = ed.name.trim().to_string();
+                    if name.is_empty() {
+                        ed.error = Some("Name cannot be empty".to_string());
+                    } else if Theme::is_builtin(&name) {
+                        ed.error = Some("Name collides with a builtin theme".to_string());
+                    } else if let Some(bad) =
+                        ed.hexes.iter().position(|h| Theme::hex_to_rgb(h).is_none())
+                    {
+                        let labels = Theme::editable_color_labels();
+                        ed.error =
+                            Some(format!("Invalid hex for {}", labels[bad]));
+                    } else {
+                        let mut theme = ed.base.clone();
+                        theme.name = name.clone();
+                        for (i, h) in ed.hexes.iter().enumerate() {
+                            theme.set_editable_color(i, h);
+                        }
+                        match theme.save_custom_theme() {
+                            Ok(()) => {
+                                self.config.theme = name;
+                                self.theme_editor = None;
+                                self.apply_config();
+                            }
+                            Err(e) => {
+                                ed.error = Some(format!("Save failed: {}", e));
+                            }
+                        }
+                    }
+                }
+            }
+            Message::ThemeDelete(name) => {
+                let _ = Theme::delete_custom_theme(&name);
+                if self.config.theme == name {
+                    self.config.theme = "dark".to_string();
+                    self.apply_config();
+                }
+            }
             Message::ConfigSave => {
                 let _ = self.config.save();
                 self.config_mtime = Config::config_mtime();
@@ -1395,6 +1541,10 @@ impl Jterm {
             sess.terminal.scrollback_len(),
         )
         .modifiers(self.modifiers.shift(), self.modifiers.alt())
+        .scrollbar_always(matches!(
+            self.config.scrollbar_visibility,
+            config::ScrollbarVisibility::Always
+        ))
         .search(search_matches, current)
         .links(links)
         .images(images)
@@ -1449,7 +1599,12 @@ impl Jterm {
         };
         let body = container(panes_body).width(Length::Fill).height(Length::Fill);
         let body: Element<'_, Message> = if self.config_panel_open {
-            stack![body, self.config_panel()].into()
+            let overlay = if self.theme_editor.is_some() {
+                self.theme_editor_view()
+            } else {
+                self.config_panel()
+            };
+            stack![body, overlay].into()
         } else if self.palette.is_open {
             stack![body, self.command_palette()].into()
         } else if self.search.is_open {
@@ -1588,15 +1743,45 @@ impl Jterm {
     /// Centered settings overlay (Ctrl+Shift+O). Controls live-apply on change;
     /// Save persists to disk, Reset restores defaults.
     fn config_panel(&self) -> Element<'_, Message> {
-        let themes: Vec<String> = Theme::available_themes()
+        let mut themes: Vec<String> = Theme::available_themes()
             .into_iter()
             .map(|s| s.to_string())
             .collect();
+        themes.extend(Theme::custom_theme_names());
         let current_theme = Some(self.config.theme.clone());
+        let is_custom = !Theme::is_builtin(&self.config.theme);
 
-        let theme_row = row![
+        let mut theme_row = row![
             text("Theme").size(13).width(Length::Fixed(120.0)),
             pick_list(themes, current_theme, Message::SetTheme).text_size(13),
+            button(text("Edit…").size(13)).on_press(Message::ThemeEditOpen),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+        if is_custom {
+            theme_row = theme_row.push(
+                button(text("Delete").size(13))
+                    .on_press(Message::ThemeDelete(self.config.theme.clone()))
+                    .style(button::danger),
+            );
+        }
+
+        // Monospace families detected via fc-list (cached, scanned on first open).
+        // Ensure the configured family is present so the pick_list shows it.
+        let mut fonts: Vec<String> = Config::get_monospace_fonts().clone();
+        if !self.config.font_family.trim().is_empty()
+            && !fonts.iter().any(|f| f == &self.config.font_family)
+        {
+            fonts.insert(0, self.config.font_family.clone());
+        }
+        let font_family_row = row![
+            text("Font").size(13).width(Length::Fixed(120.0)),
+            pick_list(
+                fonts,
+                Some(self.config.font_family.clone()),
+                Message::SetFontFamily
+            )
+            .text_size(13),
         ]
         .spacing(10)
         .align_y(iced::Alignment::Center);
@@ -1640,6 +1825,18 @@ impl Jterm {
                 .step(1u32)
                 .into(),
         );
+        let scrollbar_row = row![
+            text("Scrollbar").size(13).width(Length::Fixed(120.0)),
+            checkbox(matches!(
+                self.config.scrollbar_visibility,
+                config::ScrollbarVisibility::Always
+            ))
+            .label("Always show")
+            .text_size(13)
+            .on_toggle(Message::SetScrollbarAlways),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
 
         let buttons = row![
             button(text("Save").size(13)).on_press(Message::ConfigSave),
@@ -1660,11 +1857,13 @@ impl Jterm {
             column![
                 text("Settings").size(18),
                 theme_row,
+                font_family_row,
                 font_size,
                 line_spacing,
                 padding,
                 scrollback,
                 scroll_speed,
+                scrollbar_row,
                 buttons,
                 footer,
             ]
@@ -1674,6 +1873,86 @@ impl Jterm {
         .max_height(480.0)
         .padding(16)
         .style(container::dark);
+        container(inner)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into()
+    }
+
+    /// Custom-theme editor overlay: name field plus a hex input per terminal
+    /// palette color, with a live swatch. UI-chrome colors are inherited from the
+    /// theme the editor was opened on.
+    fn theme_editor_view(&self) -> Element<'_, Message> {
+        let Some(ed) = &self.theme_editor else {
+            return Space::new().into();
+        };
+        let labels = Theme::editable_color_labels();
+
+        let name_row = row![
+            text("Name").size(13).width(Length::Fixed(150.0)),
+            text_input("theme name", &ed.name)
+                .on_input(Message::ThemeEditName)
+                .size(13),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+
+        let mut list = column![].spacing(6);
+        for (i, label) in labels.iter().enumerate() {
+            let hex = ed.hexes.get(i).cloned().unwrap_or_default();
+            // Live swatch when the hex parses, else a neutral placeholder.
+            let swatch_color = Theme::hex_to_rgb(&hex)
+                .map(Theme::rgb_to_color32)
+                .unwrap_or(iced::Color::from_rgb(0.3, 0.3, 0.3));
+            let swatch = container(Space::new())
+                .width(Length::Fixed(22.0))
+                .height(Length::Fixed(22.0))
+                .style(move |_| container::Style {
+                    background: Some(swatch_color.into()),
+                    border: iced::Border {
+                        color: iced::Color::from_rgb(0.5, 0.5, 0.5),
+                        width: 1.0,
+                        radius: 3.0.into(),
+                    },
+                    ..Default::default()
+                });
+            let r = row![
+                text(*label).size(12).width(Length::Fixed(150.0)),
+                swatch,
+                text_input("#RRGGBB", &hex)
+                    .on_input(move |s| Message::ThemeEditColor(i, s))
+                    .size(12)
+                    .width(Length::Fixed(110.0)),
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center);
+            list = list.push(r);
+        }
+
+        let buttons = row![
+            button(text("Save").size(13)).on_press(Message::ThemeEditSave),
+            button(text("Cancel").size(13))
+                .on_press(Message::ThemeEditClose)
+                .style(button::secondary),
+        ]
+        .spacing(8);
+
+        let mut content = column![
+            text("Theme Editor").size(18),
+            name_row,
+            scrollable(list).height(Length::Fixed(300.0)),
+        ]
+        .spacing(12);
+        if let Some(err) = &ed.error {
+            content = content.push(text(err.clone()).size(12).style(text::danger));
+        }
+        content = content.push(buttons);
+
+        let inner = container(content)
+            .width(Length::Fixed(420.0))
+            .max_height(560.0)
+            .padding(16)
+            .style(container::dark);
         container(inner)
             .center_x(Length::Fill)
             .center_y(Length::Fill)

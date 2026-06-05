@@ -54,3 +54,32 @@ impl SessionsSnapshot {
         Ok(serde_json::from_str(&content)?)
     }
 }
+
+/// 尝试获取单实例锁。成功返回持锁的 `File`（需在进程生命周期内持有），
+/// 失败（已有实例运行）返回 `None`。端口自 jterm2 `try_acquire_instance_lock`。
+pub fn try_acquire_instance_lock() -> Option<std::fs::File> {
+    let lock_path = dirs::config_dir()?.join("jterm3").join("instance.lock");
+    if let Some(parent) = lock_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&lock_path)
+        .ok()?;
+
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    // LOCK_EX | LOCK_NB: 非阻塞排他锁。fd 来自有效的 File，生命周期覆盖本次调用。
+    let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if ret == 0 {
+        use std::io::Write;
+        let mut f = &file;
+        let _ = write!(f, "{}", std::process::id());
+        Some(file)
+    } else {
+        None
+    }
+}

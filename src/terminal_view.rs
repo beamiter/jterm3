@@ -144,6 +144,9 @@ pub struct TermWidget<'a, Message> {
     links: Vec<crate::link::Link>,
     /// Kitty-graphics placements to paint over the grid.
     images: Vec<KittyRender>,
+    /// When false (Auto), the scrollbar is only drawn while scrolled up; when
+    /// true (Always), it is drawn whenever scrollback exists.
+    scrollbar_always: bool,
 }
 
 impl<'a, Message> TermWidget<'a, Message> {
@@ -178,7 +181,15 @@ impl<'a, Message> TermWidget<'a, Message> {
             on_mouse: None,
             links: Vec::new(),
             images: Vec::new(),
+            scrollbar_always: true,
         }
+    }
+
+    /// Set scrollbar visibility: `true` = always shown, `false` = auto (only
+    /// while scrolled up).
+    pub fn scrollbar_always(mut self, always: bool) -> Self {
+        self.scrollbar_always = always;
+        self
     }
 
     /// Supply detected links to color, underline, and make clickable.
@@ -211,6 +222,10 @@ impl<'a, Message> TermWidget<'a, Message> {
     /// scroll. Returns `(track_top, track_h, x, thumb_y, thumb_h)`.
     fn scrollbar_geometry(&self, bounds: Rectangle) -> Option<(f32, f32, f32, f32, f32)> {
         if self.scrollback_len == 0 {
+            return None;
+        }
+        // Auto mode: only reveal the scrollbar while scrolled up into history.
+        if !self.scrollbar_always && self.scroll_offset == 0 {
             return None;
         }
         let pad = self.metrics.padding;
