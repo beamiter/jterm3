@@ -85,6 +85,9 @@ enum Message {
     PtyOutput(RawFd, Vec<u8>),
     PtyExited(RawFd, i32),
     Key(keyboard::Event),
+    /// An input-method (IME) composition event: open/close, pre-edit updates,
+    /// and committed text.
+    Ime(iced::advanced::input_method::Event),
     ModifiersChanged(keyboard::Modifiers),
     /// A mouse interaction within pane `usize` (index into `panes`).
     MousePane(usize, MouseInput),
@@ -1157,6 +1160,32 @@ impl Jterm {
                     }
                 }
             }
+            Message::Ime(event) => {
+                use iced::advanced::input_method::Event as Ime;
+                let Some(sess) = self.sessions.get_mut(self.active) else {
+                    return Task::none();
+                };
+                match event {
+                    Ime::Opened => {
+                        sess.terminal.ime_enabled = true;
+                    }
+                    Ime::Closed => {
+                        sess.terminal.ime_enabled = false;
+                        sess.terminal.clear_preedit();
+                        sess.refresh();
+                    }
+                    Ime::Preedit(content, selection) => {
+                        sess.terminal.set_preedit(content, selection);
+                        sess.refresh();
+                    }
+                    Ime::Commit(text) => {
+                        sess.terminal.clear_preedit();
+                        sess.terminal.scroll_to_bottom();
+                        sess.write_pty(text.as_bytes());
+                        sess.refresh();
+                    }
+                }
+            }
             Message::ModifiersChanged(mods) => {
                 self.modifiers = mods;
             }
@@ -1552,6 +1581,14 @@ impl Jterm {
         .search(search_matches, current)
         .links(links)
         .images(images)
+        .preedit(if focused && !sess.terminal.preedit_text.is_empty() {
+            Some((
+                sess.terminal.preedit_text.clone(),
+                sess.terminal.preedit_selection.clone(),
+            ))
+        } else {
+            None
+        })
         .on_mouse(move |inp| Message::MousePane(pane_pos, inp))
         .into()
     }
@@ -2104,6 +2141,7 @@ impl Jterm {
                 Some(Message::ModifiersChanged(m))
             }
             iced::Event::Keyboard(k) => Some(Message::Key(k)),
+            iced::Event::InputMethod(ime) => Some(Message::Ime(ime)),
             iced::Event::Window(iced::window::Event::Resized(size)) => {
                 Some(Message::Resized(size))
             }

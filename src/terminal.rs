@@ -843,7 +843,9 @@ pub struct TerminalState {
     // IME support
     pub ime_enabled: bool,
     pub preedit_text: String,
-    pub preedit_cursor: usize,
+    /// Byte range within `preedit_text` the IME marks as the active cursor /
+    /// selection, used to highlight it in the over-the-spot overlay.
+    pub preedit_selection: Option<std::ops::Range<usize>>,
 
     modes: TerminalModes,
 
@@ -971,7 +973,7 @@ impl TerminalState {
             active_charset: Charset::Ascii,
             ime_enabled: false,
             preedit_text: String::new(),
-            preedit_cursor: 0,
+            preedit_selection: None,
             scroll_region_top: 0,
             scroll_region_bottom: rows.saturating_sub(1),
             modes,
@@ -3547,14 +3549,14 @@ impl TerminalState {
     }
 
     // IME support methods
-    pub fn set_preedit(&mut self, text: String, cursor: usize) {
+    pub fn set_preedit(&mut self, text: String, selection: Option<std::ops::Range<usize>>) {
         self.preedit_text = text;
-        self.preedit_cursor = cursor;
+        self.preedit_selection = selection;
     }
 
     pub fn clear_preedit(&mut self) {
         self.preedit_text.clear();
-        self.preedit_cursor = 0;
+        self.preedit_selection = None;
     }
 }
 

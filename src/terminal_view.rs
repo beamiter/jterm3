@@ -9,6 +9,7 @@ use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer::{self, Quad};
 use iced::advanced::text::{self, Text};
 use iced::advanced::widget::{tree, Tree, Widget};
+use iced::advanced::input_method::{self, InputMethod};
 use iced::advanced::{Clipboard, Shell};
 use iced::mouse;
 use iced::{
@@ -147,6 +148,10 @@ pub struct TermWidget<'a, Message> {
     /// When false (Auto), the scrollbar is only drawn while scrolled up; when
     /// true (Always), it is drawn whenever scrollback exists.
     scrollbar_always: bool,
+    /// Active IME pre-edit (composition) text plus the byte range the IME marks
+    /// as its cursor/selection. Supplied to the runtime each redraw so it can
+    /// paint the over-the-spot composition overlay at the terminal cursor.
+    preedit: Option<(String, Option<std::ops::Range<usize>>)>,
 }
 
 impl<'a, Message> TermWidget<'a, Message> {
@@ -182,7 +187,15 @@ impl<'a, Message> TermWidget<'a, Message> {
             links: Vec::new(),
             images: Vec::new(),
             scrollbar_always: true,
+            preedit: None,
         }
+    }
+
+    /// Supply the active IME pre-edit so the runtime can render the composition
+    /// overlay and keep the input method enabled while this pane is focused.
+    pub fn preedit(mut self, preedit: Option<(String, Option<std::ops::Range<usize>>)>) -> Self {
+        self.preedit = preedit;
+        self
     }
 
     /// Set scrollbar visibility: `true` = always shown, `false` = auto (only
@@ -333,10 +346,41 @@ where
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
+        let bounds = layout.bounds();
+
+        // Keep the input method enabled and positioned at the text cursor while
+        // this pane is focused. The runtime only honors the request during a
+        // RedrawRequested, and renders any supplied pre-edit as an over-the-spot
+        // overlay anchored to `cursor`.
+        if self.focused {
+            if let Event::Window(iced::window::Event::RedrawRequested(_)) = event {
+                let pad = self.metrics.padding;
+                let (col, row) = self.cursor;
+                let cursor_rect = Rectangle::new(
+                    Point::new(
+                        bounds.x + pad + col as f32 * self.metrics.cell_w,
+                        bounds.y + pad + row as f32 * self.metrics.cell_h,
+                    ),
+                    Size::new(self.metrics.cell_w, self.metrics.cell_h),
+                );
+                let preedit = self.preedit.as_ref().map(|(content, selection)| {
+                    input_method::Preedit {
+                        content: content.as_str(),
+                        selection: selection.clone(),
+                        text_size: Some(Pixels(self.metrics.font_size)),
+                    }
+                });
+                shell.request_input_method(&InputMethod::Enabled {
+                    cursor: cursor_rect,
+                    purpose: input_method::Purpose::Terminal,
+                    preedit,
+                });
+            }
+        }
+
         let Some(on_mouse) = self.on_mouse.as_ref() else {
             return;
         };
-        let bounds = layout.bounds();
         let state = tree.state.downcast_mut::<State>();
 
         match event {
