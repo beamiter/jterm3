@@ -135,14 +135,14 @@ pub struct TermWidget<'a, Message> {
     scroll_offset: usize,
     scrollback_len: usize,
     /// Search matches in visible-grid coordinates (line = grid row index).
-    search_matches: Vec<SearchMatch>,
+    search_matches: &'a [SearchMatch],
     /// Identity `(line, col_start)` of the active match, highlighted distinctly.
     current_match: Option<(usize, usize)>,
     shift: bool,
     alt: bool,
     on_mouse: Option<Box<dyn Fn(MouseInput) -> Message + 'a>>,
     /// Detected clickable links in visible-grid coordinates (line = grid row).
-    links: Vec<crate::link::Link>,
+    links: &'a [crate::link::Link],
     /// Kitty-graphics placements to paint over the grid.
     images: Vec<KittyRender>,
     /// When false (Auto), the scrollbar is only drawn while scrolled up; when
@@ -179,12 +179,12 @@ impl<'a, Message> TermWidget<'a, Message> {
             selection,
             scroll_offset,
             scrollback_len,
-            search_matches: Vec::new(),
+            search_matches: &[],
             current_match: None,
             shift: false,
             alt: false,
             on_mouse: None,
-            links: Vec::new(),
+            links: &[],
             images: Vec::new(),
             scrollbar_always: true,
             preedit: None,
@@ -206,7 +206,7 @@ impl<'a, Message> TermWidget<'a, Message> {
     }
 
     /// Supply detected links to color, underline, and make clickable.
-    pub fn links(mut self, links: Vec<crate::link::Link>) -> Self {
+    pub fn links(mut self, links: &'a [crate::link::Link]) -> Self {
         self.links = links;
         self
     }
@@ -225,7 +225,7 @@ impl<'a, Message> TermWidget<'a, Message> {
     }
 
     /// Supply search matches (and the active match identity) to highlight.
-    pub fn search(mut self, matches: Vec<SearchMatch>, current: Option<(usize, usize)>) -> Self {
+    pub fn search(mut self, matches: &'a [SearchMatch], current: Option<(usize, usize)>) -> Self {
         self.search_matches = matches;
         self.current_match = current;
         self
@@ -526,6 +526,21 @@ where
         // Whole-widget background.
         renderer.fill_quad(solid_quad(bounds), Background::Color(default_bg));
 
+        // Bucket links by visible row so the per-cell hit test scans only the
+        // links on that row instead of the whole list. Skipped entirely (no
+        // allocation) in the common case where no links are present.
+        let links_by_row: Vec<Vec<&crate::link::Link>> = if self.links.is_empty() {
+            Vec::new()
+        } else {
+            let mut buckets: Vec<Vec<&crate::link::Link>> = vec![Vec::new(); self.grid.len()];
+            for l in self.links {
+                if l.line < buckets.len() {
+                    buckets[l.line].push(l);
+                }
+            }
+            buckets
+        };
+
         for (row_idx, row) in self.grid.iter().enumerate() {
             let y = oy + row_idx as f32 * ch;
 
@@ -606,13 +621,53 @@ where
                 }
             }
 
-            // Glyphs + decorations.
+            // Glyphs + decorations. Consecutive narrow cells sharing a foreground
+            // color are coalesced into a single shaped text run, which slashes the
+            // number of per-frame String allocations and text-shaping calls. Runs
+            // break on color changes, spaces, wide glyphs, and links so each run
+            // starts at an exact cell origin — drift from approximate cell widths
+            // can never accumulate across a break.
+            let font = self.mono;
+            let font_size = self.metrics.font_size;
+            let mut run_text = String::new();
+            let mut run_len: usize = 0;
+            let mut run_fg = Color::TRANSPARENT;
+            let mut run_start = 0usize;
+            let emit_run = |renderer: &mut Renderer,
+                            text: &mut String,
+                            len: &mut usize,
+                            start: usize,
+                            fg: Color| {
+                if *len == 0 {
+                    return;
+                }
+                let rx = ox + start as f32 * cw;
+                renderer.fill_text(
+                    Text {
+                        content: std::mem::take(text),
+                        bounds: Size::new(cw * *len as f32, ch),
+                        size: Pixels(font_size),
+                        line_height: text::LineHeight::Absolute(Pixels(ch)),
+                        font,
+                        align_x: text::Alignment::Left,
+                        align_y: iced::alignment::Vertical::Center,
+                        shaping: text::Shaping::Advanced,
+                        wrapping: text::Wrapping::None,
+                    },
+                    Point::new(rx, y + ch / 2.0),
+                    fg,
+                    clip,
+                );
+                *len = 0;
+            };
+
             for (col_idx, cell) in row.iter().enumerate() {
                 if cell.flags.wide_continuation() {
                     continue;
                 }
                 let glyph = cell.character;
-                let span = if cell.flags.wide() { 2.0 } else { 1.0 };
+                let is_wide = cell.flags.wide();
+                let span = if is_wide { 2.0 } else { 1.0 };
                 let x = ox + col_idx as f32 * cw;
                 let mut fg = resolve_fg(
                     cell.foreground,
@@ -625,7 +680,11 @@ where
                 }
 
                 // Clickable links render blue (brighter when hovered) + underlined.
-                let is_link = self.link_at(col_idx, row_idx).is_some();
+                let row_links: &[&crate::link::Link] =
+                    links_by_row.get(row_idx).map(Vec::as_slice).unwrap_or(&[]);
+                let is_link = row_links
+                    .iter()
+                    .any(|l| col_idx >= l.col_start && col_idx < l.col_end);
                 if is_link {
                     let is_hovered = hovered.is_some_and(|h| {
                         h.line == row_idx && col_idx >= h.col_start && col_idx < h.col_end
@@ -637,23 +696,42 @@ where
                     };
                 }
 
-                if glyph != ' ' && glyph != '\0' {
-                    renderer.fill_text(
-                        Text {
-                            content: glyph.to_string(),
-                            bounds: Size::new(cw * span, ch),
-                            size: Pixels(self.metrics.font_size),
-                            line_height: text::LineHeight::Absolute(Pixels(ch)),
-                            font: self.mono,
-                            align_x: text::Alignment::Center,
-                            align_y: iced::alignment::Vertical::Center,
-                            shaping: text::Shaping::Advanced,
-                            wrapping: text::Wrapping::None,
-                        },
-                        Point::new(x + cw * span / 2.0, y + ch / 2.0),
-                        fg,
-                        clip,
-                    );
+                let printable = glyph != ' ' && glyph != '\0';
+
+                if printable && !is_wide {
+                    // Extend the current run, or flush and start a new one when the
+                    // color changes or the columns are no longer contiguous.
+                    if run_len != 0 && (fg != run_fg || col_idx != run_start + run_len) {
+                        emit_run(renderer, &mut run_text, &mut run_len, run_start, run_fg);
+                    }
+                    if run_len == 0 {
+                        run_start = col_idx;
+                        run_fg = fg;
+                    }
+                    run_text.push(glyph);
+                    run_len += 1;
+                } else {
+                    // Spaces and wide glyphs end any pending run; wide glyphs are
+                    // drawn individually, centered over their two-cell span.
+                    emit_run(renderer, &mut run_text, &mut run_len, run_start, run_fg);
+                    if printable {
+                        renderer.fill_text(
+                            Text {
+                                content: glyph.to_string(),
+                                bounds: Size::new(cw * span, ch),
+                                size: Pixels(font_size),
+                                line_height: text::LineHeight::Absolute(Pixels(ch)),
+                                font,
+                                align_x: text::Alignment::Center,
+                                align_y: iced::alignment::Vertical::Center,
+                                shaping: text::Shaping::Advanced,
+                                wrapping: text::Wrapping::None,
+                            },
+                            Point::new(x + cw * span / 2.0, y + ch / 2.0),
+                            fg,
+                            clip,
+                        );
+                    }
                 }
 
                 if is_link || cell.flags.underline() != UnderlineStyle::None {
@@ -679,6 +757,8 @@ where
                     );
                 }
             }
+            // Flush any run that reached the end of the row.
+            emit_run(renderer, &mut run_text, &mut run_len, run_start, run_fg);
         }
 
         // Cursor.

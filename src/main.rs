@@ -241,6 +241,16 @@ struct Jterm {
     kitty_handles: std::collections::HashMap<u32, (iced::advanced::image::Handle, usize)>,
     /// Last persisted session-snapshot JSON, to skip redundant disk writes.
     last_session_save: Option<String>,
+    /// Set when session state that feeds the snapshot may have changed (PTY
+    /// output can move the cwd, tab switches move the active index). The periodic
+    /// save is skipped while this is false, so a fully idle app does no per-tab
+    /// `readlink` or JSON serialization on every tick.
+    session_dirty: bool,
+    /// Diagnostics (Ctrl+Shift+G): wall-clock microseconds spent ingesting the
+    /// most recent PTY-output batch (parse + refresh) and its byte count, used
+    /// to derive a throughput figure for profiling.
+    last_ingest_us: u128,
+    last_ingest_bytes: usize,
     /// Current pane layout of the active view.
     split_mode: SplitMode,
     /// Session indices shown as panes (length 1 in `Single`, else 2). Invariant:
@@ -306,6 +316,9 @@ impl Jterm {
             links_cache_key: None,
             kitty_handles: std::collections::HashMap::new(),
             last_session_save: None,
+            session_dirty: true,
+            last_ingest_us: 0,
+            last_ingest_bytes: 0,
             split_mode: SplitMode::Single,
             panes: vec![active],
             focused_pane: 0,
@@ -422,6 +435,9 @@ impl Jterm {
     /// Persist the current tabs (live cwd of each + active index) when enabled.
     /// De-duplicated against the last write to avoid redundant disk churn.
     fn save_session_snapshot(&mut self) {
+        // Reconciling current state now; clear the dirty flag so an idle app does
+        // not re-walk every tab's cwd on each periodic tick.
+        self.session_dirty = false;
         if !self.config.restore_session || !self.is_first_instance {
             return;
         }
@@ -483,6 +499,7 @@ impl Jterm {
     fn next_session(&mut self) {
         if !self.sessions.is_empty() {
             self.active = (self.active + 1) % self.sessions.len();
+            self.session_dirty = true;
             self.unsplit();
         }
     }
@@ -490,6 +507,7 @@ impl Jterm {
     fn prev_session(&mut self) {
         if !self.sessions.is_empty() {
             self.active = (self.active + self.sessions.len() - 1) % self.sessions.len();
+            self.session_dirty = true;
             self.unsplit();
         }
     }
@@ -497,6 +515,7 @@ impl Jterm {
     fn jump_session(&mut self, index: usize) {
         if index < self.sessions.len() {
             self.active = index;
+            self.session_dirty = true;
             self.unsplit();
         }
     }
@@ -624,6 +643,12 @@ impl Jterm {
     ) -> Option<Task<Message>> {
         use keyboard::key::Named;
         use keyboard::Key;
+        // F12 toggles the diagnostics overlay (also reachable via Ctrl+Shift+G),
+        // checked before the Ctrl gate since it takes no modifier.
+        if matches!(key, Key::Named(Named::F12)) {
+            self.debug_open = !self.debug_open;
+            return Some(Task::none());
+        }
         if !mods.control() {
             return None;
         }
@@ -1105,11 +1130,17 @@ impl Jterm {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::PtyOutput(fd, data) => {
+                let t0 = std::time::Instant::now();
                 if let Some(sess) = self.session_by_fd(fd) {
                     sess.terminal.process_batch(&data);
                     sess.flush_responses();
                     sess.refresh();
                 }
+                self.last_ingest_us = t0.elapsed().as_micros();
+                self.last_ingest_bytes = data.len();
+                // Output may have moved the shell's cwd; let the next periodic
+                // tick reconcile the session snapshot.
+                self.session_dirty = true;
                 self.recompute_search();
             }
             Message::PtyExited(fd, _code) => {
@@ -1196,6 +1227,7 @@ impl Jterm {
                 if matches!(input, MouseInput::Press { .. }) && pane_pos < self.panes.len() {
                     self.focused_pane = pane_pos;
                     self.active = self.panes[pane_pos];
+                    self.session_dirty = true;
                 }
                 return self.handle_mouse(input);
             }
@@ -1402,8 +1434,11 @@ impl Jterm {
                     }
                 }
                 // Periodically persist tabs so a recent snapshot (with up-to-date
-                // cwds) survives even an abrupt exit. No-op when unchanged.
-                self.save_session_snapshot();
+                // cwds) survives even an abrupt exit. Only when something that
+                // feeds the snapshot may have changed since the last save.
+                if self.session_dirty {
+                    self.save_session_snapshot();
+                }
             }
         }
         self.recompute_links();
@@ -1538,24 +1573,27 @@ impl Jterm {
         let sess = &self.sessions[sess_idx];
         let focused = self.focused && pane_pos == self.focused_pane;
         let is_active = sess_idx == self.active;
-        let selection: Vec<Option<(usize, usize)>> = (0..sess.grid.len())
-            .map(|r| sess.terminal.row_selection_cols(r))
-            .collect();
-        // Only paint match highlights while the search bar is open; otherwise
-        // stale matches (whose line indices drift as the grid scrolls) linger.
-        let (search_matches, current) = if is_active && self.search.is_open {
-            (
-                self.search.matches.clone(),
-                self.search.current_match().map(|m| (m.line, m.col_start)),
-            )
-        } else {
-            (Vec::new(), None)
-        };
-        let links = if is_active {
-            self.links.clone()
+        // Only walk the grid to build per-row selection spans when a selection
+        // actually exists; otherwise hand the widget an empty Vec (no highlight).
+        let selection: Vec<Option<(usize, usize)>> = if sess.terminal.selection.is_some() {
+            (0..sess.grid.len())
+                .map(|r| sess.terminal.row_selection_cols(r))
+                .collect()
         } else {
             Vec::new()
         };
+        // Only paint match highlights while the search bar is open; otherwise
+        // stale matches (whose line indices drift as the grid scrolls) linger.
+        let (search_matches, current): (&[search::SearchMatch], _) =
+            if is_active && self.search.is_open {
+                (
+                    &self.search.matches,
+                    self.search.current_match().map(|m| (m.line, m.col_start)),
+                )
+            } else {
+                (&[], None)
+            };
+        let links: &[link::Link] = if is_active { &self.links } else { &[] };
         let images = if is_active {
             self.kitty_images(sess)
         } else {
@@ -2118,6 +2156,19 @@ impl Jterm {
             },
         ));
         lines = lines.push(stat("Links", format!("{}", self.links.len())));
+        // Ingest cost of the last PTY-output batch. bytes/µs is numerically equal
+        // to MB/s, so the throughput needs no extra scaling.
+        let ingest = if self.last_ingest_us > 0 {
+            format!(
+                "{} B / {} µs ({:.0} MB/s)",
+                self.last_ingest_bytes,
+                self.last_ingest_us,
+                self.last_ingest_bytes as f64 / self.last_ingest_us as f64,
+            )
+        } else {
+            format!("{} B / <1 µs", self.last_ingest_bytes)
+        };
+        lines = lines.push(stat("Ingest", ingest));
 
         let inner = container(lines)
             .width(Length::Fixed(240.0))
@@ -2213,25 +2264,51 @@ fn pty_stream(fd: RawFd) -> impl iced::futures::Stream<Item = Message> {
     iced::stream::channel(256, move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
         let (tx, mut rx) = iced::futures::channel::mpsc::unbounded::<Message>();
         std::thread::spawn(move || {
+            // Drain everything currently readable into one message instead of
+            // emitting a separate message per 64 KiB read. Bursty output (e.g.
+            // `cat bigfile`) then triggers far fewer process/refresh/render
+            // cycles, while a lone keystroke still hits WouldBlock immediately
+            // and is delivered with no added latency. Capped so the UI gets a
+            // chance to repaint between very large bursts.
+            const COALESCE_CAP: usize = 1 << 20; // 1 MiB per message
             let mut buf = vec![0u8; 65536];
             loop {
                 match Pty::wait_fd_readable(fd, 200) {
                     Ok(true) => {
-                        let n =
-                            unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-                        if n > 0 {
-                            let chunk = buf[..n as usize].to_vec();
-                            if tx.unbounded_send(Message::PtyOutput(fd, chunk)).is_err() {
+                        let mut acc: Vec<u8> = Vec::new();
+                        let mut exited = false;
+                        let mut errored = false;
+                        loop {
+                            let n = unsafe {
+                                libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                            };
+                            if n > 0 {
+                                acc.extend_from_slice(&buf[..n as usize]);
+                                if acc.len() >= COALESCE_CAP {
+                                    break;
+                                }
+                            } else if n == 0 {
+                                exited = true;
+                                break;
+                            } else {
+                                let err = std::io::Error::last_os_error();
+                                if err.kind() == std::io::ErrorKind::WouldBlock {
+                                    break;
+                                }
+                                errored = true;
                                 break;
                             }
-                        } else if n == 0 {
+                        }
+                        if !acc.is_empty()
+                            && tx.unbounded_send(Message::PtyOutput(fd, acc)).is_err()
+                        {
+                            break;
+                        }
+                        if exited {
                             let _ = tx.unbounded_send(Message::PtyExited(fd, 0));
                             break;
-                        } else {
-                            let err = std::io::Error::last_os_error();
-                            if err.kind() == std::io::ErrorKind::WouldBlock {
-                                continue;
-                            }
+                        }
+                        if errored {
                             let _ = tx.unbounded_send(Message::PtyExited(fd, -1));
                             break;
                         }
