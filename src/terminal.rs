@@ -2,6 +2,7 @@ use crate::kitty_graphics::KittyGraphicsState;
 use base64::Engine;
 use smallvec::SmallVec;
 use std::collections::VecDeque;
+use unicode_normalization::UnicodeNormalization;
 
 /// Character class for word selection boundaries.
 #[derive(PartialEq)]
@@ -772,6 +773,11 @@ impl TerminalModes {
             2026 => Some(10),
             2031 => Some(11),
             5522 => Some(12),
+            1 => Some(13),    // DECCKM application cursor keys
+            4 => Some(14),    // IRM insert/replace mode
+            6 => Some(15),    // DECOM origin mode
+            1005 => Some(16), // UTF-8 mouse encoding
+            1015 => Some(17), // urxvt mouse encoding
             _ => None,
         }
     }
@@ -799,6 +805,22 @@ impl TerminalModes {
     }
 }
 
+/// Full cursor state saved by DECSC (ESC 7) / CSI s and restored by DECRC (ESC 8) / CSI u.
+/// Per the VT spec this captures more than position: SGR attributes, the active charsets,
+/// and origin mode.
+#[derive(Clone, Copy)]
+struct SavedCursor {
+    row: usize,
+    col: usize,
+    fg: Color,
+    bg: Color,
+    flags: StyleFlags,
+    g0: Charset,
+    g1: Charset,
+    active: Charset,
+    origin_mode: bool,
+}
+
 pub struct TerminalState {
     pub grid: TerminalGrid,
     alt_grid: TerminalGrid,
@@ -810,8 +832,16 @@ pub struct TerminalState {
 
     pub cursor_row: usize,
     pub cursor_col: usize,
+    // Cursor position saved when switching to the alternate screen (mode 1049).
+    // Kept separate from the DECSC slot so the two don't clobber each other.
     saved_cursor_row: usize,
     saved_cursor_col: usize,
+    // DECSC/DECRC (and CSI s/u) saved full cursor state.
+    saved_cursor: Option<SavedCursor>,
+    // Per-column horizontal tab stops (HTS/TBC); index = column.
+    tab_stops: Vec<bool>,
+    // Last printed character, for REP (CSI b).
+    last_printed_char: Option<char>,
     alt_cursor_row: usize,
     alt_cursor_col: usize,
     pub cursor_shape: CursorShape,
@@ -931,6 +961,36 @@ impl TerminalState {
         params
     }
 
+    /// Parse SGR parameters into groups. Top-level parameters are separated by ';';
+    /// within a group, ':' introduces sub-parameters (ISO 8613-6 / curly underline,
+    /// e.g. `4:3` or `38:2:r:g:b`). Empty fields parse as 0 so positions are preserved.
+    fn parse_sgr_groups(param_bytes: &[u8]) -> SmallVec<[SmallVec<[u16; 6]>; 8]> {
+        let mut groups: SmallVec<[SmallVec<[u16; 6]>; 8]> = SmallVec::new();
+        let mut group: SmallVec<[u16; 6]> = SmallVec::new();
+        let mut current: u16 = 0;
+
+        for &byte in param_bytes {
+            match byte {
+                b'0'..=b'9' => {
+                    current = current.saturating_mul(10).saturating_add((byte - b'0') as u16);
+                }
+                b':' => {
+                    group.push(current);
+                    current = 0;
+                }
+                b';' => {
+                    group.push(current);
+                    groups.push(std::mem::take(&mut group));
+                    current = 0;
+                }
+                _ => {}
+            }
+        }
+        group.push(current);
+        groups.push(group);
+        groups
+    }
+
     pub fn new(cols: usize, rows: usize) -> Self {
         let (cols, rows) = clamp_terminal_dimensions(cols, rows);
         let grid = TerminalGrid::new(rows, cols);
@@ -956,6 +1016,9 @@ impl TerminalState {
             cursor_col: 0,
             saved_cursor_row: 0,
             saved_cursor_col: 0,
+            saved_cursor: None,
+            tab_stops: Self::default_tab_stops(cols),
+            last_printed_char: None,
             alt_cursor_row: 0,
             alt_cursor_col: 0,
             cursor_shape: CursorShape::default(),
@@ -1225,12 +1288,163 @@ impl TerminalState {
         }
     }
 
+    /// Advance to the start of the next line, honoring the DECSTBM scroll region.
+    /// When the cursor sits on the region's bottom row this scrolls the region up
+    /// (pushing to scrollback only for a full-screen region); otherwise it just
+    /// moves down. Used by autowrap and linefeed so both stay region-aware.
+    fn wrap_to_next_line(&mut self) {
+        self.grid.row_wrapped[self.cursor_row] = true;
+        self.cursor_col = 0;
+        if self.cursor_row == self.scroll_region_bottom {
+            self.scroll_region_up(self.scroll_region_top, self.scroll_region_bottom);
+        } else if self.cursor_row + 1 < self.grid.rows() {
+            self.cursor_row += 1;
+        }
+    }
+
+    /// IRM (insert mode): shift cells at/after `col` right by `count`, dropping the
+    /// rightmost `count` cells off the end of the row.
+    fn shift_cells_right(&mut self, row: usize, col: usize, count: usize) {
+        let cols = self.grid.row_len();
+        if count == 0 || col >= cols {
+            return;
+        }
+        let blank = self.create_blank_cell();
+        let line = &mut self.grid[row];
+        if col + count < cols {
+            line.copy_within(col..cols - count, col + count);
+        }
+        for cell in &mut line[col..(col + count).min(cols)] {
+            *cell = blank.clone();
+        }
+        self.dirty_region.mark_row(row);
+        self.mark_row_dirty(row);
+    }
+
+    /// Merge a zero-width combining mark into the preceding base cell when the
+    /// pair has a single precomposed form (NFC); otherwise drop it.
+    fn combine_with_previous(&mut self, mark: char) {
+        if self.cursor_col == 0 {
+            return;
+        }
+        let mut base_col = self.cursor_col - 1;
+        if base_col > 0
+            && self
+                .grid
+                .get(self.cursor_row, base_col)
+                .flags
+                .wide_continuation()
+        {
+            base_col -= 1;
+        }
+        let cell = self.grid.get_mut(self.cursor_row, base_col);
+        let mut combined = String::with_capacity(8);
+        combined.push(cell.character);
+        combined.push(mark);
+        let nfc: String = combined.nfc().collect();
+        let mut chars = nfc.chars();
+        if let (Some(c0), None) = (chars.next(), chars.next()) {
+            cell.character = c0;
+            self.dirty_region.mark_row(self.cursor_row);
+            self.mark_row_dirty(self.cursor_row);
+        }
+    }
+
+    fn default_tab_stops(cols: usize) -> Vec<bool> {
+        (0..cols).map(|c| c % 8 == 0 && c != 0).collect()
+    }
+
+    /// Next tab stop strictly right of `col`, or the last column if none.
+    fn next_tab_stop(&self, col: usize) -> usize {
+        let cols = self.grid.row_len();
+        let mut c = col + 1;
+        while c < cols {
+            if self.tab_stops.get(c).copied().unwrap_or(false) {
+                return c;
+            }
+            c += 1;
+        }
+        cols.saturating_sub(1)
+    }
+
+    /// Previous tab stop strictly left of `col`, or column 0 if none.
+    fn prev_tab_stop(&self, col: usize) -> usize {
+        let mut c = col;
+        while c > 0 {
+            c -= 1;
+            if self.tab_stops.get(c).copied().unwrap_or(false) {
+                return c;
+            }
+        }
+        0
+    }
+
+    fn save_cursor(&mut self) {
+        self.saved_cursor = Some(SavedCursor {
+            row: self.cursor_row,
+            col: self.cursor_col,
+            fg: self.current_fg,
+            bg: self.current_bg,
+            flags: self.current_flags,
+            g0: self.g0_charset,
+            g1: self.g1_charset,
+            active: self.active_charset,
+            origin_mode: self.modes.contains(&6),
+        });
+    }
+
+    fn restore_cursor(&mut self) {
+        if let Some(s) = self.saved_cursor {
+            self.cursor_row = s.row.min(self.grid.rows().saturating_sub(1));
+            self.cursor_col = s.col.min(self.grid.row_len().saturating_sub(1));
+            self.current_fg = s.fg;
+            self.current_bg = s.bg;
+            self.current_flags = s.flags;
+            self.g0_charset = s.g0;
+            self.g1_charset = s.g1;
+            self.active_charset = s.active;
+            if s.origin_mode {
+                self.modes.insert(6);
+            } else {
+                self.modes.remove(&6);
+            }
+        } else {
+            self.cursor_row = 0;
+            self.cursor_col = 0;
+        }
+    }
+
+    /// Place the cursor for CUP/HVP (CSI H / f). Honors DECOM origin mode: when set,
+    /// the row is relative to the scroll region and clamped within it.
+    fn place_cursor(&mut self, row_1based: usize, col_1based: usize) {
+        let row0 = row_1based.saturating_sub(1);
+        let col0 = col_1based.saturating_sub(1);
+        if self.modes.contains(&6) {
+            self.cursor_row =
+                (self.scroll_region_top + row0).min(self.scroll_region_bottom);
+        } else {
+            self.cursor_row = row0.min(self.grid.rows().saturating_sub(1));
+        }
+        self.cursor_col = col0.min(self.grid.row_len().saturating_sub(1));
+    }
+
+    /// VPA (CSI d): move to an absolute row, honoring origin mode, keeping the column.
+    fn set_cursor_row_abs(&mut self, row_1based: usize) {
+        let row0 = row_1based.saturating_sub(1);
+        if self.modes.contains(&6) {
+            self.cursor_row =
+                (self.scroll_region_top + row0).min(self.scroll_region_bottom);
+        } else {
+            self.cursor_row = row0.min(self.grid.rows().saturating_sub(1));
+        }
+    }
+
     fn put_char(&mut self, ch: char) {
-        let _orig_ch = ch;
         let ch = self.translate_char(ch);
         let width = crate::char_width::cached_char_width(ch);
         if width == 0 {
-            return; // Skip zero-width characters for now
+            self.combine_with_previous(ch);
+            return;
         }
 
         let cols = self.grid.row_len();
@@ -1240,17 +1454,16 @@ impl TerminalState {
         if self.cursor_col + width > cols {
             // Only wrap to next line if autowrap mode (mode 7) is enabled
             if self.modes.contains(&7) {
-                self.grid.row_wrapped[self.cursor_row] = true;
-                self.cursor_col = 0;
-                self.cursor_row += 1;
-                if self.cursor_row >= self.grid.rows() {
-                    self.cursor_row = self.grid.rows() - 1;
-                    self.scroll_down();
-                }
+                self.wrap_to_next_line();
             } else {
                 // Autowrap disabled: clamp cursor to last column instead of wrapping
                 self.cursor_col = cols.saturating_sub(width);
             }
+        }
+
+        // IRM insert mode (mode 4): make room by shifting the row right.
+        if self.modes.contains(&4) {
+            self.shift_cells_right(self.cursor_row, self.cursor_col, width);
         }
 
         // If current position has a continuation cell to its left, clear the wide character
@@ -1285,6 +1498,7 @@ impl TerminalState {
         }
 
         self.cursor_col += width;
+        self.last_printed_char = Some(ch);
         // Mark the row as dirty after writing character
         self.dirty_region.mark_row(self.cursor_row);
         self.mark_row_dirty(self.cursor_row);
@@ -1294,6 +1508,9 @@ impl TerminalState {
         let cols = self.grid.row_len();
         let autowrap = self.modes.contains(&7);
         let mut pos = 0;
+        if let Some(&last) = bytes.last() {
+            self.last_printed_char = Some(last as char);
+        }
 
         while pos < bytes.len() {
             let remaining = cols - self.cursor_col;
@@ -1324,13 +1541,7 @@ impl TerminalState {
             // Handle wrap if there's more data
             if pos < bytes.len() && self.cursor_col >= cols {
                 if autowrap {
-                    self.grid.row_wrapped[self.cursor_row] = true;
-                    self.cursor_col = 0;
-                    self.cursor_row += 1;
-                    if self.cursor_row >= self.grid.rows() {
-                        self.cursor_row = self.grid.rows() - 1;
-                        self.scroll_down();
-                    }
+                    self.wrap_to_next_line();
                 } else {
                     self.cursor_col = cols - 1;
                     break;
@@ -1609,14 +1820,13 @@ impl TerminalState {
                     i += 1;
                 }
                 b'\n' => {
-                    // Linefeed - move cursor down or scroll
-                    if self.cursor_row < self.scroll_region_bottom {
-                        // Cursor is not at bottom of scroll region, just move down
-                        self.cursor_row += 1;
-                    } else {
-                        // Cursor is at bottom of scroll region, scroll the region
+                    // Linefeed - move cursor down or scroll the region.
+                    // Only scroll when exactly on the region's bottom row; when the
+                    // cursor is below the region just move down (don't scroll).
+                    if self.cursor_row == self.scroll_region_bottom {
                         self.scroll_region_up(self.scroll_region_top, self.scroll_region_bottom);
-                        // Cursor stays at bottom row of the scroll region
+                    } else if self.cursor_row + 1 < self.grid.rows() {
+                        self.cursor_row += 1;
                     }
                     i += 1;
                 }
@@ -1637,11 +1847,8 @@ impl TerminalState {
                     i += 1;
                 }
                 b'\t' => {
-                    // Tab
-                    self.cursor_col = ((self.cursor_col + 8) / 8) * 8;
-                    if self.cursor_col >= self.grid.row_len() {
-                        self.cursor_col = self.grid.row_len() - 1;
-                    }
+                    // Tab - advance to the next tab stop.
+                    self.cursor_col = self.next_tab_stop(self.cursor_col);
                     i += 1;
                 }
                 b'\x1b' => {
@@ -1654,16 +1861,48 @@ impl TerminalState {
 
                     match data_slice[i + 1] {
                         b'7' => {
-                            // DECSC - Save Cursor Position
-                            self.saved_cursor_row = self.cursor_row;
-                            self.saved_cursor_col = self.cursor_col;
+                            // DECSC - Save cursor (position + SGR + charset + origin)
+                            self.save_cursor();
                             i += 2;
                         }
                         b'8' => {
-                            // DECRC - Restore Cursor Position
-                            self.cursor_row = self.saved_cursor_row.min(self.grid.rows() - 1);
-                            self.cursor_col = self.saved_cursor_col.min(self.grid.row_len() - 1);
+                            // DECRC - Restore cursor
+                            self.restore_cursor();
                             i += 2;
+                        }
+                        b'E' => {
+                            // NEL - Next Line (linefeed + carriage return)
+                            self.cursor_col = 0;
+                            if self.cursor_row == self.scroll_region_bottom {
+                                self.scroll_region_up(
+                                    self.scroll_region_top,
+                                    self.scroll_region_bottom,
+                                );
+                            } else if self.cursor_row + 1 < self.grid.rows() {
+                                self.cursor_row += 1;
+                            }
+                            i += 2;
+                        }
+                        b'H' => {
+                            // HTS - set a horizontal tab stop at the current column
+                            if let Some(stop) = self.tab_stops.get_mut(self.cursor_col) {
+                                *stop = true;
+                            }
+                            i += 2;
+                        }
+                        b'c' => {
+                            // RIS - Reset to Initial State
+                            self.full_reset();
+                            i += 2;
+                        }
+                        b'#' => {
+                            // DEC private: ESC # 8 = DECALN (fill screen with 'E')
+                            if i + 2 < data_slice.len() && data_slice[i + 2] == b'8' {
+                                self.decaln();
+                                i += 3;
+                            } else {
+                                i += 2;
+                            }
                         }
                         b']' => {
                             i += 2;
@@ -1927,6 +2166,7 @@ impl TerminalState {
 
                             self.handle_escape_sequence(
                                 &params,
+                                &param_bytes[..param_len],
                                 cmd,
                                 private_prefix,
                                 &intermediates[..inter_len],
@@ -1939,8 +2179,12 @@ impl TerminalState {
                     }
                 }
                 32..=126 => {
-                    // ASCII fast path: scan for run of printable ASCII and process in bulk
-                    if self.utf8_len == 0 && self.active_charset == Charset::Ascii {
+                    // ASCII fast path: scan for run of printable ASCII and process in bulk.
+                    // Insert mode (IRM) needs per-cell shifting, so fall back to put_char.
+                    if self.utf8_len == 0
+                        && self.active_charset == Charset::Ascii
+                        && !self.modes.contains(&4)
+                    {
                         let run_start = i;
                         i += 1;
                         while i < data_slice.len() {
@@ -2041,6 +2285,7 @@ impl TerminalState {
     fn handle_escape_sequence(
         &mut self,
         params: &[u16],
+        raw_params: &[u8],
         cmd: char,
         private_prefix: Option<u8>,
         intermediates: &[u8],
@@ -2087,16 +2332,59 @@ impl TerminalState {
                 self.cursor_row = self.cursor_row.saturating_sub(n);
                 self.cursor_col = 0;
             }
-            'G' => {
-                // Move cursor to column
+            'G' | '`' => {
+                // CHA / HPA - move cursor to absolute column (1-based)
                 let col = params.first().copied().unwrap_or(1) as usize;
                 self.cursor_col = col.saturating_sub(1).min(self.grid.row_len() - 1);
+            }
+            'd' => {
+                // VPA - move cursor to absolute row (1-based), honoring origin mode
+                let row = params.first().copied().unwrap_or(1) as usize;
+                self.set_cursor_row_abs(row);
+            }
+            'I' => {
+                // CHT - cursor forward tabulation (n tab stops)
+                let n = params.first().copied().unwrap_or(1).max(1) as usize;
+                for _ in 0..n {
+                    self.cursor_col = self.next_tab_stop(self.cursor_col);
+                }
+            }
+            'Z' => {
+                // CBT - cursor backward tabulation (n tab stops)
+                let n = params.first().copied().unwrap_or(1).max(1) as usize;
+                for _ in 0..n {
+                    self.cursor_col = self.prev_tab_stop(self.cursor_col);
+                }
+            }
+            'b' => {
+                // REP - repeat the last printed character n times
+                let n = params.first().copied().unwrap_or(1).max(1) as usize;
+                if let Some(ch) = self.last_printed_char {
+                    for _ in 0..n {
+                        self.put_char(ch);
+                    }
+                }
+            }
+            'g' => {
+                // TBC - tab clear (0 = at cursor, 3 = all)
+                match params.first().copied().unwrap_or(0) {
+                    0 => {
+                        if let Some(stop) = self.tab_stops.get_mut(self.cursor_col) {
+                            *stop = false;
+                        }
+                    }
+                    3 => {
+                        for stop in self.tab_stops.iter_mut() {
+                            *stop = false;
+                        }
+                    }
+                    _ => {}
+                }
             }
             'H' => {
                 let row = params.first().copied().unwrap_or(1) as usize;
                 let col = params.get(1).copied().unwrap_or(1) as usize;
-                self.cursor_row = row.saturating_sub(1).min(self.grid.rows() - 1);
-                self.cursor_col = col.saturating_sub(1).min(self.grid.row_len() - 1);
+                self.place_cursor(row, col);
             }
             'f' => {
                 if private_prefix == Some(b'>') && intermediates.is_empty() {
@@ -2113,8 +2401,7 @@ impl TerminalState {
                 } else {
                     let row = params.first().copied().unwrap_or(1) as usize;
                     let col = params.get(1).copied().unwrap_or(1) as usize;
-                    self.cursor_row = row.saturating_sub(1).min(self.grid.rows() - 1);
-                    self.cursor_col = col.saturating_sub(1).min(self.grid.row_len() - 1);
+                    self.place_cursor(row, col);
                 }
             }
             'J' => {
@@ -2153,6 +2440,11 @@ impl TerminalState {
                     2 => {
                         self.clear_screen();
                         // clear_screen already marks all rows as dirty
+                    }
+                    3 => {
+                        // Clear scrollback (xterm extension)
+                        self.scrollback.clear();
+                        self.scroll_offset = 0;
                     }
                     _ => {}
                 }
@@ -2237,21 +2529,19 @@ impl TerminalState {
                     }
                 } else {
                     // SGR - Select Graphic Rendition
-                    self.handle_sgr(params);
+                    self.handle_sgr(&Self::parse_sgr_groups(raw_params));
                 }
             }
             's' => {
                 if private_prefix.is_none() && intermediates.is_empty() {
-                    self.saved_cursor_row = self.cursor_row;
-                    self.saved_cursor_col = self.cursor_col;
+                    self.save_cursor();
                 }
             }
             'u' => {
                 if intermediates.is_empty() {
                     match private_prefix {
                         None => {
-                            self.cursor_row = self.saved_cursor_row.min(self.grid.rows() - 1);
-                            self.cursor_col = self.saved_cursor_col.min(self.grid.row_len() - 1);
+                            self.restore_cursor();
                         }
                         Some(b'?') => {
                             crate::debug_log!(
@@ -2320,16 +2610,19 @@ impl TerminalState {
             }
             'n' => {
                 // DSR - Device Status Report
-                // ESC[6n requests cursor position
-                if params.first().copied().unwrap_or(0) == 6 {
-                    // Respond with CPR (Cursor Position Report): ESC[row;colR
-                    // Row and Col are 1-indexed
-                    let row = (self.cursor_row + 1) as u16;
-                    let col = (self.cursor_col + 1) as u16;
-
-                    // Send cursor position response back to PTY
-                    let response = format!("\x1b[{};{}R", row, col);
-                    self.output_buffer.extend(response.as_bytes());
+                match params.first().copied().unwrap_or(0) {
+                    5 => {
+                        // Report device OK: CSI 0 n
+                        self.output_buffer.extend_from_slice(b"\x1b[0n");
+                    }
+                    6 => {
+                        // CPR - Cursor Position Report: CSI row ; col R (1-indexed)
+                        let row = (self.cursor_row + 1) as u16;
+                        let col = (self.cursor_col + 1) as u16;
+                        let response = format!("\x1b[{};{}R", row, col);
+                        self.output_buffer.extend(response.as_bytes());
+                    }
+                    _ => {}
                 }
             }
             'c' => {
@@ -2466,17 +2759,64 @@ impl TerminalState {
         }
     }
 
-    fn handle_sgr(&mut self, params: &[u16]) {
-        if params.is_empty() {
+    /// Resolve an extended color (SGR 38/48/58) from either the colon sub-parameter
+    /// form (within a single group, e.g. `38:2:r:g:b` or `38:2:cs:r:g:b`) or the
+    /// legacy semicolon form (`38;2;r;g;b`), advancing `gi` past consumed groups.
+    fn parse_ext_color(groups: &[SmallVec<[u16; 6]>], gi: &mut usize) -> Option<Color> {
+        let g = &groups[*gi];
+        if g.len() >= 2 {
+            // Colon sub-parameter form: everything lives in this group.
+            match g[1] {
+                5 => g.get(2).map(|&n| Color::Indexed(n as u8)),
+                2 => {
+                    // 38:2:r:g:b (len 5) or 38:2:colorspace:r:g:b (len >= 6)
+                    if g.len() >= 6 {
+                        Some(Color::Rgb(g[3] as u8, g[4] as u8, g[5] as u8))
+                    } else if g.len() >= 5 {
+                        Some(Color::Rgb(g[2] as u8, g[3] as u8, g[4] as u8))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            // Legacy semicolon form: the kind and components are separate groups.
+            let first = |idx: usize| groups.get(idx).and_then(|x| x.first().copied());
+            match first(*gi + 1) {
+                Some(5) => {
+                    let n = first(*gi + 2);
+                    *gi += 2;
+                    n.map(|n| Color::Indexed(n as u8))
+                }
+                Some(2) => {
+                    let (r, gg, b) = (first(*gi + 2), first(*gi + 3), first(*gi + 4));
+                    *gi += 4;
+                    match (r, gg, b) {
+                        (Some(r), Some(gg), Some(b)) => {
+                            Some(Color::Rgb(r as u8, gg as u8, b as u8))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+    }
+
+    fn handle_sgr(&mut self, groups: &[SmallVec<[u16; 6]>]) {
+        // CSI m with no parameters is a full reset.
+        if groups.len() == 1 && groups[0].len() == 1 && groups[0][0] == 0 {
             self.current_flags = StyleFlags::default();
             self.current_fg = Color::Default;
             self.current_bg = Color::Default;
             return;
         }
 
-        let mut i = 0;
-        while i < params.len() {
-            let param = params[i];
+        let mut gi = 0;
+        while gi < groups.len() {
+            let g = &groups[gi];
+            let param = g.first().copied().unwrap_or(0);
             match param {
                 0 => {
                     self.current_flags = StyleFlags::default();
@@ -2487,21 +2827,18 @@ impl TerminalState {
                 2 => self.current_flags.set_dim(true),
                 3 => self.current_flags.set_italic(true),
                 4 => {
-                    if i + 1 < params.len() && params[i + 1] <= 5 {
-                        let style = params[i + 1];
-                        self.current_flags.set_underline(match style {
-                            0 => UnderlineStyle::None,
-                            1 => UnderlineStyle::Single,
-                            2 => UnderlineStyle::Double,
-                            3 => UnderlineStyle::Curly,
-                            4 => UnderlineStyle::Dotted,
-                            5 => UnderlineStyle::Dashed,
-                            _ => UnderlineStyle::Single,
-                        });
-                        i += 1;
-                    } else {
-                        self.current_flags.set_underline(UnderlineStyle::Single);
-                    }
+                    // Colon sub-parameter (4:n) selects the underline style; plain 4 is
+                    // a single underline. Semicolon-separated values are NOT consumed here.
+                    let style = if g.len() >= 2 { g[1] } else { 1 };
+                    self.current_flags.set_underline(match style {
+                        0 => UnderlineStyle::None,
+                        1 => UnderlineStyle::Single,
+                        2 => UnderlineStyle::Double,
+                        3 => UnderlineStyle::Curly,
+                        4 => UnderlineStyle::Dotted,
+                        5 => UnderlineStyle::Dashed,
+                        _ => UnderlineStyle::Single,
+                    });
                 }
                 5 => self.current_flags.set_blink(true),
                 7 => self.current_flags.set_inverse(true),
@@ -2544,7 +2881,6 @@ impl TerminalState {
                         _ => Color::Default,
                     };
                     self.global_bg = self.current_bg; // Update global background
-                    crate::debug_log!("[CSI] Background color set to: {:?}", self.current_bg);
                 }
                 90..=97 => {
                     self.current_fg = match param {
@@ -2573,69 +2909,62 @@ impl TerminalState {
                     };
                     self.global_bg = self.current_bg; // Update global background
                 }
-                // Extended color support: 38;5;n (256 color) and 38;2;r;g;b (RGB)
                 38 => {
-                    if i + 2 < params.len() {
-                        match params[i + 1] {
-                            5 => {
-                                // 256 color mode
-                                self.current_fg = Color::Indexed(params[i + 2] as u8);
-                                i += 2;
-                            }
-                            2 => {
-                                // RGB mode
-                                if i + 4 < params.len() {
-                                    self.current_fg = Color::Rgb(
-                                        params[i + 2] as u8,
-                                        params[i + 3] as u8,
-                                        params[i + 4] as u8,
-                                    );
-                                    i += 4;
-                                }
-                            }
-                            _ => {}
-                        }
+                    if let Some(color) = Self::parse_ext_color(groups, &mut gi) {
+                        self.current_fg = color;
                     }
                 }
                 48 => {
-                    if i + 2 < params.len() {
-                        match params[i + 1] {
-                            5 => {
-                                // 256 color mode for background
-                                self.current_bg = Color::Indexed(params[i + 2] as u8);
-                                self.global_bg = self.current_bg; // Update global background
-                                crate::debug_log!(
-                                    "[CSI] Background color (256-color) set to: index {}",
-                                    params[i + 2]
-                                );
-                                i += 2;
-                            }
-                            2 => {
-                                // RGB mode for background
-                                if i + 4 < params.len() {
-                                    self.current_bg = Color::Rgb(
-                                        params[i + 2] as u8,
-                                        params[i + 3] as u8,
-                                        params[i + 4] as u8,
-                                    );
-                                    self.global_bg = self.current_bg; // Update global background
-                                    crate::debug_log!(
-                                        "[CSI] Background color (RGB) set to: ({}, {}, {})",
-                                        params[i + 2],
-                                        params[i + 3],
-                                        params[i + 4]
-                                    );
-                                    i += 4;
-                                }
-                            }
-                            _ => {}
-                        }
+                    if let Some(color) = Self::parse_ext_color(groups, &mut gi) {
+                        self.current_bg = color;
+                        self.global_bg = self.current_bg;
                     }
                 }
                 _ => {}
             }
-            i += 1;
+            gi += 1;
         }
+    }
+
+    /// DECALN (ESC # 8): fill the entire screen with 'E', used for alignment tests.
+    fn decaln(&mut self) {
+        for row in self.grid.iter_mut() {
+            for cell in row.iter_mut() {
+                *cell = TerminalCell {
+                    character: 'E',
+                    foreground: Color::Default,
+                    background: Color::Default,
+                    flags: StyleFlags::default(),
+                };
+            }
+        }
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.dirty_region.mark_all(self.grid.rows());
+        self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
+    }
+
+    /// RIS (ESC c): reset the terminal to its initial state.
+    fn full_reset(&mut self) {
+        if self.use_alt_buffer {
+            self.reset_mode(1049);
+        }
+        self.current_fg = Color::Default;
+        self.current_bg = Color::Default;
+        self.global_bg = Color::Default;
+        self.current_flags = StyleFlags::default();
+        self.g0_charset = Charset::Ascii;
+        self.g1_charset = Charset::Ascii;
+        self.active_charset = Charset::Ascii;
+        self.scroll_region_top = 0;
+        self.scroll_region_bottom = self.grid.rows().saturating_sub(1);
+        self.tab_stops = Self::default_tab_stops(self.grid.row_len());
+        self.saved_cursor = None;
+        self.modes = TerminalModes::default();
+        self.modes.insert(25); // cursor visible
+        self.modes.insert(7); // autowrap on
+        self.scroll_offset = 0;
+        self.clear_screen();
     }
 
     fn clear_screen(&mut self) {
@@ -3489,6 +3818,16 @@ impl TerminalState {
         // When grid grows, we need to extend row_versions; when it shrinks, truncate it
         if rows != self.row_versions.len() {
             self.row_versions.resize(rows, self.grid_version);
+        }
+
+        // Keep the tab-stop table sized to the new column count, defaulting any
+        // newly added columns to the standard every-8 stops.
+        if cols != self.tab_stops.len() {
+            let old_len = self.tab_stops.len();
+            self.tab_stops.resize(cols, false);
+            for c in old_len..cols {
+                self.tab_stops[c] = c % 8 == 0 && c != 0;
+            }
         }
 
         self.scroll_offset = 0;

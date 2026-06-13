@@ -118,8 +118,7 @@ enum Message {
     ConfigSave,
     ConfigReset,
     ConfigTick,
-    ToggleHelp,
-    ToggleDebug,
+    BlinkTick,
 }
 
 /// In-progress custom theme being edited in the theme editor overlay. UI-chrome
@@ -196,9 +195,13 @@ impl Session {
         let mut written = 0usize;
         while written < data.len() {
             match self.pty.write(&data[written..]) {
-                Ok(0) => {
-                    let _ = Pty::wait_fd_readable(self.master_fd, 5);
-                }
+                // Kernel write buffer full: wait until the fd drains, then retry
+                // so large pastes are not silently truncated.
+                Ok(0) => match Pty::wait_fd_writable(self.master_fd, 1000) {
+                    Ok(true) => {}
+                    // Timed out or fd dead — give up rather than spin forever.
+                    Ok(false) | Err(_) => break,
+                },
                 Ok(n) => written += n,
                 Err(_) => break,
             }
@@ -227,9 +230,12 @@ struct Jterm {
     mono: iced::Font,
     search: search::SearchState,
     palette: command_palette::PaletteState,
+    keybindings: keybindings::KeyBindings,
     config_panel_open: bool,
     help_open: bool,
     debug_open: bool,
+    /// Blink clock phase, toggled by a timer; drives blinking-attribute cells.
+    blink_on: bool,
     win_size: Size,
     config_mtime: Option<std::time::SystemTime>,
     link_detector: link::LinkDetector,
@@ -306,9 +312,11 @@ impl Jterm {
             mono,
             search: search::SearchState::new(),
             palette: command_palette::PaletteState::new(),
+            keybindings: load_keybindings(),
             config_panel_open: false,
             help_open: false,
             debug_open: false,
+            blink_on: true,
             win_size,
             config_mtime,
             link_detector: link::LinkDetector::new(link::LinkDetectionConfig::default()),
@@ -635,7 +643,162 @@ impl Jterm {
         Task::none()
     }
 
-    /// Returns true if the keypress was consumed as a tab-management shortcut.
+    /// Look up a key event in the configurable keybindings and run the bound
+    /// command. Returns the resulting task when a binding matched and applied,
+    /// or `None` to let the key fall through to other handlers / the PTY.
+    fn handle_keybinding(
+        &mut self,
+        key: &keyboard::Key,
+        mods: keyboard::Modifiers,
+    ) -> Option<Task<Message>> {
+        let binding = key_to_binding_string(key, mods)?;
+        let cmd = self.keybindings.get_command(&binding)?;
+        self.dispatch_command(cmd)
+    }
+
+    /// Execute a bound [`keybindings::Command`]. Returns `None` for commands
+    /// that don't apply in the current context (e.g. search navigation while
+    /// the search bar is closed) so the key can fall through.
+    fn dispatch_command(&mut self, cmd: keybindings::Command) -> Option<Task<Message>> {
+        use keybindings::Command as C;
+        // Write raw bytes to the focused session's PTY (control-key commands).
+        let mut send = |bytes: &[u8]| {
+            if let Some(sess) = self.sessions.get_mut(self.active) {
+                sess.terminal.scroll_to_bottom();
+                sess.write_pty(bytes);
+                sess.refresh();
+            }
+        };
+        let task = match cmd {
+            C::SessionNew => {
+                self.new_session();
+                Task::none()
+            }
+            C::SessionClose | C::WindowClose => return Some(self.close_session(self.active)),
+            C::SessionNext => {
+                self.next_session();
+                Task::none()
+            }
+            C::SessionPrev => {
+                self.prev_session();
+                Task::none()
+            }
+            C::SessionJump(n) => {
+                self.jump_session(n);
+                Task::none()
+            }
+            C::EditCopy => {
+                let text = self
+                    .sessions
+                    .get(self.active)
+                    .and_then(|s| s.terminal.copy_selection())
+                    .filter(|t| !t.is_empty());
+                match text {
+                    Some(text) => iced::clipboard::write(text),
+                    None => Task::none(),
+                }
+            }
+            C::EditPaste => iced::clipboard::read().map(Message::Pasted),
+            C::SearchOpen => {
+                self.search.toggle();
+                self.recompute_search();
+                Task::none()
+            }
+            C::SearchClose => {
+                if !self.search.is_open {
+                    return None;
+                }
+                self.search.close();
+                Task::none()
+            }
+            C::SearchNext => {
+                if !self.search.is_open {
+                    return None;
+                }
+                self.search.next_match();
+                Task::none()
+            }
+            C::SearchPrev => {
+                if !self.search.is_open {
+                    return None;
+                }
+                self.search.prev_match();
+                Task::none()
+            }
+            C::SearchHistoryPrev => {
+                if !self.search.is_open {
+                    return None;
+                }
+                self.search.history_prev();
+                self.recompute_search();
+                Task::none()
+            }
+            C::SearchHistoryNext => {
+                if !self.search.is_open {
+                    return None;
+                }
+                self.search.history_next();
+                self.recompute_search();
+                Task::none()
+            }
+            C::TerminalSendSigint => {
+                send(&[0x03]);
+                Task::none()
+            }
+            C::TerminalSendEof => {
+                send(&[0x04]);
+                Task::none()
+            }
+            C::TerminalClear => {
+                send(&[0x0c]);
+                Task::none()
+            }
+            C::TerminalScrollUp | C::TerminalScrollDown => {
+                let speed = self.config.scroll_speed.max(1) as isize;
+                let delta = if matches!(cmd, C::TerminalScrollUp) {
+                    speed
+                } else {
+                    -speed
+                };
+                if let Some(sess) = self.sessions.get_mut(self.active) {
+                    sess.terminal.scroll(delta);
+                    sess.refresh();
+                }
+                Task::none()
+            }
+            C::TerminalSplitVertical => {
+                self.split(SplitMode::Vertical);
+                Task::none()
+            }
+            C::TerminalSplitHorizontal => {
+                self.split(SplitMode::Horizontal);
+                Task::none()
+            }
+            C::TerminalClosePane => return Some(self.close_focused_pane()),
+            // Only two panes exist, so next and prev are the same toggle.
+            C::PaneFocusNext | C::PaneFocusPrev => {
+                self.focus_next_pane();
+                Task::none()
+            }
+            C::ConfigOpen => {
+                self.config_panel_open = true;
+                Task::none()
+            }
+            C::ConfigClose => {
+                self.config_panel_open = false;
+                Task::none()
+            }
+            C::ConfigToggle => {
+                self.config_panel_open = !self.config_panel_open;
+                Task::none()
+            }
+        };
+        Some(task)
+    }
+
+    /// Non-configurable app-chrome shortcuts that have no [`keybindings::Command`]
+    /// (command palette, diagnostics, and help overlays). Returns `Some` when the
+    /// keypress was consumed.
     fn handle_tab_shortcut(
         &mut self,
         key: &keyboard::Key,
@@ -644,104 +807,32 @@ impl Jterm {
         use keyboard::key::Named;
         use keyboard::Key;
         // F12 toggles the diagnostics overlay (also reachable via Ctrl+Shift+G),
-        // checked before the Ctrl gate since it takes no modifier.
+        // checked before the modifier gate since it takes no modifier.
         if matches!(key, Key::Named(Named::F12)) {
             self.debug_open = !self.debug_open;
             return Some(Task::none());
         }
-        if !mods.control() {
+        if !(mods.control() && mods.shift()) {
             return None;
         }
-        match key {
-            Key::Named(Named::Tab) => {
-                if mods.shift() {
-                    self.prev_session();
-                } else {
-                    self.next_session();
+        if let Key::Character(s) = key {
+            match s.chars().next()?.to_ascii_lowercase() {
+                'p' => {
+                    self.palette.toggle();
+                    return Some(Task::none());
                 }
-                Some(Task::none())
-            }
-            Key::Named(Named::PageDown) => {
-                self.next_session();
-                Some(Task::none())
-            }
-            Key::Named(Named::PageUp) => {
-                self.prev_session();
-                Some(Task::none())
-            }
-            Key::Character(s) => {
-                let c = s.chars().next()?;
-                if mods.shift() {
-                    match c.to_ascii_lowercase() {
-                        't' => {
-                            self.new_session();
-                            return Some(Task::none());
-                        }
-                        'w' => {
-                            return Some(self.close_focused_pane());
-                        }
-                        'd' => {
-                            self.split(SplitMode::Vertical);
-                            return Some(Task::none());
-                        }
-                        'e' => {
-                            self.split(SplitMode::Horizontal);
-                            return Some(Task::none());
-                        }
-                        'j' => {
-                            self.focus_next_pane();
-                            return Some(Task::none());
-                        }
-                        'c' => {
-                            if let Some(text) = self
-                                .sessions
-                                .get(self.active)
-                                .and_then(|s| s.terminal.copy_selection())
-                                .filter(|t| !t.is_empty())
-                            {
-                                return Some(iced::clipboard::write(text));
-                            }
-                            return Some(Task::none());
-                        }
-                        'v' => {
-                            return Some(iced::clipboard::read().map(Message::Pasted));
-                        }
-                        'f' => {
-                            self.search.toggle();
-                            self.recompute_search();
-                            return Some(Task::none());
-                        }
-                        'p' => {
-                            self.palette.toggle();
-                            return Some(Task::none());
-                        }
-                        'o' => {
-                            self.config_panel_open = !self.config_panel_open;
-                            return Some(Task::none());
-                        }
-                        'g' => {
-                            self.debug_open = !self.debug_open;
-                            return Some(Task::none());
-                        }
-                        '/' | '?' => {
-                            self.help_open = !self.help_open;
-                            return Some(Task::none());
-                        }
-                        _ => return None,
-                    }
+                'g' => {
+                    self.debug_open = !self.debug_open;
+                    return Some(Task::none());
                 }
-                // Ctrl+<digit> jumps to that session index (0-8).
-                if let Some(d) = c.to_digit(10) {
-                    let d = d as usize;
-                    if d < 9 {
-                        self.jump_session(d);
-                        return Some(Task::none());
-                    }
+                '/' | '?' => {
+                    self.help_open = !self.help_open;
+                    return Some(Task::none());
                 }
-                None
+                _ => {}
             }
-            _ => None,
         }
+        None
     }
 
     /// Route a grid mouse interaction either to the running application (when it
@@ -836,15 +927,24 @@ impl Jterm {
                     }
                 }
             }
-            MouseInput::Wheel { col, row, up } => {
+            MouseInput::Wheel {
+                col,
+                row,
+                up,
+                lines,
+            } => {
                 if report_to_app {
                     let code = if up { 64 } else { 65 };
-                    if let Some(report) = sess.terminal.get_mouse_report(code, col, row) {
-                        sess.write_pty(report.as_bytes());
+                    // One wheel report per line so apps see the full magnitude.
+                    for _ in 0..lines.max(1) {
+                        if let Some(report) = sess.terminal.get_mouse_report(code, col, row) {
+                            sess.write_pty(report.as_bytes());
+                        }
                     }
                     return Task::none();
                 }
-                sess.terminal.scroll(if up { speed } else { -speed });
+                let step = speed * lines.max(1) as isize;
+                sess.terminal.scroll(if up { step } else { -step });
                 sess.refresh();
             }
             MouseInput::ScrollTo { offset } => {
@@ -1156,6 +1256,9 @@ impl Jterm {
                     ..
                 } = event
                 {
+                    if let Some(task) = self.handle_keybinding(&key, modifiers) {
+                        return task;
+                    }
                     if let Some(task) = self.handle_tab_shortcut(&key, modifiers) {
                         return task;
                     }
@@ -1296,11 +1399,8 @@ impl Jterm {
             Message::ToggleConfigPanel => {
                 self.config_panel_open = !self.config_panel_open;
             }
-            Message::ToggleHelp => {
-                self.help_open = !self.help_open;
-            }
-            Message::ToggleDebug => {
-                self.debug_open = !self.debug_open;
+            Message::BlinkTick => {
+                self.blink_on = !self.blink_on;
             }
             Message::SetTheme(name) => {
                 self.config.theme = name;
@@ -1532,8 +1632,9 @@ impl Jterm {
         for (i, sess) in self.sessions.iter().enumerate() {
             let active = i == self.active;
             let label = sess.label();
-            let label = if label.len() > 24 {
-                format!("{}…", &label[..23])
+            let label = if label.chars().count() > 24 {
+                let truncated: String = label.chars().take(23).collect();
+                format!("{truncated}…")
             } else {
                 label
             };
@@ -1627,6 +1728,7 @@ impl Jterm {
         } else {
             None
         })
+        .blink_on(self.blink_on)
         .on_mouse(move |inp| Message::MousePane(pane_pos, inp))
         .into()
     }
@@ -2185,7 +2287,7 @@ impl Jterm {
         let mut subs: Vec<Subscription<Message>> = self
             .sessions
             .iter()
-            .map(|s| pty_subscription(s.master_fd))
+            .map(|s| pty_subscription(s.id, s.master_fd))
             .collect();
         let events = iced::event::listen_with(|event, _status, _id| match event {
             iced::Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => {
@@ -2204,6 +2306,10 @@ impl Jterm {
         subs.push(
             iced::time::every(std::time::Duration::from_millis(1500))
                 .map(|_| Message::ConfigTick),
+        );
+        subs.push(
+            iced::time::every(std::time::Duration::from_millis(530))
+                .map(|_| Message::BlinkTick),
         );
         Subscription::batch(subs)
     }
@@ -2255,8 +2361,11 @@ fn wrap_bracketed_paste(mut payload: Vec<u8>) -> Vec<u8> {
     wrapped
 }
 
-fn pty_subscription(fd: RawFd) -> Subscription<Message> {
-    Subscription::run_with(fd, |fd: &RawFd| pty_stream(*fd))
+fn pty_subscription(id: usize, fd: RawFd) -> Subscription<Message> {
+    // Key on the stable session id (not the raw fd): a closed session's fd
+    // number can be reused by a new session, and keying on fd alone would let
+    // iced confuse the two and reuse the old reader thread on the reused fd.
+    Subscription::run_with((id, fd), |&(_, fd): &(usize, RawFd)| pty_stream(fd))
 }
 
 fn pty_stream(fd: RawFd) -> impl iced::futures::Stream<Item = Message> {
@@ -2327,6 +2436,90 @@ fn pty_stream(fd: RawFd) -> impl iced::futures::Stream<Item = Message> {
             }
         }
     })
+}
+
+/// Load keybindings from disk (merged onto defaults), logging any load error or
+/// invalid binding so a malformed config degrades gracefully to the defaults.
+fn load_keybindings() -> keybindings::KeyBindings {
+    match keybindings::KeyBindings::load() {
+        Ok(kb) => {
+            for issue in kb.check_conflicts() {
+                log::warn!("[keybindings] {issue}");
+            }
+            kb
+        }
+        Err(e) => {
+            log::warn!("[keybindings] failed to load, using defaults: {e}");
+            keybindings::KeyBindings::default()
+        }
+    }
+}
+
+/// Build the normalized binding string (e.g. `"ctrl+shift+t"`) for a key event,
+/// matching the lowercase `modifier+...+key` format stored in keybindings.toml.
+/// Returns `None` for keys that should never be treated as shortcuts — plain
+/// character input (no Ctrl/Alt/Super) and unmappable named keys — so ordinary
+/// typing is never swallowed by the keybinding layer.
+fn key_to_binding_string(key: &keyboard::Key, mods: keyboard::Modifiers) -> Option<String> {
+    use keyboard::key::Named;
+    use keyboard::Key;
+    let name: String = match key {
+        Key::Character(s) => {
+            // Shift alone just changes case; require a "real" modifier so typing
+            // an uppercase letter can't trigger a command.
+            if !(mods.control() || mods.alt() || mods.logo()) {
+                return None;
+            }
+            s.chars().next()?.to_ascii_lowercase().to_string()
+        }
+        Key::Named(named) => match named {
+            Named::Tab => "tab",
+            Named::Enter => "enter",
+            Named::Escape => "escape",
+            Named::Backspace => "backspace",
+            Named::Delete => "delete",
+            Named::Insert => "insert",
+            Named::Home => "home",
+            Named::End => "end",
+            Named::PageUp => "pageup",
+            Named::PageDown => "pagedown",
+            Named::ArrowUp => "up",
+            Named::ArrowDown => "down",
+            Named::ArrowLeft => "left",
+            Named::ArrowRight => "right",
+            Named::Space => "space",
+            Named::F1 => "f1",
+            Named::F2 => "f2",
+            Named::F3 => "f3",
+            Named::F4 => "f4",
+            Named::F5 => "f5",
+            Named::F6 => "f6",
+            Named::F7 => "f7",
+            Named::F8 => "f8",
+            Named::F9 => "f9",
+            Named::F10 => "f10",
+            Named::F11 => "f11",
+            Named::F12 => "f12",
+            _ => return None,
+        }
+        .to_string(),
+        _ => return None,
+    };
+    let mut binding = String::new();
+    if mods.control() {
+        binding.push_str("ctrl+");
+    }
+    if mods.shift() {
+        binding.push_str("shift+");
+    }
+    if mods.alt() {
+        binding.push_str("alt+");
+    }
+    if mods.logo() {
+        binding.push_str("super+");
+    }
+    binding.push_str(&name);
+    Some(binding)
 }
 
 /// Translate an iced key press into the bytes to send to the PTY.

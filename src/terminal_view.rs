@@ -49,6 +49,8 @@ pub enum MouseInput {
         col: usize,
         row: usize,
         up: bool,
+        /// Number of whole lines this event scrolls (≥1).
+        lines: usize,
     },
     /// Drag/jump the scrollbar to an absolute scrollback offset
     /// (0 = bottom/live view).
@@ -83,6 +85,9 @@ struct State {
     scrollbar_dragging: bool,
     last_click: Option<(Instant, usize, usize)>,
     click_count: u32,
+    /// Fractional wheel lines not yet consumed, so sub-line trackpad pixel
+    /// deltas accumulate into whole-line scrolls instead of being lost.
+    scroll_accum: f32,
 }
 
 /// Max gap between presses (ms) for them to count as a multi-click.
@@ -152,6 +157,9 @@ pub struct TermWidget<'a, Message> {
     /// as its cursor/selection. Supplied to the runtime each redraw so it can
     /// paint the over-the-spot composition overlay at the terminal cursor.
     preedit: Option<(String, Option<std::ops::Range<usize>>)>,
+    /// Current phase of the blink clock: when false, cells with the blink
+    /// attribute hide their glyph (drawn as background only).
+    blink_on: bool,
 }
 
 impl<'a, Message> TermWidget<'a, Message> {
@@ -188,7 +196,14 @@ impl<'a, Message> TermWidget<'a, Message> {
             images: Vec::new(),
             scrollbar_always: true,
             preedit: None,
+            blink_on: true,
         }
+    }
+
+    /// Set the blink clock phase (true = glyphs visible).
+    pub fn blink_on(mut self, on: bool) -> Self {
+        self.blink_on = on;
+        self
     }
 
     /// Supply the active IME pre-edit so the runtime can render the composition
@@ -355,7 +370,7 @@ where
         if self.focused {
             if let Event::Window(iced::window::Event::RedrawRequested(_)) = event {
                 let pad = self.metrics.padding;
-                let (col, row) = self.cursor;
+                let (row, col) = self.cursor;
                 let cursor_rect = Rectangle::new(
                     Point::new(
                         bounds.x + pad + col as f32 * self.metrics.cell_w,
@@ -479,18 +494,30 @@ where
                 let Some(pos) = cursor.position_over(bounds) else {
                     return;
                 };
+                // Normalize both delta kinds to lines: Lines is already in lines;
+                // Pixels is divided by the cell height. Fractions accumulate so a
+                // trackpad's stream of sub-line pixel deltas still scrolls.
                 let dy = match delta {
                     mouse::ScrollDelta::Lines { y, .. } => *y,
-                    mouse::ScrollDelta::Pixels { y, .. } => *y,
+                    mouse::ScrollDelta::Pixels { y, .. } => *y / self.metrics.cell_h.max(1.0),
                 };
                 if dy == 0.0 {
                     return;
                 }
+                let state = tree.state.downcast_mut::<State>();
+                state.scroll_accum += dy;
+                let whole = state.scroll_accum.trunc();
+                if whole == 0.0 {
+                    shell.capture_event();
+                    return;
+                }
+                state.scroll_accum -= whole;
                 let (col, row) = self.cell_at(pos, bounds);
                 shell.publish(on_mouse(MouseInput::Wheel {
                     col,
                     row,
-                    up: dy > 0.0,
+                    up: whole > 0.0,
+                    lines: whole.abs() as usize,
                 }));
                 shell.capture_event();
             }
@@ -628,16 +655,25 @@ where
             // starts at an exact cell origin — drift from approximate cell widths
             // can never accumulate across a break.
             let font = self.mono;
+            let italic_font = iced::Font {
+                style: iced::font::Style::Italic,
+                ..self.mono
+            };
             let font_size = self.metrics.font_size;
+            // Cells covered by the active selection draw their glyphs in the
+            // selection foreground color so text stays legible over the overlay.
+            let sel_range = self.selection.get(row_idx).copied().flatten();
             let mut run_text = String::new();
             let mut run_len: usize = 0;
             let mut run_fg = Color::TRANSPARENT;
             let mut run_start = 0usize;
+            let mut run_font = font;
             let emit_run = |renderer: &mut Renderer,
                             text: &mut String,
                             len: &mut usize,
                             start: usize,
-                            fg: Color| {
+                            fg: Color,
+                            run_font: iced::Font| {
                 if *len == 0 {
                     return;
                 }
@@ -648,7 +684,7 @@ where
                         bounds: Size::new(cw * *len as f32, ch),
                         size: Pixels(font_size),
                         line_height: text::LineHeight::Absolute(Pixels(ch)),
-                        font,
+                        font: run_font,
                         align_x: text::Alignment::Left,
                         align_y: iced::alignment::Vertical::Center,
                         shaping: text::Shaping::Advanced,
@@ -678,6 +714,13 @@ where
                 if cell.flags.inverse() {
                     fg = resolve_bg(cell.background, self.theme);
                 }
+                let selected = sel_range.is_some_and(|(sc, ec)| col_idx >= sc && col_idx <= ec);
+                if selected {
+                    fg = self.theme.selection_fg_color();
+                }
+                let glyph_font = if cell.flags.italic() { italic_font } else { font };
+                // Blink: during the off phase, blinking cells show no glyph.
+                let blink_hidden = cell.flags.blink() && !self.blink_on;
 
                 // Clickable links render blue (brighter when hovered) + underlined.
                 let row_links: &[&crate::link::Link] =
@@ -696,24 +739,43 @@ where
                     };
                 }
 
-                let printable = glyph != ' ' && glyph != '\0';
+                let printable = glyph != ' ' && glyph != '\0' && !blink_hidden;
 
                 if printable && !is_wide {
                     // Extend the current run, or flush and start a new one when the
-                    // color changes or the columns are no longer contiguous.
-                    if run_len != 0 && (fg != run_fg || col_idx != run_start + run_len) {
-                        emit_run(renderer, &mut run_text, &mut run_len, run_start, run_fg);
+                    // color, font (italic), or contiguity changes.
+                    if run_len != 0
+                        && (fg != run_fg
+                            || glyph_font != run_font
+                            || col_idx != run_start + run_len)
+                    {
+                        emit_run(
+                            renderer,
+                            &mut run_text,
+                            &mut run_len,
+                            run_start,
+                            run_fg,
+                            run_font,
+                        );
                     }
                     if run_len == 0 {
                         run_start = col_idx;
                         run_fg = fg;
+                        run_font = glyph_font;
                     }
                     run_text.push(glyph);
                     run_len += 1;
                 } else {
                     // Spaces and wide glyphs end any pending run; wide glyphs are
                     // drawn individually, centered over their two-cell span.
-                    emit_run(renderer, &mut run_text, &mut run_len, run_start, run_fg);
+                    emit_run(
+                        renderer,
+                        &mut run_text,
+                        &mut run_len,
+                        run_start,
+                        run_fg,
+                        run_font,
+                    );
                     if printable {
                         renderer.fill_text(
                             Text {
@@ -721,7 +783,7 @@ where
                                 bounds: Size::new(cw * span, ch),
                                 size: Pixels(font_size),
                                 line_height: text::LineHeight::Absolute(Pixels(ch)),
-                                font,
+                                font: glyph_font,
                                 align_x: text::Alignment::Center,
                                 align_y: iced::alignment::Vertical::Center,
                                 shaping: text::Shaping::Advanced,
@@ -758,7 +820,14 @@ where
                 }
             }
             // Flush any run that reached the end of the row.
-            emit_run(renderer, &mut run_text, &mut run_len, run_start, run_fg);
+            emit_run(
+                renderer,
+                &mut run_text,
+                &mut run_len,
+                run_start,
+                run_fg,
+                run_font,
+            );
         }
 
         // Cursor.
@@ -767,23 +836,30 @@ where
             let x = ox + cc as f32 * cw;
             let y = oy + cr as f32 * ch;
             let cur = self.theme.cursor_color();
+            let cursor_cell = self.grid.get(cr).and_then(|r| r.get(cc));
+            // A wide (CJK) glyph occupies two cells; the cursor must cover both.
+            let cursor_w = if cursor_cell.is_some_and(|c| c.flags.wide()) {
+                cw * 2.0
+            } else {
+                cw
+            };
             if self.focused {
                 renderer.fill_quad(
                     solid_quad(Rectangle {
                         x,
                         y,
-                        width: cw,
+                        width: cursor_w,
                         height: ch,
                     }),
                     Background::Color(cur),
                 );
-                if let Some(cell) = self.grid.get(cr).and_then(|r| r.get(cc)) {
+                if let Some(cell) = cursor_cell {
                     let glyph = cell.character;
                     if glyph != ' ' && glyph != '\0' {
                         renderer.fill_text(
                             Text {
                                 content: glyph.to_string(),
-                                bounds: Size::new(cw, ch),
+                                bounds: Size::new(cursor_w, ch),
                                 size: Pixels(self.metrics.font_size),
                                 line_height: text::LineHeight::Absolute(Pixels(ch)),
                                 font: self.mono,
@@ -792,7 +868,7 @@ where
                                 shaping: text::Shaping::Advanced,
                                 wrapping: text::Wrapping::None,
                             },
-                            Point::new(x + cw / 2.0, y + ch / 2.0),
+                            Point::new(x + cursor_w / 2.0, y + ch / 2.0),
                             default_bg,
                             clip,
                         );
@@ -803,7 +879,7 @@ where
                     bounds: Rectangle {
                         x,
                         y,
-                        width: cw,
+                        width: cursor_w,
                         height: ch,
                     },
                     border: Border {

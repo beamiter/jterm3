@@ -304,22 +304,51 @@ mod unix_pty {
                 ))
             } else if ready == 0 {
                 Ok(false)
+            } else if poll_fd.revents & libc::POLLNVAL != 0 {
+                // fd was closed (e.g. the session was dropped). Surface this as
+                // an error so the reader thread exits instead of busy-looping —
+                // poll() returns immediately on an invalid fd, which otherwise
+                // spins the CPU and leaks the thread forever.
+                Err(anyhow!("PTY fd is invalid (POLLNVAL)"))
             } else {
                 Ok((poll_fd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0)
             }
         }
 
-        /// Single non-blocking write. Returns bytes written, or WouldBlock if buffer full.
+        /// Block until the fd is writable (POLLOUT) or the timeout elapses.
+        pub fn wait_fd_writable(fd: RawFd, timeout_ms: i32) -> Result<bool> {
+            let mut poll_fd = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+            if ready < 0 {
+                Err(anyhow!(
+                    "Failed to poll PTY: {}",
+                    std::io::Error::last_os_error()
+                ))
+            } else if ready == 0 {
+                Ok(false)
+            } else {
+                Ok((poll_fd.revents & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR)) != 0)
+            }
+        }
+
+        /// Single non-blocking write. Returns bytes written, `Ok(0)` if the
+        /// buffer is full (WouldBlock), or an error for a real failure.
         pub fn write(&mut self, data: &[u8]) -> Result<usize> {
             // SAFETY: self.master 是有效的文件描述符，data.as_ptr() 指向有效的内存，
             // data.len() 是正确的长度。write 系统调用不会超出缓冲区边界。
             unsafe {
                 let n = libc::write(self.master, data.as_ptr() as *const _, data.len());
                 if n < 0 {
-                    Err(anyhow!(
-                        "Failed to write to PTY: {}",
-                        std::io::Error::last_os_error()
-                    ))
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::WouldBlock {
+                        Ok(0)
+                    } else {
+                        Err(anyhow!("Failed to write to PTY: {}", err))
+                    }
                 } else {
                     Ok(n as usize)
                 }
