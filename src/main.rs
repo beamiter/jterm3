@@ -21,8 +21,8 @@ use std::sync::Arc;
 
 use config::Config;
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, slider, stack, text,
-    text_input, Space,
+    button, checkbox, column, container, mouse_area, pick_list, row, scrollable, slider, stack,
+    text, text_input, Space,
 };
 use iced::{keyboard, Element, Length, Size, Subscription, Task};
 use pty::Pty;
@@ -32,8 +32,18 @@ use theme::Theme;
 
 /// Height reserved for the tab bar at the top of the window.
 const TAB_BAR_H: f32 = 30.0;
-/// Thickness of the divider drawn between split panes.
-const DIVIDER: f32 = 2.0;
+/// Height reserved for the status bar at the bottom of the window.
+const STATUS_BAR_H: f32 = 22.0;
+/// Default width of the file-tree sidebar when shown.
+const SIDEBAR_W: f32 = 220.0;
+/// Thickness of the divider drawn between split panes (also its drag hit area).
+const DIVIDER: f32 = 6.0;
+
+/// Stable widget ids so the overlays' text inputs can be focused on open.
+static SEARCH_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-search-input"));
+static PALETTE_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-palette-input"));
 
 /// How the active view is split into panes (MVP: at most two panes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,8 +107,17 @@ enum Message {
     NewSession,
     CloseTab(usize),
     SelectTab(usize),
+    TabHover(Option<usize>),
+    ToggleSidebar,
+    SidebarToggleNode(std::path::PathBuf),
+    SidebarInsertPath(std::path::PathBuf),
+    DividerDragStart,
+    DividerDragMove(iced::Point),
+    DividerDragEnd,
     SearchToggleRegex,
     SearchToggleCase,
+    SearchInput(String),
+    PaletteInput(String),
     PaletteExecute(usize),
     ToggleConfigPanel,
     SetTheme(String),
@@ -140,6 +159,9 @@ struct Session {
     grid: Arc<Vec<Vec<TerminalCell>>>,
     cursor: (usize, usize),
     cursor_visible: bool,
+    /// Cached working directory, refreshed periodically so the status bar can
+    /// display it without a `readlink` syscall on every render frame.
+    cwd_cache: Option<String>,
 }
 
 impl Session {
@@ -165,6 +187,7 @@ impl Session {
             grid,
             cursor,
             cursor_visible,
+            cwd_cache: None,
         })
     }
 
@@ -266,6 +289,16 @@ struct Jterm {
     focused_pane: usize,
     /// Active custom-theme editor overlay, or `None` when closed.
     theme_editor: Option<ThemeEditState>,
+    /// File-tree sidebar (left panel) and whether it is currently shown.
+    sidebar: sidebar::Sidebar,
+    sidebar_open: bool,
+    /// Split ratio for the first pane (0.1..=0.9); adjusted by dragging the
+    /// divider. 0.5 is an even split.
+    split_ratio: f32,
+    /// In-progress divider drag: the layout axis is implied by `split_mode`.
+    dragging_divider: bool,
+    /// Tab index the pointer is currently hovering (drives close-button reveal).
+    hovered_tab: Option<usize>,
     /// Held for the process lifetime to enforce single-instance behavior. When
     /// `None`, another instance already holds the lock and this one runs fresh
     /// (no session restore, no snapshot writes) to avoid clobbering its history.
@@ -331,6 +364,11 @@ impl Jterm {
             panes: vec![active],
             focused_pane: 0,
             theme_editor: None,
+            sidebar: sidebar::Sidebar::new(),
+            sidebar_open: false,
+            split_ratio: 0.5,
+            dragging_divider: false,
+            hovered_tab: None,
             _instance_lock: instance_lock,
             is_first_instance,
         };
@@ -368,8 +406,8 @@ impl Jterm {
             self.config.line_spacing,
             self.config.padding,
         );
-        let term_h = (self.win_size.height - TAB_BAR_H).max(0.0);
-        let term_w = (self.win_size.width - terminal_view::SCROLLBAR_WIDTH).max(0.0);
+        let term_h = self.term_height();
+        let term_w = (self.term_width() - terminal_view::SCROLLBAR_WIDTH).max(0.0);
         let (cols, rows) = self.metrics.grid_size(term_w, term_h);
         let resized = cols != self.cols || rows != self.rows;
         if resized {
@@ -385,6 +423,25 @@ impl Jterm {
             sess.refresh();
         }
         self.relayout();
+    }
+
+    /// Terminal area height: window minus the tab bar and status bar.
+    fn term_height(&self) -> f32 {
+        (self.win_size.height - TAB_BAR_H - STATUS_BAR_H).max(0.0)
+    }
+
+    /// Terminal area width: window minus the sidebar (when shown).
+    fn term_width(&self) -> f32 {
+        (self.win_size.width - self.sidebar_width()).max(0.0)
+    }
+
+    /// Current sidebar width (0 when hidden).
+    fn sidebar_width(&self) -> f32 {
+        if self.sidebar_open {
+            SIDEBAR_W
+        } else {
+            0.0
+        }
     }
 
     fn session_by_fd(&mut self, fd: RawFd) -> Option<&mut Session> {
@@ -529,18 +586,24 @@ impl Jterm {
     }
 
     /// Per-pane (cols, rows) for the current split mode and window size.
-    fn pane_grid(&self) -> (usize, usize) {
-        let term_h = (self.win_size.height - TAB_BAR_H).max(0.0);
-        let term_w = self.win_size.width;
+    fn pane_grid(&self, pane_pos: usize) -> (usize, usize) {
+        let term_h = self.term_height();
+        let term_w = self.term_width();
+        // Fraction of the available space this pane occupies.
+        let frac = if pane_pos == 0 {
+            self.split_ratio
+        } else {
+            1.0 - self.split_ratio
+        };
         match self.split_mode {
             SplitMode::Single => (self.cols, self.rows),
             SplitMode::Vertical => {
-                let pane_w = ((term_w - DIVIDER) / 2.0).max(0.0);
+                let pane_w = ((term_w - DIVIDER) * frac).max(0.0);
                 self.metrics
                     .grid_size((pane_w - terminal_view::SCROLLBAR_WIDTH).max(0.0), term_h)
             }
             SplitMode::Horizontal => {
-                let pane_h = ((term_h - DIVIDER) / 2.0).max(0.0);
+                let pane_h = ((term_h - DIVIDER) * frac).max(0.0);
                 self.metrics
                     .grid_size((term_w - terminal_view::SCROLLBAR_WIDTH).max(0.0), pane_h)
             }
@@ -566,8 +629,8 @@ impl Jterm {
                 self.resize_session(self.active, c, r);
             }
             _ => {
-                let (c, r) = self.pane_grid();
-                for idx in self.panes.clone() {
+                for (pos, idx) in self.panes.clone().into_iter().enumerate() {
+                    let (c, r) = self.pane_grid(pos);
                     self.resize_session(idx, c, r);
                 }
             }
@@ -702,7 +765,11 @@ impl Jterm {
             C::SearchOpen => {
                 self.search.toggle();
                 self.recompute_search();
-                Task::none()
+                if self.search.is_open {
+                    iced::widget::operation::focus(SEARCH_INPUT_ID.clone())
+                } else {
+                    Task::none()
+                }
             }
             C::SearchClose => {
                 if !self.search.is_open {
@@ -819,7 +886,11 @@ impl Jterm {
             match s.chars().next()?.to_ascii_lowercase() {
                 'p' => {
                     self.palette.toggle();
-                    return Some(Task::none());
+                    return Some(if self.palette.is_open {
+                        iced::widget::operation::focus(PALETTE_INPUT_ID.clone())
+                    } else {
+                        Task::none()
+                    });
                 }
                 'g' => {
                     self.debug_open = !self.debug_open;
@@ -1198,7 +1269,11 @@ impl Jterm {
             PaletteAction::OpenSearch => {
                 self.search.toggle();
                 self.recompute_search();
-                Task::none()
+                if self.search.is_open {
+                    iced::widget::operation::focus(SEARCH_INPUT_ID.clone())
+                } else {
+                    Task::none()
+                }
             }
             PaletteAction::ScrollToTop => {
                 if let Some(sess) = self.sessions.get_mut(self.active) {
@@ -1350,8 +1425,8 @@ impl Jterm {
             Message::Pasted(None) => {}
             Message::Resized(size) => {
                 self.win_size = size;
-                let term_h = (size.height - TAB_BAR_H).max(0.0);
-                let term_w = (size.width - terminal_view::SCROLLBAR_WIDTH).max(0.0);
+                let term_h = self.term_height();
+                let term_w = (self.term_width() - terminal_view::SCROLLBAR_WIDTH).max(0.0);
                 let (cols, rows) = self.metrics.grid_size(term_w, term_h);
                 if cols != self.cols || rows != self.rows {
                     self.cols = cols;
@@ -1381,6 +1456,47 @@ impl Jterm {
             Message::NewSession => self.new_session(),
             Message::CloseTab(i) => return self.close_session(i),
             Message::SelectTab(i) => self.jump_session(i),
+            Message::TabHover(i) => self.hovered_tab = i,
+            Message::DividerDragStart => self.dragging_divider = true,
+            Message::DividerDragEnd => self.dragging_divider = false,
+            Message::DividerDragMove(pt) => {
+                if self.dragging_divider {
+                    let ratio = match self.split_mode {
+                        SplitMode::Vertical => pt.x / self.term_width().max(1.0),
+                        SplitMode::Horizontal => pt.y / self.term_height().max(1.0),
+                        SplitMode::Single => self.split_ratio,
+                    };
+                    let ratio = ratio.clamp(0.15, 0.85);
+                    if (ratio - self.split_ratio).abs() > f32::EPSILON {
+                        self.split_ratio = ratio;
+                        self.relayout();
+                    }
+                }
+            }
+            Message::ToggleSidebar => {
+                self.sidebar_open = !self.sidebar_open;
+                if self.sidebar_open {
+                    if let Some(cwd) = self
+                        .sessions
+                        .get(self.active)
+                        .and_then(|s| s.cwd_cache.clone().or_else(|| s.cwd()))
+                    {
+                        self.sidebar.set_current_dir(std::path::PathBuf::from(cwd));
+                    }
+                }
+                self.apply_config();
+            }
+            Message::SidebarToggleNode(path) => self.sidebar.toggle_node(&path),
+            Message::SidebarInsertPath(path) => {
+                // Type the (shell-quoted) path into the active terminal so the
+                // sidebar doubles as a path picker.
+                if let Some(sess) = self.sessions.get_mut(self.active) {
+                    let quoted = shell_quote(&path.to_string_lossy());
+                    sess.terminal.scroll_to_bottom();
+                    sess.write_pty(quoted.as_bytes());
+                    sess.refresh();
+                }
+            }
             Message::SearchToggleRegex => {
                 self.search.toggle_regex();
                 self.recompute_search();
@@ -1388,6 +1504,15 @@ impl Jterm {
             Message::SearchToggleCase => {
                 self.search.toggle_case_sensitive();
                 self.recompute_search();
+            }
+            Message::SearchInput(value) => {
+                self.search.query = value;
+                self.search.history_nav_index = None;
+                self.recompute_search();
+            }
+            Message::PaletteInput(value) => {
+                self.palette.query = value;
+                self.palette.selected = 0;
             }
             Message::PaletteExecute(i) => {
                 let action = self.palette.action_at(i);
@@ -1539,6 +1664,10 @@ impl Jterm {
                 if self.session_dirty {
                     self.save_session_snapshot();
                 }
+                // Refresh the active session's cwd cache for the status bar.
+                if let Some(sess) = self.sessions.get_mut(self.active) {
+                    sess.cwd_cache = sess.cwd();
+                }
             }
         }
         self.recompute_links();
@@ -1629,6 +1758,17 @@ impl Jterm {
 
     fn tab_bar(&self) -> Element<'_, Message> {
         let mut tabs = row![].spacing(2).padding(2);
+        // Optional sidebar toggle button at the far left of the tab bar.
+        tabs = tabs.push(
+            button(text("☰").size(13))
+                .on_press(Message::ToggleSidebar)
+                .padding([3, 8])
+                .style(if self.sidebar_open {
+                    button::primary
+                } else {
+                    button::secondary
+                }),
+        );
         for (i, sess) in self.sessions.iter().enumerate() {
             let active = i == self.active;
             let label = sess.label();
@@ -1646,12 +1786,26 @@ impl Jterm {
             } else {
                 tab.style(button::secondary)
             };
-            tabs = tabs.push(tab);
-            tabs = tabs.push(
+            // Reveal the close button only on the active or hovered tab to cut
+            // visual noise; keep its footprint reserved otherwise so tabs don't
+            // jump when hovered.
+            let show_close = active || self.hovered_tab == Some(i);
+            let close: Element<'_, Message> = if show_close {
                 button(text("×").size(13))
                     .on_press(Message::CloseTab(i))
                     .padding([3, 6])
-                    .style(button::secondary),
+                    .style(button::secondary)
+                    .into()
+            } else {
+                Space::new().width(Length::Fixed(18.0)).into()
+            };
+            let cell = row![tab, close]
+                .spacing(1)
+                .align_y(iced::Alignment::Center);
+            tabs = tabs.push(
+                mouse_area(cell)
+                    .on_enter(Message::TabHover(Some(i)))
+                    .on_exit(Message::TabHover(None)),
             );
         }
         tabs = tabs.push(
@@ -1660,9 +1814,67 @@ impl Jterm {
                 .padding([3, 8])
                 .style(button::secondary),
         );
-        container(tabs)
+        let scroller = scrollable(tabs)
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new().width(0).scroller_width(0),
+            ))
+            .width(Length::Fill);
+        container(scroller)
             .width(Length::Fill)
             .height(Length::Fixed(TAB_BAR_H))
+            .into()
+    }
+
+    /// Bottom status bar: cwd, grid size, cursor position, and search state.
+    fn status_bar(&self) -> Element<'_, Message> {
+        let sess = self.sessions.get(self.active);
+        let cwd = sess
+            .and_then(|s| s.cwd_cache.clone())
+            .map(|p| {
+                // Abbreviate the home directory to `~` to keep the bar compact.
+                if let Some(home) = dirs::home_dir().and_then(|h| h.to_str().map(String::from)) {
+                    if let Some(rest) = p.strip_prefix(&home) {
+                        return format!("~{rest}");
+                    }
+                }
+                p
+            })
+            .unwrap_or_default();
+        let (cur_row, cur_col) = sess.map(|s| s.cursor).unwrap_or((0, 0));
+        let grid = format!("{}×{}", self.cols, self.rows);
+        let pos = format!("{}:{}", cur_row + 1, cur_col + 1);
+
+        let mut right = row![
+            text(grid).size(11).style(text::secondary),
+            text(pos).size(11).style(text::secondary),
+        ]
+        .spacing(14)
+        .align_y(iced::Alignment::Center);
+        if self.search.is_open && !self.search.matches.is_empty() {
+            right = right.push(
+                text(format!(
+                    "{}/{}",
+                    self.search.current_match_index + 1,
+                    self.search.matches.len()
+                ))
+                .size(11)
+                .style(text::secondary),
+            );
+        }
+
+        let bar = row![
+            text(cwd).size(11).style(text::secondary),
+            Space::new().width(Length::Fill),
+            right,
+        ]
+        .spacing(14)
+        .align_y(iced::Alignment::Center);
+        container(bar)
+            .width(Length::Fill)
+            .height(Length::Fixed(STATUS_BAR_H))
+            .padding([0, 10])
+            .align_y(iced::Alignment::Center)
+            .style(container::dark)
             .into()
     }
 
@@ -1672,7 +1884,11 @@ impl Jterm {
     fn pane_view(&self, pane_pos: usize) -> Element<'_, Message> {
         let sess_idx = self.panes[pane_pos];
         let sess = &self.sessions[sess_idx];
-        let focused = self.focused && pane_pos == self.focused_pane;
+        // An open overlay input owns the keyboard and IME, so the terminal pane
+        // renders unfocused (no blinking cursor, no competing IME request).
+        let overlay_input_active = self.search.is_open || self.palette.is_open;
+        let focused =
+            self.focused && pane_pos == self.focused_pane && !overlay_input_active;
         let is_active = sess_idx == self.active;
         // Only walk the grid to build per-row selection spans when a selection
         // actually exists; otherwise hand the widget an empty Vec (no highlight).
@@ -1733,7 +1949,81 @@ impl Jterm {
         .into()
     }
 
-    /// A thin divider strip drawn between split panes.
+    /// Left file-tree sidebar. Directories toggle expand/collapse on click;
+    /// files type their (quoted) path into the active terminal.
+    fn sidebar_view(&self) -> Element<'_, Message> {
+        let title = self
+            .sidebar
+            .current_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("/")
+            .to_string();
+        let mut rows: Vec<Element<'_, Message>> = vec![container(
+            text(title).size(12).font(iced::Font {
+                weight: iced::font::Weight::Bold,
+                ..iced::Font::DEFAULT
+            }),
+        )
+        .padding([4, 6])
+        .into()];
+        if let Some(root) = &self.sidebar.root {
+            for child in &root.children {
+                Self::collect_sidebar_nodes(child, 0, &mut rows);
+            }
+        }
+        let list = iced::widget::Column::with_children(rows).spacing(1);
+        container(scrollable(list).height(Length::Fill))
+            .width(Length::Fixed(SIDEBAR_W))
+            .height(Length::Fill)
+            .style(container::dark)
+            .into()
+    }
+
+    /// Recursively flatten a file-tree node (and expanded descendants) into rows.
+    fn collect_sidebar_nodes<'a>(
+        node: &'a sidebar::FileTreeNode,
+        depth: usize,
+        out: &mut Vec<Element<'a, Message>>,
+    ) {
+        let indent = 6.0 + depth as f32 * 12.0;
+        let icon = if node.is_dir {
+            if node.expanded {
+                "▾"
+            } else {
+                "▸"
+            }
+        } else {
+            "·"
+        };
+        let label = row![
+            Space::new().width(Length::Fixed(indent)),
+            text(icon).size(12).width(Length::Fixed(14.0)),
+            text(node.name.clone()).size(12),
+        ]
+        .align_y(iced::Alignment::Center);
+        let msg = if node.is_dir {
+            Message::SidebarToggleNode(node.path.clone())
+        } else {
+            Message::SidebarInsertPath(node.path.clone())
+        };
+        out.push(
+            button(label)
+                .on_press(msg)
+                .width(Length::Fill)
+                .padding([1, 2])
+                .style(button::text)
+                .into(),
+        );
+        if node.is_dir && node.expanded {
+            for child in &node.children {
+                Self::collect_sidebar_nodes(child, depth + 1, out);
+            }
+        }
+    }
+
+    /// A draggable divider strip drawn between split panes. Pressing it starts a
+    /// resize drag (continued via the body's `on_move` while `dragging_divider`).
     fn divider(&self, horizontal: bool) -> Element<'_, Message> {
         let d = if horizontal {
             container(Space::new())
@@ -1744,22 +2034,33 @@ impl Jterm {
                 .width(Length::Fixed(DIVIDER))
                 .height(Length::Fill)
         };
-        d.style(container::dark).into()
+        let interaction = if horizontal {
+            iced::mouse::Interaction::ResizingVertically
+        } else {
+            iced::mouse::Interaction::ResizingHorizontally
+        };
+        mouse_area(d.style(container::dark))
+            .on_press(Message::DividerDragStart)
+            .interaction(interaction)
+            .into()
     }
 
     fn view(&self) -> Element<'_, Message> {
         if self.panes.is_empty() || self.sessions.is_empty() {
             return container(text("no session")).into();
         }
+        // Integer FillPortions approximating the float split ratio.
+        let p0 = (self.split_ratio * 1000.0).round().clamp(1.0, 999.0) as u16;
+        let p1 = 1000 - p0;
         let panes_body: Element<'_, Message> = match self.split_mode {
             SplitMode::Single => self.pane_view(0),
             SplitMode::Vertical => row![
                 container(self.pane_view(0))
-                    .width(Length::FillPortion(1))
+                    .width(Length::FillPortion(p0))
                     .height(Length::Fill),
                 self.divider(false),
                 container(self.pane_view(1))
-                    .width(Length::FillPortion(1))
+                    .width(Length::FillPortion(p1))
                     .height(Length::Fill),
             ]
             .width(Length::Fill)
@@ -1768,15 +2069,27 @@ impl Jterm {
             SplitMode::Horizontal => column![
                 container(self.pane_view(0))
                     .width(Length::Fill)
-                    .height(Length::FillPortion(1)),
+                    .height(Length::FillPortion(p0)),
                 self.divider(true),
                 container(self.pane_view(1))
                     .width(Length::Fill)
-                    .height(Length::FillPortion(1)),
+                    .height(Length::FillPortion(p1)),
             ]
             .width(Length::Fill)
             .height(Length::Fill)
             .into(),
+        };
+        // While dragging the divider, wrap the panes in a mouse_area so pointer
+        // moves drive the resize and release ends it. The handler is attached
+        // only during a drag to avoid emitting a message on every idle move.
+        let panes_body: Element<'_, Message> = if self.dragging_divider {
+            mouse_area(panes_body)
+                .on_move(Message::DividerDragMove)
+                .on_release(Message::DividerDragEnd)
+                .on_exit(Message::DividerDragEnd)
+                .into()
+        } else {
+            panes_body
         };
         let body = container(panes_body).width(Length::Fill).height(Length::Fill);
         let body: Element<'_, Message> = if self.config_panel_open {
@@ -1802,19 +2115,25 @@ impl Jterm {
         } else {
             body
         };
-        column![self.tab_bar(), body]
+        // Optional file-tree sidebar to the left of the terminal body.
+        let main_area: Element<'_, Message> = if self.sidebar_open {
+            row![self.sidebar_view(), body]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else {
+            body
+        };
+        column![self.tab_bar(), main_area, self.status_bar()]
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
     }
 
-    /// Display-only search bar overlaid at the top-right of the terminal.
+    /// Search bar overlaid at the top-right of the terminal. The query is an
+    /// editable `text_input`; Enter/Esc/arrows are still handled at the app level
+    /// (the input deliberately has no `on_submit` so Shift+Enter can mean "prev").
     fn search_bar(&self) -> Element<'_, Message> {
-        let query = if self.search.query.is_empty() {
-            "_".to_string()
-        } else {
-            self.search.query.clone()
-        };
         let status = if let Some(err) = &self.search.error_message {
             err.clone()
         } else if !self.search.matches.is_empty() {
@@ -1847,7 +2166,12 @@ impl Jterm {
                 button::secondary
             });
 
-        let mut bar = row![text("Find:").size(13), text(query).size(13)]
+        let input = text_input("search…", &self.search.query)
+            .id(SEARCH_INPUT_ID.clone())
+            .on_input(Message::SearchInput)
+            .size(13)
+            .width(Length::Fixed(220.0));
+        let mut bar = row![text("Find:").size(13), input]
             .spacing(8)
             .align_y(iced::Alignment::Center);
         if !status.is_empty() {
@@ -1867,11 +2191,10 @@ impl Jterm {
     /// Centered, fuzzy-filtered command palette overlay. Keys are handled at
     /// the app level (`handle_palette_key`); rows are also mouse-clickable.
     fn command_palette(&self) -> Element<'_, Message> {
-        let query: Element<'_, Message> = if self.palette.query.is_empty() {
-            text("Type to filter…").size(14).style(text::secondary).into()
-        } else {
-            text(self.palette.query.clone()).size(14).into()
-        };
+        let query = text_input("Type to filter…", &self.palette.query)
+            .id(PALETTE_INPUT_ID.clone())
+            .on_input(Message::PaletteInput)
+            .size(14);
         let query_line = row![text("›").size(16), query]
             .spacing(8)
             .align_y(iced::Alignment::Center);
@@ -2289,10 +2612,15 @@ impl Jterm {
             .iter()
             .map(|s| pty_subscription(s.id, s.master_fd))
             .collect();
-        let events = iced::event::listen_with(|event, _status, _id| match event {
+        let events = iced::event::listen_with(|event, status, _id| match event {
             iced::Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => {
                 Some(Message::ModifiersChanged(m))
             }
+            // When an overlay text input is focused it captures the keys it
+            // consumes (typing, Backspace, cursor movement). Dropping captured
+            // keyboard events here keeps them from also reaching the terminal,
+            // so editing the search/palette query never double-inputs.
+            iced::Event::Keyboard(_) if status == iced::event::Status::Captured => None,
             iced::Event::Keyboard(k) => Some(Message::Key(k)),
             iced::Event::InputMethod(ime) => Some(Message::Ime(ime)),
             iced::Event::Window(iced::window::Event::Resized(size)) => {
@@ -2353,6 +2681,21 @@ fn btn_code(button: MouseButton) -> u8 {
 }
 
 /// Wrap a paste payload in bracketed-paste delimiters.
+/// Shell-quote a path for typing into the terminal, with a trailing space.
+fn shell_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    let safe = s
+        .chars()
+        .all(|c| c.is_alphanumeric() || "._-/~".contains(c));
+    if safe {
+        format!("{s} ")
+    } else {
+        format!("'{}' ", s.replace('\'', "'\\''"))
+    }
+}
+
 fn wrap_bracketed_paste(mut payload: Vec<u8>) -> Vec<u8> {
     let mut wrapped = Vec::with_capacity(payload.len() + 12);
     wrapped.extend_from_slice(b"\x1b[200~");
