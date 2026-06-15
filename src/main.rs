@@ -449,21 +449,17 @@ impl Jterm {
         self.relayout();
     }
 
-    /// Whether the top tab strip is rendered (only in `Top` tab-position mode).
-    fn top_bar_shown(&self) -> bool {
-        self.config.tab_position == config::TabPosition::Top
-    }
-
     /// Whether the left dock is shown. Follows the manual `sidebar_open` toggle
     /// in both tab-position modes, so the dock can always be collapsed.
     fn dock_open(&self) -> bool {
         self.sidebar_open
     }
 
-    /// Terminal area height: window minus the (optional) tab bar and status bar.
+    /// Terminal area height: window minus the tab bar and status bar. The top bar
+    /// is always reserved (even in side-tab mode, where it hosts the dock toggle)
+    /// so floating chrome never overlaps terminal content.
     fn term_height(&self) -> f32 {
-        let top = if self.top_bar_shown() { TAB_BAR_H } else { 0.0 };
-        (self.win_size.height - top - STATUS_BAR_H).max(0.0)
+        (self.win_size.height - TAB_BAR_H - STATUS_BAR_H).max(0.0)
     }
 
     /// Terminal area width: window minus the sidebar (when shown).
@@ -1829,7 +1825,7 @@ impl Jterm {
 
     fn tab_bar(&self) -> Element<'_, Message> {
         let mut tabs = row![].spacing(2).padding(2);
-        // Optional sidebar toggle button at the far left of the tab bar.
+        // Sidebar/dock toggle button at the far left of the tab bar.
         tabs = tabs.push(
             button(text("☰").size(13))
                 .on_press(Message::ToggleSidebar)
@@ -1840,6 +1836,20 @@ impl Jterm {
                     button::secondary
                 }),
         );
+        // In side-tab mode the tab list lives in the dock; the top bar keeps only
+        // the dock toggle plus a button to move tabs back to the top.
+        if self.config.tab_position == config::TabPosition::Side {
+            tabs = tabs.push(
+                button(text("▔ Tabs to top").size(13))
+                    .on_press(Message::SetTabPosition(config::TabPosition::Top))
+                    .padding([3, 8])
+                    .style(button::secondary),
+            );
+            return container(tabs)
+                .width(Length::Fill)
+                .height(Length::Fixed(TAB_BAR_H))
+                .into();
+        }
         // Dock the tab strip into the left sidebar (vertical tab list).
         tabs = tabs.push(
             button(text("◧").size(13))
@@ -2042,8 +2052,8 @@ impl Jterm {
                     button::secondary
                 })
         };
-        let mut header = row![
-            // Collapse the dock. A floating button reopens it (see `view`).
+        let header = row![
+            // Collapse the dock; the top-bar ☰ reopens it.
             button(text("☰").size(12))
                 .on_press(Message::ToggleSidebar)
                 .padding([2, 8])
@@ -2054,15 +2064,6 @@ impl Jterm {
         ]
         .spacing(4)
         .align_y(iced::Alignment::Center);
-        // When tabs are docked here, offer a button to move them back to the top.
-        if self.config.tab_position == config::TabPosition::Side {
-            header = header.push(
-                button(text("▔").size(12))
-                    .on_press(Message::SetTabPosition(config::TabPosition::Top))
-                    .padding([2, 8])
-                    .style(button::secondary),
-            );
-        }
         let header = container(header).padding([4, 6]);
 
         let panel: Element<'_, Message> = match self.sidebar_panel {
@@ -2297,27 +2298,12 @@ impl Jterm {
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
-        } else if !self.top_bar_shown() {
-            // Side mode with the dock collapsed: there is no top bar, so float a
-            // small reopen affordance over the terminal's top-left corner.
-            let reopen = container(
-                button(text("☰").size(13))
-                    .on_press(Message::ToggleSidebar)
-                    .padding([3, 8])
-                    .style(button::secondary),
-            )
-            .padding(4);
-            stack![body, reopen].into()
         } else {
             body
         };
-        // The top tab strip is hidden when tabs are docked to the side.
-        let mut root = column![];
-        if self.top_bar_shown() {
-            root = root.push(self.tab_bar());
-        }
-        root.push(main_area)
-            .push(self.status_bar())
+        // The top bar is always present: in Top mode it holds the tab strip; in
+        // Side mode it holds the dock toggle so chrome never overlaps the grid.
+        column![self.tab_bar(), main_area, self.status_bar()]
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
