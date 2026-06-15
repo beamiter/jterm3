@@ -344,13 +344,15 @@ impl Jterm {
         let (sessions, active, next_id) =
             Self::restore_or_spawn(&config, cols, rows, is_first_instance);
 
-        // In Side mode the dock hosts the tab list by default; otherwise it opens
-        // onto the file tree.
-        let sidebar_panel = if config.tab_position == config::TabPosition::Side {
+        // In Side mode the dock hosts the tab list and starts open (there is no
+        // top bar to show tabs otherwise); in Top mode it starts collapsed.
+        let side_tabs = config.tab_position == config::TabPosition::Side;
+        let sidebar_panel = if side_tabs {
             SidebarPanel::Tabs
         } else {
             SidebarPanel::Files
         };
+        let sidebar_open = side_tabs;
 
         let app = Jterm {
             config,
@@ -386,7 +388,7 @@ impl Jterm {
             focused_pane: 0,
             theme_editor: None,
             sidebar: sidebar::Sidebar::new(),
-            sidebar_open: false,
+            sidebar_open,
             sidebar_panel,
             split_ratio: 0.5,
             dragging_divider: false,
@@ -452,10 +454,10 @@ impl Jterm {
         self.config.tab_position == config::TabPosition::Top
     }
 
-    /// Whether the left dock is shown. It is always shown in `Side` mode (it
-    /// hosts the tab list); in `Top` mode it follows the manual `sidebar_open`.
+    /// Whether the left dock is shown. Follows the manual `sidebar_open` toggle
+    /// in both tab-position modes, so the dock can always be collapsed.
     fn dock_open(&self) -> bool {
-        self.config.tab_position == config::TabPosition::Side || self.sidebar_open
+        self.sidebar_open
     }
 
     /// Terminal area height: window minus the (optional) tab bar and status bar.
@@ -1537,9 +1539,10 @@ impl Jterm {
                 if self.config.tab_position != pos {
                     self.config.tab_position = pos;
                     match pos {
-                        // Docking tabs to the side: the dock is always shown there,
-                        // so surface the tab list immediately.
+                        // Docking tabs to the side: open the dock and surface the
+                        // tab list (there is no top bar to show tabs otherwise).
                         config::TabPosition::Side => {
+                            self.sidebar_open = true;
                             self.sidebar_panel = SidebarPanel::Tabs;
                         }
                         // Returning tabs to the top bar: collapse the dock back to
@@ -2040,6 +2043,11 @@ impl Jterm {
                 })
         };
         let mut header = row![
+            // Collapse the dock. A floating button reopens it (see `view`).
+            button(text("☰").size(12))
+                .on_press(Message::ToggleSidebar)
+                .padding([2, 8])
+                .style(button::secondary),
             panel_btn("Tabs", SidebarPanel::Tabs),
             panel_btn("Files", SidebarPanel::Files),
             Space::new().width(Length::Fill),
@@ -2289,6 +2297,17 @@ impl Jterm {
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
+        } else if !self.top_bar_shown() {
+            // Side mode with the dock collapsed: there is no top bar, so float a
+            // small reopen affordance over the terminal's top-left corner.
+            let reopen = container(
+                button(text("☰").size(13))
+                    .on_press(Message::ToggleSidebar)
+                    .padding([3, 8])
+                    .style(button::secondary),
+            )
+            .padding(4);
+            stack![body, reopen].into()
         } else {
             body
         };
