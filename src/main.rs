@@ -2053,11 +2053,6 @@ impl Jterm {
                 })
         };
         let header = row![
-            // Collapse the dock; the top-bar ☰ reopens it.
-            button(text("☰").size(12))
-                .on_press(Message::ToggleSidebar)
-                .padding([2, 8])
-                .style(button::secondary),
             panel_btn("Tabs", SidebarPanel::Tabs),
             panel_btn("Files", SidebarPanel::Files),
             Space::new().width(Length::Fill),
