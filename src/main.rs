@@ -45,6 +45,15 @@ static SEARCH_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
 static PALETTE_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-palette-input"));
 
+/// Which content the left sidebar dock currently shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarPanel {
+    /// File-tree browser (doubles as a path picker).
+    Files,
+    /// Vertical session tab list.
+    Tabs,
+}
+
 /// How the active view is split into panes (MVP: at most two panes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SplitMode {
@@ -109,6 +118,8 @@ enum Message {
     SelectTab(usize),
     TabHover(Option<usize>),
     ToggleSidebar,
+    SetSidebarPanel(SidebarPanel),
+    SetTabPosition(config::TabPosition),
     SidebarToggleNode(std::path::PathBuf),
     SidebarInsertPath(std::path::PathBuf),
     DividerDragStart,
@@ -292,6 +303,8 @@ struct Jterm {
     /// File-tree sidebar (left panel) and whether it is currently shown.
     sidebar: sidebar::Sidebar,
     sidebar_open: bool,
+    /// Which content the sidebar dock shows (file tree or tab list).
+    sidebar_panel: SidebarPanel,
     /// Split ratio for the first pane (0.1..=0.9); adjusted by dragging the
     /// divider. 0.5 is an even split.
     split_ratio: f32,
@@ -331,6 +344,14 @@ impl Jterm {
         let (sessions, active, next_id) =
             Self::restore_or_spawn(&config, cols, rows, is_first_instance);
 
+        // In Side mode the dock hosts the tab list by default; otherwise it opens
+        // onto the file tree.
+        let sidebar_panel = if config.tab_position == config::TabPosition::Side {
+            SidebarPanel::Tabs
+        } else {
+            SidebarPanel::Files
+        };
+
         let app = Jterm {
             config,
             theme,
@@ -366,6 +387,7 @@ impl Jterm {
             theme_editor: None,
             sidebar: sidebar::Sidebar::new(),
             sidebar_open: false,
+            sidebar_panel,
             split_ratio: 0.5,
             dragging_divider: false,
             hovered_tab: None,
@@ -425,9 +447,21 @@ impl Jterm {
         self.relayout();
     }
 
-    /// Terminal area height: window minus the tab bar and status bar.
+    /// Whether the top tab strip is rendered (only in `Top` tab-position mode).
+    fn top_bar_shown(&self) -> bool {
+        self.config.tab_position == config::TabPosition::Top
+    }
+
+    /// Whether the left dock is shown. It is always shown in `Side` mode (it
+    /// hosts the tab list); in `Top` mode it follows the manual `sidebar_open`.
+    fn dock_open(&self) -> bool {
+        self.config.tab_position == config::TabPosition::Side || self.sidebar_open
+    }
+
+    /// Terminal area height: window minus the (optional) tab bar and status bar.
     fn term_height(&self) -> f32 {
-        (self.win_size.height - TAB_BAR_H - STATUS_BAR_H).max(0.0)
+        let top = if self.top_bar_shown() { TAB_BAR_H } else { 0.0 };
+        (self.win_size.height - top - STATUS_BAR_H).max(0.0)
     }
 
     /// Terminal area width: window minus the sidebar (when shown).
@@ -437,7 +471,7 @@ impl Jterm {
 
     /// Current sidebar width (0 when hidden).
     fn sidebar_width(&self) -> f32 {
-        if self.sidebar_open {
+        if self.dock_open() {
             SIDEBAR_W
         } else {
             0.0
@@ -1486,6 +1520,40 @@ impl Jterm {
                 }
                 self.apply_config();
             }
+            Message::SetSidebarPanel(panel) => {
+                self.sidebar_panel = panel;
+                // Opening the file tree should reflect the active tab's cwd.
+                if panel == SidebarPanel::Files {
+                    if let Some(cwd) = self
+                        .sessions
+                        .get(self.active)
+                        .and_then(|s| s.cwd_cache.clone().or_else(|| s.cwd()))
+                    {
+                        self.sidebar.set_current_dir(std::path::PathBuf::from(cwd));
+                    }
+                }
+            }
+            Message::SetTabPosition(pos) => {
+                if self.config.tab_position != pos {
+                    self.config.tab_position = pos;
+                    match pos {
+                        // Docking tabs to the side: the dock is always shown there,
+                        // so surface the tab list immediately.
+                        config::TabPosition::Side => {
+                            self.sidebar_panel = SidebarPanel::Tabs;
+                        }
+                        // Returning tabs to the top bar: collapse the dock back to
+                        // the classic top-only layout.
+                        config::TabPosition::Top => {
+                            self.sidebar_open = false;
+                            self.sidebar_panel = SidebarPanel::Files;
+                        }
+                    }
+                    // Layout chrome changed (top bar shown/hidden, dock width):
+                    // recompute the grid.
+                    self.apply_config();
+                }
+            }
             Message::SidebarToggleNode(path) => self.sidebar.toggle_node(&path),
             Message::SidebarInsertPath(path) => {
                 // Type the (shell-quoted) path into the active terminal so the
@@ -1769,6 +1837,13 @@ impl Jterm {
                     button::secondary
                 }),
         );
+        // Dock the tab strip into the left sidebar (vertical tab list).
+        tabs = tabs.push(
+            button(text("◧").size(13))
+                .on_press(Message::SetTabPosition(config::TabPosition::Side))
+                .padding([3, 8])
+                .style(button::secondary),
+        );
         for (i, sess) in self.sessions.iter().enumerate() {
             let active = i == self.active;
             let label = sess.label();
@@ -1949,9 +2024,54 @@ impl Jterm {
         .into()
     }
 
-    /// Left file-tree sidebar. Directories toggle expand/collapse on click;
-    /// files type their (quoted) path into the active terminal.
+    /// Left dock. A header lets the user switch between the file tree and the
+    /// vertical tab list and dock the tab strip back to the top.
     fn sidebar_view(&self) -> Element<'_, Message> {
+        // Panel switcher: highlight the active panel.
+        let panel_btn = |label: &str, panel: SidebarPanel| {
+            let active = self.sidebar_panel == panel;
+            button(text(label.to_string()).size(12))
+                .on_press(Message::SetSidebarPanel(panel))
+                .padding([2, 8])
+                .style(if active {
+                    button::primary
+                } else {
+                    button::secondary
+                })
+        };
+        let mut header = row![
+            panel_btn("Tabs", SidebarPanel::Tabs),
+            panel_btn("Files", SidebarPanel::Files),
+            Space::new().width(Length::Fill),
+        ]
+        .spacing(4)
+        .align_y(iced::Alignment::Center);
+        // When tabs are docked here, offer a button to move them back to the top.
+        if self.config.tab_position == config::TabPosition::Side {
+            header = header.push(
+                button(text("▔").size(12))
+                    .on_press(Message::SetTabPosition(config::TabPosition::Top))
+                    .padding([2, 8])
+                    .style(button::secondary),
+            );
+        }
+        let header = container(header).padding([4, 6]);
+
+        let panel: Element<'_, Message> = match self.sidebar_panel {
+            SidebarPanel::Tabs => self.sidebar_tabs_view(),
+            SidebarPanel::Files => self.sidebar_files_view(),
+        };
+
+        container(column![header, panel].spacing(2))
+            .width(Length::Fixed(SIDEBAR_W))
+            .height(Length::Fill)
+            .style(container::dark)
+            .into()
+    }
+
+    /// File-tree panel body. Directories toggle expand/collapse on click; files
+    /// type their (quoted) path into the active terminal.
+    fn sidebar_files_view(&self) -> Element<'_, Message> {
         let title = self
             .sidebar
             .current_dir
@@ -1973,11 +2093,59 @@ impl Jterm {
             }
         }
         let list = iced::widget::Column::with_children(rows).spacing(1);
-        container(scrollable(list).height(Length::Fill))
-            .width(Length::Fixed(SIDEBAR_W))
-            .height(Length::Fill)
-            .style(container::dark)
-            .into()
+        scrollable(list).height(Length::Fill).into()
+    }
+
+    /// Vertical session tab list shown in the dock. Mirrors the top tab strip:
+    /// click to select, hover to reveal close, and a trailing "new tab" button.
+    fn sidebar_tabs_view(&self) -> Element<'_, Message> {
+        let mut list = column![].spacing(2).padding([2, 4]);
+        for (i, sess) in self.sessions.iter().enumerate() {
+            let active = i == self.active;
+            let label = sess.label();
+            let label = if label.chars().count() > 22 {
+                let truncated: String = label.chars().take(21).collect();
+                format!("{truncated}…")
+            } else {
+                label
+            };
+            let tab = button(text(label).size(13))
+                .on_press(Message::SelectTab(i))
+                .width(Length::Fill)
+                .padding([4, 8])
+                .style(if active {
+                    button::primary
+                } else {
+                    button::secondary
+                });
+            // Reveal the close button on the active or hovered tab only.
+            let show_close = active || self.hovered_tab == Some(i);
+            let close: Element<'_, Message> = if show_close {
+                button(text("×").size(13))
+                    .on_press(Message::CloseTab(i))
+                    .padding([4, 6])
+                    .style(button::secondary)
+                    .into()
+            } else {
+                Space::new().width(Length::Fixed(20.0)).into()
+            };
+            let cell = row![tab, close]
+                .spacing(2)
+                .align_y(iced::Alignment::Center);
+            list = list.push(
+                mouse_area(cell)
+                    .on_enter(Message::TabHover(Some(i)))
+                    .on_exit(Message::TabHover(None)),
+            );
+        }
+        list = list.push(
+            button(text("+ New tab").size(13))
+                .on_press(Message::NewSession)
+                .width(Length::Fill)
+                .padding([4, 8])
+                .style(button::secondary),
+        );
+        scrollable(list).height(Length::Fill).into()
     }
 
     /// Recursively flatten a file-tree node (and expanded descendants) into rows.
@@ -2115,8 +2283,8 @@ impl Jterm {
         } else {
             body
         };
-        // Optional file-tree sidebar to the left of the terminal body.
-        let main_area: Element<'_, Message> = if self.sidebar_open {
+        // Optional left dock (file tree and/or tab list) beside the terminal.
+        let main_area: Element<'_, Message> = if self.dock_open() {
             row![self.sidebar_view(), body]
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -2124,7 +2292,13 @@ impl Jterm {
         } else {
             body
         };
-        column![self.tab_bar(), main_area, self.status_bar()]
+        // The top tab strip is hidden when tabs are docked to the side.
+        let mut root = column![];
+        if self.top_bar_shown() {
+            root = root.push(self.tab_bar());
+        }
+        root.push(main_area)
+            .push(self.status_bar())
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -2342,6 +2516,20 @@ impl Jterm {
         .spacing(10)
         .align_y(iced::Alignment::Center);
 
+        let tab_position_row = row![
+            text("Tabs").size(13).width(Length::Fixed(120.0)),
+            checkbox(self.config.tab_position == config::TabPosition::Side)
+                .label("In sidebar")
+                .text_size(13)
+                .on_toggle(|side| Message::SetTabPosition(if side {
+                    config::TabPosition::Side
+                } else {
+                    config::TabPosition::Top
+                })),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+
         let buttons = row![
             button(text("Save").size(13)).on_press(Message::ConfigSave),
             button(text("Reset").size(13))
@@ -2368,6 +2556,7 @@ impl Jterm {
                 scrollback,
                 scroll_speed,
                 scrollbar_row,
+                tab_position_row,
                 buttons,
                 footer,
             ]

@@ -56,6 +56,19 @@ pub enum ScrollbarVisibility {
 }
 
 
+/// Where the session tab strip is rendered.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum TabPosition {
+    /// Horizontal tab strip across the top of the window.
+    #[default]
+    Top,
+    /// Vertical tab list docked in the left sidebar.
+    Side,
+}
+
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_font_size")]
@@ -81,6 +94,9 @@ pub struct Config {
 
     #[serde(default)]
     pub scrollbar_visibility: ScrollbarVisibility,
+
+    #[serde(default)]
+    pub tab_position: TabPosition,
 
     #[serde(default = "default_scrollback_lines")]
     pub scrollback_lines: usize,
@@ -253,6 +269,7 @@ impl Default for Config {
             padding: default_padding(),
             line_spacing: default_line_spacing(),
             scrollbar_visibility: ScrollbarVisibility::default(),
+            tab_position: TabPosition::default(),
             scrollback_lines: default_scrollback_lines(),
             initial_width: default_initial_width(),
             initial_height: default_initial_height(),
