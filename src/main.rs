@@ -24,7 +24,7 @@ use iced::widget::{
     button, checkbox, column, container, mouse_area, pick_list, row, scrollable, slider, stack,
     text, text_input, Space,
 };
-use iced::{keyboard, Element, Length, Size, Subscription, Task};
+use iced::{keyboard, Color, Element, Length, Size, Subscription, Task};
 use pty::Pty;
 use terminal::{TerminalCell, TerminalState};
 use terminal_view::{KittyRender, Metrics, MouseButton, MouseInput, TermWidget};
@@ -73,6 +73,16 @@ enum SplitMode {
 /// missing family falls back to the built-in monospace font. The name is leaked
 /// because `iced::Font::with_name` requires `&'static str`; family changes are
 /// rare so the leak is negligible.
+/// Linear blend between two colors (t=0 → a, t=1 → b); result is fully opaque.
+fn blend(a: Color, b: Color, t: f32) -> Color {
+    Color {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: 1.0,
+    }
+}
+
 fn resolve_mono_font(family: &str) -> iced::Font {
     let f = family.trim();
     if f.is_empty() {
@@ -1848,6 +1858,128 @@ impl Jterm {
             .detect_links_in_visible_cells_with_wrapping(&sess.grid, &row_wrapped);
     }
 
+    // --- Theme-derived chrome colors and styles ---------------------------
+    fn c_panel(&self) -> Color {
+        Theme::rgb_to_color32(self.theme.ui.panel_bg)
+    }
+    fn c_text(&self) -> Color {
+        Theme::rgb_to_color32(self.theme.ui.text)
+    }
+    fn c_text_dim(&self) -> Color {
+        Theme::rgb_to_color32(self.theme.ui.text_disabled)
+    }
+    fn c_border(&self) -> Color {
+        Theme::rgb_to_color32(self.theme.ui.border)
+    }
+    fn c_accent(&self) -> Color {
+        Theme::rgb_to_color32(self.theme.tabbar.active_border)
+    }
+
+    /// Top tab bar / status bar background, matching the theme's tabbar color.
+    fn chrome_bar_style(&self) -> impl Fn(&iced::Theme) -> container::Style {
+        let bg = Theme::rgb_to_color32(self.theme.tabbar.bg);
+        let text = self.c_text();
+        move |_| container::Style {
+            text_color: Some(text),
+            background: Some(bg.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Sidebar dock background, matching the theme's panel color.
+    fn panel_style(&self) -> impl Fn(&iced::Theme) -> container::Style {
+        let bg = self.c_panel();
+        let text = self.c_text();
+        move |_| container::Style {
+            text_color: Some(text),
+            background: Some(bg.into()),
+            ..Default::default()
+        }
+    }
+
+    fn divider_style(&self) -> impl Fn(&iced::Theme) -> container::Style {
+        let bg = self.c_border();
+        move |_| container::Style {
+            background: Some(bg.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Tab button: accent-tinted + bordered when active, flat otherwise.
+    fn tab_btn_style(&self, active: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+        let base = Theme::rgb_to_color32(self.theme.tabbar.bg);
+        let accent = self.c_accent();
+        let active_text = Theme::rgb_to_color32(self.theme.tabbar.active_text);
+        let inactive_text = Theme::rgb_to_color32(self.theme.tabbar.inactive_text);
+        move |_t, status| {
+            let (bg, txt, bw) = if active {
+                (blend(base, accent, 0.22), active_text, 1.0)
+            } else {
+                let bg = match status {
+                    button::Status::Hovered => blend(base, accent, 0.10),
+                    _ => base,
+                };
+                (bg, inactive_text, 0.0)
+            };
+            button::Style {
+                background: Some(bg.into()),
+                text_color: txt,
+                border: iced::Border {
+                    color: accent,
+                    width: bw,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            }
+        }
+    }
+
+    /// Flat button (toggles, file rows, "+ New"): transparent, accent on hover.
+    fn ghost_btn_style(&self) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+        let base = self.c_panel();
+        let accent = self.c_accent();
+        let text = self.c_text();
+        move |_t, status| {
+            let bg = match status {
+                button::Status::Hovered => Some(blend(base, accent, 0.16).into()),
+                _ => None,
+            };
+            button::Style {
+                background: bg,
+                text_color: text,
+                border: iced::Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            }
+        }
+    }
+
+    /// Close (×) button using the theme's close-button colors.
+    fn close_btn_style(&self) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+        let normal = Theme::rgb_to_color32(self.theme.tabbar.close_btn_bg);
+        let hover = Theme::rgb_to_color32(self.theme.tabbar.close_btn_hover);
+        let text = self.c_text();
+        move |_t, status| {
+            let bg = match status {
+                button::Status::Hovered => hover,
+                _ => normal,
+            };
+            button::Style {
+                background: Some(bg.into()),
+                text_color: text,
+                border: iced::Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            }
+        }
+    }
+
     fn tab_bar(&self) -> Element<'_, Message> {
         let mut tabs = row![].spacing(2).padding(2);
         // Sidebar/dock toggle button at the far left of the tab bar.
@@ -1855,11 +1987,7 @@ impl Jterm {
             button(text("☰").size(13))
                 .on_press(Message::ToggleSidebar)
                 .padding([3, 8])
-                .style(if self.sidebar_open {
-                    button::primary
-                } else {
-                    button::secondary
-                }),
+                .style(self.tab_btn_style(self.sidebar_open)),
         );
         // In side-tab mode the tab list lives in the dock; the top bar keeps only
         // the dock toggle plus a button to move tabs back to the top.
@@ -1868,11 +1996,12 @@ impl Jterm {
                 button(text("▔ Tabs to top").size(13))
                     .on_press(Message::SetTabPosition(config::TabPosition::Top))
                     .padding([3, 8])
-                    .style(button::secondary),
+                    .style(self.ghost_btn_style()),
             );
             return container(tabs)
                 .width(Length::Fill)
                 .height(Length::Fixed(TAB_BAR_H))
+                .style(self.chrome_bar_style())
                 .into();
         }
         // Dock the tab strip into the left sidebar (vertical tab list).
@@ -1880,7 +2009,7 @@ impl Jterm {
             button(text("◧").size(13))
                 .on_press(Message::SetTabPosition(config::TabPosition::Side))
                 .padding([3, 8])
-                .style(button::secondary),
+                .style(self.ghost_btn_style()),
         );
         for (i, sess) in self.sessions.iter().enumerate() {
             let active = i == self.active;
@@ -1893,12 +2022,8 @@ impl Jterm {
             };
             let tab = button(text(label).size(13))
                 .on_press(Message::SelectTab(i))
-                .padding([3, 8]);
-            let tab = if active {
-                tab.style(button::primary)
-            } else {
-                tab.style(button::secondary)
-            };
+                .padding([3, 8])
+                .style(self.tab_btn_style(active));
             // Reveal the close button only on the active or hovered tab to cut
             // visual noise; keep its footprint reserved otherwise so tabs don't
             // jump when hovered.
@@ -1907,7 +2032,7 @@ impl Jterm {
                 button(text("×").size(13))
                     .on_press(Message::CloseTab(i))
                     .padding([3, 6])
-                    .style(button::secondary)
+                    .style(self.close_btn_style())
                     .into()
             } else {
                 Space::new().width(Length::Fixed(18.0)).into()
@@ -1925,7 +2050,7 @@ impl Jterm {
             button(text("+").size(13))
                 .on_press(Message::NewSession)
                 .padding([3, 8])
-                .style(button::secondary),
+                .style(self.ghost_btn_style()),
         );
         let scroller = scrollable(tabs)
             .direction(scrollable::Direction::Horizontal(
@@ -1935,6 +2060,7 @@ impl Jterm {
         container(scroller)
             .width(Length::Fill)
             .height(Length::Fixed(TAB_BAR_H))
+            .style(self.chrome_bar_style())
             .into()
     }
 
@@ -1957,9 +2083,12 @@ impl Jterm {
         let grid = format!("{}×{}", self.cols, self.rows);
         let pos = format!("{}:{}", cur_row + 1, cur_col + 1);
 
+        let dim = self.c_text_dim();
+        let dim_style = move |_t: &iced::Theme| text::Style { color: Some(dim) };
+
         let mut right = row![
-            text(grid).size(11).style(text::secondary),
-            text(pos).size(11).style(text::secondary),
+            text(grid).size(11).style(dim_style),
+            text(pos).size(11).style(dim_style),
         ]
         .spacing(14)
         .align_y(iced::Alignment::Center);
@@ -1971,12 +2100,12 @@ impl Jterm {
                     self.search.matches.len()
                 ))
                 .size(11)
-                .style(text::secondary),
+                .style(dim_style),
             );
         }
 
         let bar = row![
-            text(cwd).size(11).style(text::secondary),
+            text(cwd).size(11).style(dim_style),
             Space::new().width(Length::Fill),
             right,
         ]
@@ -1987,7 +2116,7 @@ impl Jterm {
             .height(Length::Fixed(STATUS_BAR_H))
             .padding([0, 10])
             .align_y(iced::Alignment::Center)
-            .style(container::dark)
+            .style(self.chrome_bar_style())
             .into()
     }
 
@@ -2071,11 +2200,7 @@ impl Jterm {
             button(text(label.to_string()).size(12))
                 .on_press(Message::SetSidebarPanel(panel))
                 .padding([2, 8])
-                .style(if active {
-                    button::primary
-                } else {
-                    button::secondary
-                })
+                .style(self.tab_btn_style(active))
         };
         let header = row![
             panel_btn("Tabs", SidebarPanel::Tabs),
@@ -2094,7 +2219,7 @@ impl Jterm {
         container(column![header, panel].spacing(2))
             .width(Length::Fixed(self.dock_width))
             .height(Length::Fill)
-            .style(container::dark)
+            .style(self.panel_style())
             .into()
     }
 
@@ -2104,7 +2229,7 @@ impl Jterm {
         let strip = container(Space::new())
             .width(Length::Fixed(DIVIDER))
             .height(Length::Fill);
-        mouse_area(strip.style(container::dark))
+        mouse_area(strip.style(self.divider_style()))
             .on_press(Message::SidebarDragStart)
             .interaction(iced::mouse::Interaction::ResizingHorizontally)
             .into()
@@ -2130,7 +2255,7 @@ impl Jterm {
         .into()];
         if let Some(root) = &self.sidebar.root {
             for child in &root.children {
-                Self::collect_sidebar_nodes(child, 0, &mut rows);
+                self.collect_sidebar_nodes(child, 0, &mut rows);
             }
         }
         let list = iced::widget::Column::with_children(rows).spacing(1);
@@ -2150,26 +2275,29 @@ impl Jterm {
             } else {
                 label
             };
-            let tab = button(text(label).size(13))
-                .on_press(Message::SelectTab(i))
-                .width(Length::Fill)
-                .padding([4, 8])
-                .style(if active {
-                    button::primary
-                } else {
-                    button::secondary
-                });
+            let tab = button(
+                text(label)
+                    .size(13)
+                    .wrapping(text::Wrapping::None),
+            )
+            .on_press(Message::SelectTab(i))
+            .width(Length::Fill)
+            .padding([4, 8])
+            .style(self.tab_btn_style(active));
             // Reveal the close button on the active or hovered tab only.
             let show_close = active || self.hovered_tab == Some(i);
-            let close: Element<'_, Message> = if show_close {
+            let close_inner: Element<'_, Message> = if show_close {
                 button(text("×").size(13))
                     .on_press(Message::CloseTab(i))
                     .padding([4, 6])
-                    .style(button::secondary)
+                    .style(self.close_btn_style())
                     .into()
             } else {
-                Space::new().width(Length::Fixed(20.0)).into()
+                Space::new().into()
             };
+            let close = container(close_inner)
+                .width(Length::Fixed(24.0))
+                .center_x(Length::Fixed(24.0));
             let cell = row![tab, close]
                 .spacing(2)
                 .align_y(iced::Alignment::Center);
@@ -2185,7 +2313,7 @@ impl Jterm {
             button(text("+ New").size(12))
                 .on_press(Message::NewSession)
                 .padding([2, 10])
-                .style(button::text),
+                .style(self.ghost_btn_style()),
         )
         .width(Length::Fill)
         .center_x(Length::Fill)
@@ -2196,6 +2324,7 @@ impl Jterm {
 
     /// Recursively flatten a file-tree node (and expanded descendants) into rows.
     fn collect_sidebar_nodes<'a>(
+        &self,
         node: &'a sidebar::FileTreeNode,
         depth: usize,
         out: &mut Vec<Element<'a, Message>>,
@@ -2226,12 +2355,12 @@ impl Jterm {
                 .on_press(msg)
                 .width(Length::Fill)
                 .padding([1, 2])
-                .style(button::text)
+                .style(self.ghost_btn_style())
                 .into(),
         );
         if node.is_dir && node.expanded {
             for child in &node.children {
-                Self::collect_sidebar_nodes(child, depth + 1, out);
+                self.collect_sidebar_nodes(child, depth + 1, out);
             }
         }
     }
@@ -2253,7 +2382,7 @@ impl Jterm {
         } else {
             iced::mouse::Interaction::ResizingHorizontally
         };
-        mouse_area(d.style(container::dark))
+        mouse_area(d.style(self.divider_style()))
             .on_press(Message::DividerDragStart)
             .interaction(interaction)
             .into()
