@@ -36,6 +36,9 @@ const TAB_BAR_H: f32 = 30.0;
 const STATUS_BAR_H: f32 = 22.0;
 /// Default width of the file-tree sidebar when shown.
 const SIDEBAR_W: f32 = 220.0;
+/// Drag-resize bounds for the sidebar width.
+const SIDEBAR_W_MIN: f32 = 120.0;
+const SIDEBAR_W_MAX: f32 = 500.0;
 /// Thickness of the divider drawn between split panes (also its drag hit area).
 const DIVIDER: f32 = 6.0;
 
@@ -120,6 +123,9 @@ enum Message {
     ToggleSidebar,
     SetSidebarPanel(SidebarPanel),
     SetTabPosition(config::TabPosition),
+    SidebarDragStart,
+    SidebarDragMove(iced::Point),
+    SidebarDragEnd,
     SidebarToggleNode(std::path::PathBuf),
     SidebarInsertPath(std::path::PathBuf),
     DividerDragStart,
@@ -305,6 +311,10 @@ struct Jterm {
     sidebar_open: bool,
     /// Which content the sidebar dock shows (file tree or tab list).
     sidebar_panel: SidebarPanel,
+    /// Current dock width in pixels (drag-resizable).
+    dock_width: f32,
+    /// Whether the sidebar-resize divider is being dragged.
+    dragging_sidebar: bool,
     /// Split ratio for the first pane (0.1..=0.9); adjusted by dragging the
     /// divider. 0.5 is an even split.
     split_ratio: f32,
@@ -390,6 +400,8 @@ impl Jterm {
             sidebar: sidebar::Sidebar::new(),
             sidebar_open,
             sidebar_panel,
+            dock_width: SIDEBAR_W,
+            dragging_sidebar: false,
             split_ratio: 0.5,
             dragging_divider: false,
             hovered_tab: None,
@@ -467,10 +479,10 @@ impl Jterm {
         (self.win_size.width - self.sidebar_width()).max(0.0)
     }
 
-    /// Current sidebar width (0 when hidden).
+    /// Current sidebar width (0 when hidden), including the resize divider.
     fn sidebar_width(&self) -> f32 {
         if self.dock_open() {
-            SIDEBAR_W
+            self.dock_width + DIVIDER
         } else {
             0.0
         }
@@ -1505,6 +1517,19 @@ impl Jterm {
                     }
                 }
             }
+            Message::SidebarDragStart => self.dragging_sidebar = true,
+            Message::SidebarDragEnd => self.dragging_sidebar = false,
+            Message::SidebarDragMove(pt) => {
+                if self.dragging_sidebar {
+                    // pt.x is relative to the dock+body row, which starts at the
+                    // window's left edge, so it is the desired dock width directly.
+                    let w = pt.x.clamp(SIDEBAR_W_MIN, SIDEBAR_W_MAX);
+                    if (w - self.dock_width).abs() > f32::EPSILON {
+                        self.dock_width = w;
+                        self.apply_config();
+                    }
+                }
+            }
             Message::ToggleSidebar => {
                 self.sidebar_open = !self.sidebar_open;
                 if self.sidebar_open {
@@ -2067,9 +2092,21 @@ impl Jterm {
         };
 
         container(column![header, panel].spacing(2))
-            .width(Length::Fixed(SIDEBAR_W))
+            .width(Length::Fixed(self.dock_width))
             .height(Length::Fill)
             .style(container::dark)
+            .into()
+    }
+
+    /// Draggable vertical strip between the dock and the terminal body. Pressing
+    /// it starts a width-resize drag (continued via the row's `on_move`).
+    fn sidebar_divider(&self) -> Element<'_, Message> {
+        let strip = container(Space::new())
+            .width(Length::Fixed(DIVIDER))
+            .height(Length::Fill);
+        mouse_area(strip.style(container::dark))
+            .on_press(Message::SidebarDragStart)
+            .interaction(iced::mouse::Interaction::ResizingHorizontally)
             .into()
     }
 
@@ -2142,13 +2179,18 @@ impl Jterm {
                     .on_exit(Message::TabHover(None)),
             );
         }
-        list = list.push(
-            button(text("+ New tab").size(13))
+        // A compact, flat "+ New" sits apart from the filled tab rows so it does
+        // not read as just another tab.
+        let new_tab = container(
+            button(text("+ New").size(12))
                 .on_press(Message::NewSession)
-                .width(Length::Fill)
-                .padding([4, 8])
-                .style(button::secondary),
-        );
+                .padding([2, 10])
+                .style(button::text),
+        )
+        .width(Length::Fill)
+        .center_x(Length::Fill)
+        .padding([4, 0]);
+        list = list.push(new_tab);
         scrollable(list).height(Length::Fill).into()
     }
 
@@ -2287,12 +2329,22 @@ impl Jterm {
         } else {
             body
         };
-        // Optional left dock (file tree and/or tab list) beside the terminal.
+        // Optional left dock (file tree and/or tab list) beside the terminal,
+        // separated by a draggable resize divider.
         let main_area: Element<'_, Message> = if self.dock_open() {
-            row![self.sidebar_view(), body]
+            let dock_row = row![self.sidebar_view(), self.sidebar_divider(), body]
                 .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
+                .height(Length::Fill);
+            // While dragging, pointer moves drive the resize and release ends it.
+            if self.dragging_sidebar {
+                mouse_area(dock_row)
+                    .on_move(Message::SidebarDragMove)
+                    .on_release(Message::SidebarDragEnd)
+                    .on_exit(Message::SidebarDragEnd)
+                    .into()
+            } else {
+                dock_row.into()
+            }
         } else {
             body
         };
