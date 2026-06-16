@@ -9,7 +9,6 @@ mod link;
 mod pty;
 mod search;
 mod search_replace;
-mod scripting;
 mod session_persistence;
 mod sidebar;
 mod terminal;
@@ -124,6 +123,12 @@ enum Message {
     /// A mouse interaction within pane `usize` (index into `panes`).
     MousePane(usize, MouseInput),
     Pasted(Option<String>),
+    /// System clipboard contents read in response to an OSC 52 query from the
+    /// app running in the session identified by the file descriptor.
+    Osc52Query(RawFd, Option<String>),
+    /// System clipboard contents read in response to an OSC 5522 MIME-data read
+    /// request. Carries the requesting fd and the MIME type that was requested.
+    Osc5522Data(RawFd, String, Option<String>),
     Resized(Size),
     Focus(bool),
     NewSession,
@@ -1360,10 +1365,23 @@ impl Jterm {
         match message {
             Message::PtyOutput(fd, data) => {
                 let t0 = std::time::Instant::now();
+                let mut clip_set: Option<String> = None;
+                let mut clip_query = false;
+                let mut clip_requests: Vec<terminal::ClipboardReadKind> = Vec::new();
+                let mut notifications: Vec<(String, String)> = Vec::new();
                 if let Some(sess) = self.session_by_fd(fd) {
                     sess.terminal.process_batch(&data);
                     sess.flush_responses();
                     sess.refresh();
+                    clip_set = sess.terminal.take_osc52_clipboard_set();
+                    clip_query = sess.terminal.take_osc52_clipboard_query();
+                    clip_requests = sess
+                        .terminal
+                        .take_clipboard_read_requests()
+                        .into_iter()
+                        .map(|r| r.kind)
+                        .collect();
+                    notifications = sess.terminal.pending_notifications.drain(..).collect();
                 }
                 self.last_ingest_us = t0.elapsed().as_micros();
                 self.last_ingest_bytes = data.len();
@@ -1371,6 +1389,81 @@ impl Jterm {
                 // tick reconcile the session snapshot.
                 self.session_dirty = true;
                 self.recompute_search();
+
+                // Desktop notifications requested via OSC 9 / OSC 777.
+                for (title, body) in notifications {
+                    let _ = std::process::Command::new("notify-send")
+                        .arg(&title)
+                        .arg(&body)
+                        .spawn();
+                }
+
+                // Clipboard set/query via OSC 52. The query path reads the
+                // system clipboard asynchronously and writes the base64
+                // response back to the originating session's PTY.
+                let mut tasks: Vec<Task<Message>> = Vec::new();
+                if let Some(text) = clip_set {
+                    tasks.push(iced::clipboard::write(text));
+                }
+                if clip_query {
+                    tasks.push(iced::clipboard::read().map(move |c| Message::Osc52Query(fd, c)));
+                }
+
+                // OSC 5522 extended-clipboard read requests. iced's clipboard is
+                // text-only, so we advertise a text MIME and serve text reads via
+                // an async clipboard read; non-text MIME types get ENOSYS.
+                for kind in clip_requests {
+                    match kind {
+                        terminal::ClipboardReadKind::MimeList => {
+                            if let Some(sess) = self.session_by_fd(fd) {
+                                let resp = sess
+                                    .terminal
+                                    .build_paste_event(&["text/plain;charset=utf-8".to_string()]);
+                                sess.terminal.output_buffer.extend_from_slice(&resp);
+                                sess.flush_responses();
+                                sess.refresh();
+                            }
+                        }
+                        terminal::ClipboardReadKind::MimeData(mime) => {
+                            if mime.starts_with("text") {
+                                tasks.push(
+                                    iced::clipboard::read()
+                                        .map(move |c| Message::Osc5522Data(fd, mime.clone(), c)),
+                                );
+                            } else if let Some(sess) = self.session_by_fd(fd) {
+                                let resp = osc_5522_packet("type=read:status=ENOSYS", None);
+                                sess.terminal.output_buffer.extend_from_slice(&resp);
+                                sess.flush_responses();
+                                sess.refresh();
+                            }
+                        }
+                    }
+                }
+
+                if !tasks.is_empty() {
+                    return Task::batch(tasks);
+                }
+            }
+            Message::Osc52Query(fd, content) => {
+                if let Some(sess) = self.session_by_fd(fd) {
+                    sess.terminal
+                        .respond_osc52_clipboard(content.as_deref().unwrap_or(""));
+                    sess.flush_responses();
+                    sess.refresh();
+                }
+            }
+            Message::Osc5522Data(fd, mime, content) => {
+                if let Some(sess) = self.session_by_fd(fd) {
+                    let data = content.unwrap_or_default();
+                    let resp = if data.is_empty() {
+                        osc_5522_packet("type=read:status=ENOSYS", None)
+                    } else {
+                        clipboard_5522_response_for_mime(&mime, data.as_bytes())
+                    };
+                    sess.terminal.output_buffer.extend_from_slice(&resp);
+                    sess.flush_responses();
+                    sess.refresh();
+                }
             }
             Message::PtyExited(fd, _code) => {
                 if let Some(index) = self.sessions.iter().position(|s| s.master_fd == fd) {
@@ -1416,7 +1509,15 @@ impl Jterm {
                         return Task::none();
                     };
                     let app_cursor = sess.terminal.is_application_cursor_keys();
-                    if let Some(bytes) = encode_key(&key, modifiers, text.as_deref(), app_cursor) {
+                    let enh = KeyboardEnhancements {
+                        kitty_flags: sess.terminal.keyboard_enhancement_flags(),
+                        modify_other_keys: sess.terminal.xterm_modify_other_keys(),
+                        format_other_keys: sess.terminal.xterm_format_other_keys(),
+                        report_all_keys: sess.terminal.is_report_all_keys_enabled(),
+                    };
+                    if let Some(bytes) =
+                        encode_key(&key, modifiers, text.as_deref(), app_cursor, enh)
+                    {
                         sess.terminal.scroll_to_bottom();
                         sess.write_pty(&bytes);
                         sess.refresh();
@@ -3074,6 +3175,35 @@ fn wrap_bracketed_paste(mut payload: Vec<u8>) -> Vec<u8> {
     wrapped
 }
 
+/// Build a single OSC 5522 packet: `ESC ] 5522 ; <metadata> [; <payload>] ESC \`.
+fn osc_5522_packet(metadata: &str, payload: Option<&str>) -> Vec<u8> {
+    let mut packet = Vec::new();
+    packet.extend_from_slice(b"\x1b]5522;");
+    packet.extend_from_slice(metadata.as_bytes());
+    if let Some(payload) = payload {
+        packet.extend_from_slice(b";");
+        packet.extend_from_slice(payload.as_bytes());
+    }
+    packet.extend_from_slice(b"\x1b\\");
+    packet
+}
+
+/// Build the OK/DATA/DONE sequence answering an OSC 5522 MIME-data read.
+fn clipboard_5522_response_for_mime(mime_type: &str, data: &[u8]) -> Vec<u8> {
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let encoded_mime = engine.encode(mime_type.as_bytes());
+    let encoded_data = engine.encode(data);
+    let mut output = Vec::new();
+    output.extend_from_slice(&osc_5522_packet("type=read:status=OK", None));
+    output.extend_from_slice(&osc_5522_packet(
+        &format!("type=read:status=DATA:mime={encoded_mime}"),
+        Some(&encoded_data),
+    ));
+    output.extend_from_slice(&osc_5522_packet("type=read:status=DONE", None));
+    output
+}
+
 fn pty_subscription(id: usize, fd: RawFd) -> Subscription<Message> {
     // Key on the stable session id (not the raw fd): a closed session's fd
     // number can be reused by a new session, and keying on fd alone would let
@@ -3235,18 +3365,50 @@ fn key_to_binding_string(key: &keyboard::Key, mods: keyboard::Modifiers) -> Opti
     Some(binding)
 }
 
+/// Flags describing which enhanced-keyboard protocols an application has
+/// enabled, sampled from the focused terminal before encoding a key press.
+#[derive(Clone, Copy, Default)]
+struct KeyboardEnhancements {
+    kitty_flags: u16,
+    modify_other_keys: u16,
+    format_other_keys: u16,
+    report_all_keys: bool,
+}
+
 /// Translate an iced key press into the bytes to send to the PTY.
 fn encode_key(
     key: &keyboard::Key,
     mods: keyboard::Modifiers,
     text: Option<&str>,
     app_cursor: bool,
+    enh: KeyboardEnhancements,
 ) -> Option<Vec<u8>> {
     use keyboard::key::Named;
     use keyboard::Key;
 
     let ctrl = mods.control();
     let alt = mods.alt();
+
+    // Enhanced keyboard protocols (Kitty / xterm modifyOtherKeys) take
+    // precedence when an app has enabled them. A bare alphanumeric keypress
+    // that already carries committed text is left to the normal path so plain
+    // typing is not double-encoded (mirrors jterm2's key/text de-duplication).
+    let bare_alnum_text =
+        text.is_some_and(|t| t.len() == 1 && t.as_bytes()[0].is_ascii_alphanumeric());
+    if !bare_alnum_text {
+        if let Some(enc) = kitty_encode_key(key, mods, enh.kitty_flags) {
+            return Some(enc);
+        }
+        if let Some(enc) = xterm_modify_other_keys_encode(
+            key,
+            mods,
+            enh.modify_other_keys,
+            enh.format_other_keys,
+            enh.report_all_keys,
+        ) {
+            return Some(enc);
+        }
+    }
 
     let csi = |c: &str| -> Vec<u8> { format!("\x1b[{c}").into_bytes() };
     let ss3 = |c: &str| -> Vec<u8> { format!("\x1bO{c}").into_bytes() };
@@ -3276,6 +3438,18 @@ fn encode_key(
                 Named::PageDown => csi("6~"),
                 Named::Delete => csi("3~"),
                 Named::Insert => csi("2~"),
+                Named::F1 => ss3("P"),
+                Named::F2 => ss3("Q"),
+                Named::F3 => ss3("R"),
+                Named::F4 => ss3("S"),
+                Named::F5 => csi("15~"),
+                Named::F6 => csi("17~"),
+                Named::F7 => csi("18~"),
+                Named::F8 => csi("19~"),
+                Named::F9 => csi("20~"),
+                Named::F10 => csi("21~"),
+                Named::F11 => csi("23~"),
+                Named::F12 => csi("24~"),
                 _ => return None,
             };
             if alt {
@@ -3325,5 +3499,103 @@ fn encode_key(
             }
         }
         Key::Unidentified => text.map(|t| t.as_bytes().to_vec()),
+    }
+}
+
+/// The base Unicode codepoint a key reports under the Kitty keyboard protocol.
+/// Only ASCII alphanumerics are mapped, matching jterm2.
+fn kitty_text_key_code(key: &keyboard::Key) -> Option<u32> {
+    if let keyboard::Key::Character(s) = key {
+        let c = s.chars().next()?.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            return Some(c as u32);
+        }
+    }
+    None
+}
+
+/// Codepoint for the xterm modifyOtherKeys report; like [`kitty_text_key_code`]
+/// but reports the shifted (uppercase) form when Shift is held.
+fn text_key_code(key: &keyboard::Key, mods: keyboard::Modifiers) -> Option<u32> {
+    let codepoint = kitty_text_key_code(key)?;
+    if mods.shift() {
+        if let keyboard::Key::Character(s) = key {
+            let c = s.chars().next()?;
+            if c.is_ascii_alphabetic() {
+                return Some(c.to_ascii_uppercase() as u32);
+            }
+        }
+    }
+    Some(codepoint)
+}
+
+/// The CSI-u / modifyOtherKeys modifier value: a bitfield + 1.
+fn keyboard_modifier_value(mods: keyboard::Modifiers) -> u8 {
+    let mut bits = 0u8;
+    if mods.shift() {
+        bits |= 0b1;
+    }
+    if mods.alt() {
+        bits |= 0b10;
+    }
+    if mods.control() {
+        bits |= 0b100;
+    }
+    if mods.logo() && !mods.control() {
+        bits |= 0b1000;
+    }
+    bits + 1
+}
+
+/// Encode a key press as a Kitty keyboard protocol report (`CSI codepoint;mod u`)
+/// when the app has enabled disambiguation or report-all-keys. Returns `None`
+/// when the protocol is inactive or the key needs no special report.
+fn kitty_encode_key(
+    key: &keyboard::Key,
+    mods: keyboard::Modifiers,
+    kitty_flags: u16,
+) -> Option<Vec<u8>> {
+    let disambiguate = (kitty_flags & 0b1) != 0;
+    let report_all_keys = (kitty_flags & 0b1000) != 0;
+    if !disambiguate && !report_all_keys {
+        return None;
+    }
+    let codepoint = kitty_text_key_code(key)?;
+    let should_encode =
+        report_all_keys || mods.control() || mods.alt() || (mods.logo() && !mods.control());
+    if !should_encode {
+        return None;
+    }
+    Some(format!("\x1b[{};{}u", codepoint, keyboard_modifier_value(mods)).into_bytes())
+}
+
+/// Encode a key press under xterm's modifyOtherKeys/formatOtherKeys regime.
+fn xterm_modify_other_keys_encode(
+    key: &keyboard::Key,
+    mods: keyboard::Modifiers,
+    modify_other_keys: u16,
+    format_other_keys: u16,
+    report_all_keys: bool,
+) -> Option<Vec<u8>> {
+    let codepoint = text_key_code(key, mods)?;
+    let modifier_value = keyboard_modifier_value(mods);
+    let has_non_shift_modifier =
+        mods.control() || mods.alt() || (mods.logo() && !mods.control());
+    let should_encode = if report_all_keys {
+        modifier_value > 1
+    } else {
+        match modify_other_keys {
+            0 => false,
+            1 => mods.alt() || (mods.logo() && !mods.control()),
+            _ => has_non_shift_modifier || mods.shift(),
+        }
+    };
+    if !should_encode {
+        return None;
+    }
+    if format_other_keys == 1 || report_all_keys {
+        Some(format!("\x1b[{};{}u", codepoint, modifier_value).into_bytes())
+    } else {
+        Some(format!("\x1b[27;{};{}~", modifier_value, codepoint).into_bytes())
     }
 }
