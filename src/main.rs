@@ -2094,7 +2094,7 @@ impl Jterm {
         // the dock toggle plus a button to move tabs back to the top.
         if self.config.tab_position == config::TabPosition::Side {
             tabs = tabs.push(
-                button(text("▔ Tabs to top").size(13))
+                button(text("▔").size(13))
                     .on_press(Message::SetTabPosition(config::TabPosition::Top))
                     .padding([3, 8])
                     .style(self.ghost_btn_style()),
