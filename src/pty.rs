@@ -112,6 +112,114 @@ mod unix_pty {
                     let _ = libc::fcntl(master, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC);
                 }
 
+                // Prepare everything that needs heap allocation or environment
+                // lookups BEFORE fork(). iced spawns winit/wgpu worker threads, so
+                // this is a multithreaded process; between fork() and execve() only
+                // async-signal-safe calls are legal. malloc/getenv/setenv are not —
+                // if another thread held the allocator lock at fork time the child
+                // could deadlock. So argv and a custom envp are built here and the
+                // child branch only reads already-allocated memory.
+                let shell_path = choose_shell(configured_shell);
+                let shell_name = std::path::Path::new(&shell_path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("sh")
+                    .to_string();
+
+                macro_rules! cstr_or_bail {
+                    ($e:expr, $msg:expr) => {
+                        match CString::new($e) {
+                            Ok(c) => c,
+                            Err(_) => {
+                                libc::close(master);
+                                libc::close(slave);
+                                return Err(anyhow!($msg));
+                            }
+                        }
+                    };
+                }
+
+                let shell_cstr = cstr_or_bail!(shell_path.clone(), "shell path contains NUL");
+                let dash_shell_cstr =
+                    cstr_or_bail!(format!("-{}", shell_name), "shell name contains NUL");
+                let login_arg = if shell_name == "bash" {
+                    Some(CString::new("-l").unwrap())
+                } else {
+                    None
+                };
+                let session_flag = CString::new("--session").unwrap();
+                let session_id_cstr = session_id.and_then(|s| CString::new(s).ok());
+
+                // argv pointers borrow the CStrings above; both outlive the fork.
+                let mut argv_ptrs: Vec<*const libc::c_char> = Vec::new();
+                argv_ptrs.push(dash_shell_cstr.as_ptr());
+                if let Some(ref arg) = login_arg {
+                    argv_ptrs.push(arg.as_ptr());
+                }
+                if shell_name == "rsh" {
+                    if let Some(ref sid) = session_id_cstr {
+                        argv_ptrs.push(session_flag.as_ptr());
+                        argv_ptrs.push(sid.as_ptr());
+                    }
+                }
+                argv_ptrs.push(std::ptr::null());
+
+                // Build a custom envp: copy the current environment, override our
+                // keys, and add LESS=FR only if the user hasn't set it. Doing this
+                // here means the child never calls setenv (which mallocs).
+                let mut env_cstrings: Vec<CString> = Vec::new();
+                {
+                    let overridden: [&str; 5] = [
+                        "TERM",
+                        "COLORTERM",
+                        "TERM_PROGRAM",
+                        "TERM_PROGRAM_VERSION",
+                        "VTE_VERSION",
+                    ];
+                    let mut has_less = false;
+                    let mut p = environ;
+                    while !(*p).is_null() {
+                        let bytes = std::ffi::CStr::from_ptr(*p).to_bytes();
+                        let key = match bytes.iter().position(|&b| b == b'=') {
+                            Some(i) => &bytes[..i],
+                            None => bytes,
+                        };
+                        if key == b"LESS" {
+                            has_less = true;
+                        }
+                        if !overridden.iter().any(|k| k.as_bytes() == key) {
+                            if let Ok(c) = CString::new(bytes) {
+                                env_cstrings.push(c);
+                            }
+                        }
+                        p = p.offset(1);
+                    }
+                    env_cstrings.push(CString::new("TERM=xterm-256color").unwrap());
+                    env_cstrings.push(CString::new("COLORTERM=truecolor").unwrap());
+                    env_cstrings
+                        .push(CString::new(format!("TERM_PROGRAM={}", TERM_PROGRAM_NAME)).unwrap());
+                    env_cstrings.push(
+                        CString::new(format!("TERM_PROGRAM_VERSION={}", TERM_PROGRAM_VERSION))
+                            .unwrap(),
+                    );
+                    env_cstrings.push(CString::new(format!("VTE_VERSION={}", VTE_VERSION)).unwrap());
+                    // LESS=FR (not the default FRX, whose -X disables the alternate
+                    // screen and leaks pager output into scrollback). Only set when
+                    // the user hasn't configured LESS themselves.
+                    if !has_less {
+                        env_cstrings.push(CString::new("LESS=FR").unwrap());
+                    }
+                }
+                let mut envp: Vec<*const libc::c_char> =
+                    env_cstrings.iter().map(|c| c.as_ptr()).collect();
+                envp.push(std::ptr::null());
+
+                // cwd prepared before fork; chdir() itself is async-signal-safe.
+                let cwd_cstr = match cwd {
+                    Some(dir) => Some(cstr_or_bail!(dir, "working directory contains NUL")),
+                    None => None,
+                };
+
                 // 3. Fork 子进程
                 let fork_result = libc::fork();
 
@@ -122,36 +230,21 @@ mod unix_pty {
                 }
 
                 if fork_result == 0 {
-                    // 子进程分支
-                    // 关闭 master
+                    // ===== 子进程分支：以下只允许 async-signal-safe 调用 =====
                     libc::close(master);
 
-                    // 【关键】设置父进程死亡信号：当父进程(jterm2)死亡时，此进程会收到SIGTERM
-                    // 这是最后一道防线，确保即使jterm2被SIGKILL强制杀死或panic崩溃，
-                    // rsh进程也会收到退出信号，不会变成孤儿进程继续运行。
-                    //
-                    // 配合其他清理机制：
-                    // - 正常退出：ShellSession::Drop 清理进程组
-                    // - SIGINT/SIGTERM：信号处理器触发正常退出
-                    // - SIGKILL/panic：PR_SET_PDEATHSIG 确保子进程退出
+                    // 父进程死亡信号：父进程(jterm3)退出时此进程收到 SIGTERM，
+                    // 作为 SIGKILL/panic 情况下避免孤儿进程的最后一道防线。
                     #[cfg(target_os = "linux")]
                     {
                         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
                     }
 
-                    // 创建新的会话和进程组（将此进程设为会话leader）
-                    // 这允许我们通过负PID向整个进程组发送信号，杀死shell的所有子进程
+                    // 新建会话/进程组，使其成为会话 leader，便于按进程组发信号。
                     libc::setsid();
 
-                    // 如果指定了工作目录，在执行 shell 前改变目录
-                    if let Some(dir) = cwd {
-                        let dir_cstr = match CString::new(dir) {
-                            Ok(s) => s,
-                            Err(_) => {
-                                libc::perror(b"Invalid working directory\0".as_ptr() as *const i8);
-                                libc::exit(127);
-                            }
-                        };
+                    // 切换工作目录（CString 已在 fork 前构造好）。
+                    if let Some(ref dir_cstr) = cwd_cstr {
                         if libc::chdir(dir_cstr.as_ptr()) != 0 {
                             libc::perror(b"chdir failed\0".as_ptr() as *const i8);
                             libc::exit(127);
@@ -163,106 +256,17 @@ mod unix_pty {
                         libc::perror(b"ioctl TIOCSCTTY failed\0".as_ptr() as *const i8);
                     }
 
-                    // 重定向 stdin/stdout/stderr 到 PTY slave
                     libc::dup2(slave, libc::STDIN_FILENO);
                     libc::dup2(slave, libc::STDOUT_FILENO);
                     libc::dup2(slave, libc::STDERR_FILENO);
-
-                    // 关闭原始 slave fd（因为已经重定向了）
                     if slave > libc::STDERR_FILENO {
                         libc::close(slave);
                     }
 
-                    // 选择 shell：优先 rsh，fallback bash，最后 sh
-                    let shell_path = choose_shell(configured_shell);
+                    // 执行 shell，使用 fork 前构造好的 argv 与 envp。
+                    libc::execve(shell_cstr.as_ptr(), argv_ptrs.as_ptr(), envp.as_ptr());
 
-                    let term_name = CString::new("TERM").unwrap();
-                    let term_value = CString::new("xterm-256color").unwrap();
-                    libc::setenv(term_name.as_ptr(), term_value.as_ptr(), 1);
-
-                    let color_term_name = CString::new("COLORTERM").unwrap();
-                    let color_term_value = CString::new("truecolor").unwrap();
-                    libc::setenv(color_term_name.as_ptr(), color_term_value.as_ptr(), 1);
-
-                    let term_program_name = CString::new("TERM_PROGRAM").unwrap();
-                    let term_program_value = CString::new(TERM_PROGRAM_NAME).unwrap();
-                    libc::setenv(term_program_name.as_ptr(), term_program_value.as_ptr(), 1);
-
-                    let term_program_version_name = CString::new("TERM_PROGRAM_VERSION").unwrap();
-                    let term_program_version_value = CString::new(TERM_PROGRAM_VERSION).unwrap();
-                    libc::setenv(
-                        term_program_version_name.as_ptr(),
-                        term_program_version_value.as_ptr(),
-                        1,
-                    );
-
-                    let vte_version_name = CString::new("VTE_VERSION").unwrap();
-                    let vte_version_value = CString::new(VTE_VERSION).unwrap();
-                    libc::setenv(vte_version_name.as_ptr(), vte_version_value.as_ptr(), 1);
-
-                    // Set LESS=FR (without -X) so that programs like git use
-                    // the alternate screen properly. Git defaults to LESS=FRX
-                    // where -X disables alternate screen, causing pager output
-                    // to leak into scrollback. Only set if user hasn't already
-                    // configured LESS.
-                    let less_name = CString::new("LESS").unwrap();
-                    let less_value = CString::new("FR").unwrap();
-                    libc::setenv(less_name.as_ptr(), less_value.as_ptr(), 0); // 0 = don't overwrite
-
-                    // 创建 C 字符串
-                    let shell_cstr = match CString::new(shell_path.clone()) {
-                        Ok(s) => s,
-                        Err(_) => {
-                            libc::perror(b"Invalid shell path\0".as_ptr() as *const i8);
-                            libc::exit(127);
-                        }
-                    };
-
-                    // 根据 shell 名称确定 argv[0]（带前缀 "-" 表示登录 shell）
-                    let shell_name = std::path::Path::new(&shell_path)
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("sh");
-
-                    let dash_shell = format!("-{}", shell_name);
-                    let dash_shell_cstr = match CString::new(dash_shell.clone()) {
-                        Ok(s) => s,
-                        Err(_) => {
-                            libc::perror(b"Invalid shell name\0".as_ptr() as *const i8);
-                            libc::exit(127);
-                        }
-                    };
-
-                    // Build argv as a Vec for flexibility
-                    let mut argv_ptrs: Vec<*const libc::c_char> = Vec::new();
-                    argv_ptrs.push(dash_shell_cstr.as_ptr());
-
-                    // 如果是 bash，添加 -l 参数
-                    let login_arg = if shell_name == "bash" {
-                        Some(CString::new("-l").unwrap())
-                    } else {
-                        None
-                    };
-                    if let Some(ref arg) = login_arg {
-                        argv_ptrs.push(arg.as_ptr());
-                    }
-
-                    // 如果是 rsh 且有 session_id，添加 --session <id>
-                    let session_flag = CString::new("--session").unwrap();
-                    let session_id_cstr = session_id.and_then(|s| CString::new(s).ok());
-                    if shell_name == "rsh" {
-                        if let Some(ref sid) = session_id_cstr {
-                            argv_ptrs.push(session_flag.as_ptr());
-                            argv_ptrs.push(sid.as_ptr());
-                        }
-                    }
-
-                    argv_ptrs.push(std::ptr::null());
-
-                    // 执行 shell，继承当前环境
-                    libc::execve(shell_cstr.as_ptr(), argv_ptrs.as_ptr(), environ);
-
-                    // 如果 execve 返回，说明出错
+                    // execve 仅在出错时返回。
                     libc::perror(b"execve failed\0".as_ptr() as *const i8);
                     libc::exit(127);
                 } else {
@@ -355,20 +359,26 @@ mod unix_pty {
             }
         }
 
-        pub fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        /// Single non-blocking read. `Ok(Some(n))` with n>0 means n bytes were
+        /// read; `Ok(Some(0))` means WouldBlock (no data right now); `Ok(None)`
+        /// means EOF — the child closed the PTY. Collapsing EOF and WouldBlock
+        /// into a bare `Ok(0)` would let a read loop busy-spin on a hung-up PTY.
+        pub fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>> {
             // SAFETY: self.master 是有效的文件描述符，buf.as_mut_ptr() 指向有效的可变内存，
             // buf.len() 是正确的缓冲区大小。read 不会超出边界。
             unsafe {
                 let n = libc::read(self.master, buf.as_mut_ptr() as *mut _, buf.len());
-                if n < 0 {
+                if n > 0 {
+                    Ok(Some(n as usize))
+                } else if n == 0 {
+                    Ok(None) // EOF
+                } else {
                     let err = std::io::Error::last_os_error();
                     if err.kind() == std::io::ErrorKind::WouldBlock {
-                        Ok(0)
+                        Ok(Some(0))
                     } else {
                         Err(anyhow!("Failed to read from PTY: {}", err))
                     }
-                } else {
-                    Ok(n as usize)
                 }
             }
         }
@@ -396,8 +406,8 @@ mod unix_pty {
             Ok(())
         }
 
-        pub fn is_alive(&self) -> bool {
-            // If we already have a cached exit code, the process is not alive
+        pub fn is_alive(&mut self) -> bool {
+            // If we already have a cached exit code, the process is not alive.
             if self.exit_code_cached.is_some() {
                 return false;
             }
@@ -407,7 +417,28 @@ mod unix_pty {
             unsafe {
                 let mut status = 0;
                 let result = libc::waitpid(self.child_pid, &mut status, libc::WNOHANG);
-                result == 0 // 0 表示子进程还活着
+                if result == 0 {
+                    // Still running.
+                    true
+                } else if result > 0 {
+                    // The child changed state and we just reaped it — decode and
+                    // cache the real exit status here so it isn't lost (a later
+                    // wait_timeout would otherwise hit ECHILD and fabricate 0).
+                    let code = if libc::WIFEXITED(status) {
+                        libc::WEXITSTATUS(status) as i32
+                    } else if libc::WIFSIGNALED(status) {
+                        -(libc::WTERMSIG(status) as i32)
+                    } else {
+                        -1
+                    };
+                    self.exit_code_cached = Some(code);
+                    false
+                } else {
+                    // waitpid error (typically ECHILD: already reaped elsewhere).
+                    // Treat as dead so callers stop polling.
+                    self.exit_code_cached = Some(0);
+                    false
+                }
             }
         }
 
@@ -448,30 +479,38 @@ mod unix_pty {
         }
 
         pub fn terminate(&mut self) -> Result<()> {
-            // SAFETY: kill 系统调用发送信号到进程/进程组。
-            // 负 PID 是向进程组发送信号的标准方式。child_pid 是有效的进程 ID。
-            // 即使进程已经退出，kill 调用也是安全的（会返回错误但不会导致 UB）。
+            // SAFETY: kill 向进程组(负 PID)发送信号；child_pid 通过 setsid 成为
+            // 会话/进程组 leader。即使进程已退出，kill 也只是返回错误、无 UB。
+            let pgid = -self.child_pid;
             unsafe {
-                // 向整个进程组发送 SIGHUP（子进程通过 setsid() 创建了新会话）
-                // 使用负 PID 向进程组发信号，确保 shell 的子进程也被杀死
-                let pgid = -self.child_pid;
                 let _ = libc::kill(pgid, libc::SIGHUP);
                 let _ = libc::kill(self.child_pid, libc::SIGTERM);
-
-                // 给进程时间优雅退出
-                std::thread::sleep(std::time::Duration::from_millis(50));
-
-                // 如果仍未退出，强制杀死
-                if self.is_alive() {
-                    let _ = libc::kill(pgid, libc::SIGKILL);
-                    let _ = libc::kill(self.child_pid, libc::SIGKILL);
-                    // 回收僵尸进程
-                    let mut status = 0;
-                    let _ = libc::waitpid(self.child_pid, &mut status, 0);
-                    self.exit_code_cached = Some(-9);
-                }
-                Ok(())
             }
+
+            // Non-blocking reap: if the child already exited, we're done.
+            if !self.is_alive() {
+                return Ok(());
+            }
+
+            // Otherwise escalate on a detached thread instead of sleeping here —
+            // terminate() runs from Drop, often on the UI thread, which must not
+            // block for the grace period. The thread only captures the pid (in
+            // its own process group), so there's no aliasing with `self`.
+            let child_pid = self.child_pid;
+            std::thread::spawn(move || unsafe {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let mut status = 0;
+                if libc::waitpid(child_pid, &mut status, libc::WNOHANG) == 0 {
+                    // Still alive after the grace period: force kill, then reap.
+                    let _ = libc::kill(-child_pid, libc::SIGKILL);
+                    let _ = libc::kill(child_pid, libc::SIGKILL);
+                    let _ = libc::waitpid(child_pid, &mut status, 0);
+                }
+            });
+            // The child is being torn down; record that so is_alive() stops
+            // polling. The detached thread owns the actual reaping.
+            self.exit_code_cached = Some(-15);
+            Ok(())
         }
     }
 
@@ -504,7 +543,7 @@ mod windows_pty {
             Err(anyhow!("PTY not available"))
         }
 
-        pub fn read(&mut self, _buf: &mut [u8]) -> Result<usize> {
+        pub fn read(&mut self, _buf: &mut [u8]) -> Result<Option<usize>> {
             Err(anyhow!("PTY not available"))
         }
 

@@ -1793,6 +1793,16 @@ impl TerminalState {
     }
 
     pub fn process_input(&mut self, input: &[u8]) {
+        // Guard against an unterminated OSC/DCS/escape sequence. Such a sequence
+        // is buffered into `pending_escape` and re-scanned from its start on every
+        // read, which is both O(n^2) in CPU and unbounded in memory. Once the
+        // buffered prefix exceeds this cap, abandon the partial sequence. The cap
+        // is generous enough for legitimate large payloads (e.g. OSC 52 clipboard).
+        const MAX_PENDING_ESCAPE: usize = 1 << 20; // 1 MiB
+        if self.pending_escape.len() > MAX_PENDING_ESCAPE {
+            self.pending_escape.clear();
+        }
+
         // Fast path: if no pending escape, process input directly without allocation
         let data;
         let data_slice: &[u8] = if self.pending_escape.is_empty() {
@@ -2292,25 +2302,26 @@ impl TerminalState {
     ) {
         match cmd {
             'A' => {
-                // Cursor up - should scroll region down if at top
-                let n = params.first().copied().unwrap_or(1) as usize;
-
-                for _ in 0..n {
-                    if self.cursor_row > self.scroll_region_top {
-                        self.cursor_row -= 1;
-                    } else if self.scroll_region_top < self.grid.rows()
-                        && self.scroll_region_bottom < self.grid.rows()
-                    {
-                        self.scroll_region_down(
-                            self.scroll_region_top,
-                            self.scroll_region_bottom,
-                        );
-                    }
-                }
+                // CUU - cursor up. Stops at the top margin (or row 0 if the
+                // cursor starts above the region); never scrolls.
+                let n = params.first().copied().unwrap_or(1).max(1) as usize;
+                let limit = if self.cursor_row >= self.scroll_region_top {
+                    self.scroll_region_top
+                } else {
+                    0
+                };
+                self.cursor_row = self.cursor_row.saturating_sub(n).max(limit);
             }
             'B' => {
-                let n = params.first().copied().unwrap_or(1) as usize;
-                self.cursor_row = (self.cursor_row + n).min(self.grid.rows() - 1);
+                // CUD - cursor down. Stops at the bottom margin (or last row if
+                // the cursor starts below the region); never scrolls.
+                let n = params.first().copied().unwrap_or(1).max(1) as usize;
+                let limit = if self.cursor_row <= self.scroll_region_bottom {
+                    self.scroll_region_bottom
+                } else {
+                    self.grid.rows() - 1
+                };
+                self.cursor_row = (self.cursor_row + n).min(limit);
             }
             'C' => {
                 let n = params.first().copied().unwrap_or(1) as usize;
@@ -2321,15 +2332,27 @@ impl TerminalState {
                 self.cursor_col = self.cursor_col.saturating_sub(n);
             }
             'E' => {
-                // Move cursor down and to start of line
-                let n = params.first().copied().unwrap_or(1) as usize;
-                self.cursor_row = (self.cursor_row + n).min(self.grid.rows() - 1);
+                // CNL - cursor next line. Down n, to column 0, bounded by the
+                // bottom margin (matching CUD); never scrolls.
+                let n = params.first().copied().unwrap_or(1).max(1) as usize;
+                let limit = if self.cursor_row <= self.scroll_region_bottom {
+                    self.scroll_region_bottom
+                } else {
+                    self.grid.rows() - 1
+                };
+                self.cursor_row = (self.cursor_row + n).min(limit);
                 self.cursor_col = 0;
             }
             'F' => {
-                // Move cursor up and to start of line
-                let n = params.first().copied().unwrap_or(1) as usize;
-                self.cursor_row = self.cursor_row.saturating_sub(n);
+                // CPL - cursor previous line. Up n, to column 0, bounded by the
+                // top margin (matching CUU); never scrolls.
+                let n = params.first().copied().unwrap_or(1).max(1) as usize;
+                let limit = if self.cursor_row >= self.scroll_region_top {
+                    self.scroll_region_top
+                } else {
+                    0
+                };
+                self.cursor_row = self.cursor_row.saturating_sub(n).max(limit);
                 self.cursor_col = 0;
             }
             'G' | '`' => {
@@ -2652,15 +2675,19 @@ impl TerminalState {
                     }
             }
             'h' => {
-                // Set mode (DECSET)
+                // Set mode: DECSET (CSI ? Pn h) vs ANSI SM (CSI Pn h). The two
+                // share parameter numbers (e.g. 4 = DECSCLM private vs IRM ANSI),
+                // so the private prefix must be threaded through.
+                let private = private_prefix == Some(b'?');
                 for &mode in params {
-                    self.set_mode(mode);
+                    self.set_mode(mode, private);
                 }
             }
             'l' => {
-                // Reset mode (DECRST)
+                // Reset mode: DECRST (CSI ? Pn l) vs ANSI RM (CSI Pn l).
+                let private = private_prefix == Some(b'?');
                 for &mode in params {
-                    self.reset_mode(mode);
+                    self.reset_mode(mode, private);
                 }
             }
             'r' => {
@@ -2947,7 +2974,7 @@ impl TerminalState {
     /// RIS (ESC c): reset the terminal to its initial state.
     fn full_reset(&mut self) {
         if self.use_alt_buffer {
-            self.reset_mode(1049);
+            self.reset_mode(1049, true);
         }
         self.current_fg = Color::Default;
         self.current_bg = Color::Default;
@@ -2986,8 +3013,21 @@ impl TerminalState {
         self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
     }
 
-    fn set_mode(&mut self, mode: u16) {
+    fn set_mode(&mut self, mode: u16, private: bool) {
+        if !private {
+            // ANSI Set Mode (CSI Pn h). The only one we implement is IRM (4).
+            // Everything else (GATM 1, ERM 6, VEM 7, LNM 20, …) is ignored so
+            // it can't collide with the identically-numbered DEC private modes.
+            if mode == 4 {
+                self.modes.insert(4);
+            }
+            return;
+        }
         match mode {
+            4 => {
+                // DECSCLM (smooth scroll) — accepted and ignored. Must NOT fall
+                // through to the IRM bit that ANSI mode 4 uses.
+            }
             25 => {
                 // Show cursor (mode 25)
                 self.modes.insert(25);
@@ -3054,8 +3094,18 @@ impl TerminalState {
         }
     }
 
-    fn reset_mode(&mut self, mode: u16) {
+    fn reset_mode(&mut self, mode: u16, private: bool) {
+        if !private {
+            // ANSI Reset Mode (CSI Pn l). Only IRM (4) is implemented.
+            if mode == 4 {
+                self.modes.remove(&4);
+            }
+            return;
+        }
         match mode {
+            4 => {
+                // DECSCLM reset — ignored (see set_mode).
+            }
             25 => {
                 // Hide cursor
                 self.modes.remove(&25);
@@ -3192,9 +3242,11 @@ impl TerminalState {
         } else {
             // Standard xterm format: CSI M button col row (raw bytes)
             // Col and row are offset by 32 (space character)
-            let button_byte = 32 + button ;
-            let col_byte = 32 + (col as u8).min(223) ;
-            let row_byte = 32 + (row as u8).min(223) ;
+            let button_byte = 32 + button;
+            // Clamp the usize coordinate BEFORE the u8 cast: casting first would
+            // wrap columns/rows > 255 (the grid can be up to 1024 wide).
+            let col_byte = 32 + (col.saturating_add(1).min(223) as u8);
+            let row_byte = 32 + (row.saturating_add(1).min(223) as u8);
             Some(format!(
                 "\x1b[M{}{}{}",
                 button_byte as char, col_byte as char, row_byte as char
@@ -3215,8 +3267,8 @@ impl TerminalState {
         } else {
             // Standard xterm: release is button 3
             let button_byte = 32 + 3u8;
-            let col_byte = 32 + (col as u8).min(223);
-            let row_byte = 32 + (row as u8).min(223);
+            let col_byte = 32 + (col.saturating_add(1).min(223) as u8);
+            let row_byte = 32 + (row.saturating_add(1).min(223) as u8);
             Some(format!(
                 "\x1b[M{}{}{}",
                 button_byte as char, col_byte as char, row_byte as char
@@ -3810,6 +3862,32 @@ impl TerminalState {
             || (self.scroll_region_top == 0 && self.scroll_region_bottom + 1 >= old_rows);
 
         let blank_cell = self.create_blank_cell();
+
+        // When the row count shrinks on the primary screen, mirror a real
+        // terminal: push the oldest on-screen lines into scrollback and shift the
+        // rest up, rather than letting TerminalGrid::resize silently truncate the
+        // BOTTOM rows (where the prompt/cursor usually live). The cursor is kept
+        // on-screen. (Column reflow on width change is not done here.)
+        if !self.use_alt_buffer && old_rows > rows {
+            let to_remove = old_rows - rows;
+            // Take as many rows off the top as possible without scrolling the
+            // cursor above row 0; any remainder is truncated from the bottom.
+            let top_remove = to_remove.min(self.cursor_row);
+            if top_remove > 0 {
+                let cols_now = self.grid.row_len();
+                for r in 0..top_remove {
+                    let line =
+                        ScrollbackLine::compress(&self.grid[r], self.grid.row_wrapped[r]);
+                    self.push_scrollback_compressed(line);
+                }
+                let src_start = top_remove * cols_now;
+                let total = old_rows * cols_now;
+                self.grid.cells.copy_within(src_start..total, 0);
+                self.grid.row_wrapped.copy_within(top_remove..old_rows, 0);
+                self.cursor_row -= top_remove;
+                self.saved_cursor_row = self.saved_cursor_row.saturating_sub(top_remove);
+            }
+        }
 
         self.grid.resize(rows, cols, blank_cell.clone());
         self.alt_grid.resize(rows, cols, blank_cell.clone());

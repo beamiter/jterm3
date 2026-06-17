@@ -505,6 +505,12 @@ where
                     return;
                 }
                 let state = tree.state.downcast_mut::<State>();
+                // Drop any leftover fraction of the opposite sign on a direction
+                // reversal, otherwise it cancels part of the new delta and the
+                // first reversed tick gets swallowed.
+                if state.scroll_accum != 0.0 && (dy > 0.0) != (state.scroll_accum > 0.0) {
+                    state.scroll_accum = 0.0;
+                }
                 state.scroll_accum += dy;
                 let whole = state.scroll_accum.trunc();
                 if whole == 0.0 {
