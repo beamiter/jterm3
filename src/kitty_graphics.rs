@@ -122,10 +122,14 @@ impl KittyGraphicsState {
         let params = Self::parse_params(payload)?;
 
         match params.action.as_deref() {
-            Some("t") => self.handle_transfer(params),
+            Some("t") | Some("T") => self.handle_transfer(params),
             Some("p") => self.handle_placement(params),
             Some("d") => self.handle_delete(params),
             Some("q") => self.handle_query(params),
+            // Continuation chunks of a multi-chunk transfer carry only `m=`/data
+            // with no `a=` key, so route them to the transfer handler when a
+            // transfer is already in progress.
+            None if self.pending_transfer.is_some() => self.handle_transfer(params),
             _ => Err("Unknown action".to_string()),
         }
     }
@@ -175,7 +179,11 @@ impl KittyGraphicsState {
 
     /// 处理传输操作 (a=t)
     fn handle_transfer(&mut self, params: KittyGraphicsParams) -> Result<(), String> {
-        let image_id = params.image_id.ok_or("Missing image ID")?;
+        // Continuation chunks omit `i=`; fall back to the in-progress transfer's id.
+        let image_id = params
+            .image_id
+            .or_else(|| self.pending_transfer.as_ref().map(|p| p.image_id))
+            .ok_or("Missing image ID")?;
         let format_str = params.format.as_deref().unwrap_or("png");
         let format =
             ImageFormat::from_str(format_str).ok_or(format!("Unknown format: {}", format_str))?;
@@ -235,6 +243,14 @@ impl KittyGraphicsState {
             let data_size = final_data.len() as u64;
             self.total_decoded += 1;
             self.total_bytes_processed += data_size;
+            // Re-transmitting an existing id replaces the old image: drop its
+            // memory and its stale access-order entry so the counter doesn't
+            // drift (and later underflow in enforce_image_limits).
+            if let Some(old) = self.images.get(&image_id) {
+                self.total_image_memory =
+                    self.total_image_memory.saturating_sub(old.data.len() as u64);
+                self.access_order.retain(|&id| id != image_id);
+            }
             self.total_image_memory += data_size;
             self.access_order.push_back(image_id);
 

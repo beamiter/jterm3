@@ -108,8 +108,10 @@ pub struct LinkDetector {
 impl LinkDetector {
     pub fn new(config: LinkDetectionConfig) -> Self {
         // URL 正则：http(s)?:// 或 ftp://
+        // Parens are allowed in the body (e.g. Wikipedia `/wiki/Foo_(bar)`); an
+        // unbalanced trailing `)` is trimmed in code below.
         let url_regex =
-            Regex::new(r"(?:https?|ftp)://[^\s<>\[\]{}|\\^`()]*[^\s<>\[\]{}|\\^`().,;:!?\-]")
+            Regex::new(r"(?:https?|ftp)://[^\s<>\[\]{}|\\^`]*[^\s<>\[\]{}|\\^`.,;:!?\-]")
                 .unwrap();
 
         // IP 地址正则：x.x.x.x 格式
@@ -142,14 +144,23 @@ impl LinkDetector {
         // 检测 URL
         if self.config.detect_urls {
             for mat in self.url_regex.find_iter(line) {
+                let mut url = mat.as_str();
+                // Drop trailing unbalanced `)` so a URL inside parentheses like
+                // `(https://example.com)` doesn't swallow the closing paren,
+                // while a balanced `/wiki/Foo_(bar)` is kept intact.
+                while url.ends_with(')')
+                    && url.matches(')').count() > url.matches('(').count()
+                {
+                    url = &url[..url.len() - 1];
+                }
                 let col_start = Self::byte_offset_to_char_offset(line, mat.start());
-                let col_end = Self::byte_offset_to_char_offset(line, mat.end());
+                let col_end = Self::byte_offset_to_char_offset(line, mat.start() + url.len());
                 links.push(Link {
                     line: line_idx,
                     col_start,
                     col_end,
                     link_type: LinkType::Url,
-                    text: mat.as_str().to_string(),
+                    text: url.to_string(),
                 });
             }
         }
@@ -178,9 +189,14 @@ impl LinkDetector {
         // 检测文件路径
         if self.config.detect_file_paths {
             for mat in self.file_path_regex.find_iter(line) {
-                let matched_text = mat.as_str().trim();
-                let col_start = Self::byte_offset_to_char_offset(line, mat.start());
-                let col_end = Self::byte_offset_to_char_offset(line, mat.end());
+                let raw = mat.as_str();
+                let matched_text = raw.trim();
+                // The regex captures a leading `^|\s` boundary; skip it so the
+                // highlight columns cover only the path, not the preceding space.
+                let lead_ws = raw.len() - raw.trim_start().len();
+                let start_byte = mat.start() + lead_ws;
+                let col_start = Self::byte_offset_to_char_offset(line, start_byte);
+                let col_end = Self::byte_offset_to_char_offset(line, start_byte + matched_text.len());
 
                 // 避免与 URL 重复
                 if !links

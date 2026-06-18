@@ -16,6 +16,13 @@ mod unix_pty {
     use super::*;
     use std::path::Path;
 
+    /// Outcome of polling the PTY fd alongside the shutdown pipe.
+    pub enum ReaderPoll {
+        Data,
+        Timeout,
+        Shutdown,
+    }
+
     fn is_executable(path: &Path) -> bool {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(path)
@@ -319,6 +326,61 @@ mod unix_pty {
             }
         }
 
+        /// Create a self-pipe used to wake the reader thread on shutdown.
+        /// Returns (read_end, write_end). Closing the write end makes a `poll`
+        /// on the read end report POLLHUP immediately.
+        pub fn make_shutdown_pipe() -> Result<(RawFd, RawFd)> {
+            let mut fds = [0 as RawFd; 2];
+            // SAFETY: fds is a valid 2-element array; pipe() fills both ends.
+            let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+            if rc != 0 {
+                return Err(anyhow!(
+                    "Failed to create shutdown pipe: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok((fds[0], fds[1]))
+        }
+
+        /// Poll the PTY fd for readability while also watching `shutdown_fd`.
+        /// Shutdown takes priority: if the shutdown pipe's write end was closed
+        /// (POLLHUP) — or the PTY fd became invalid because the session was
+        /// dropped — this returns `Shutdown` WITHOUT reporting data, so the
+        /// caller never reads from a PTY fd whose number may have been reused.
+        pub fn wait_fd_or_shutdown(
+            fd: RawFd,
+            shutdown_fd: RawFd,
+            timeout_ms: i32,
+        ) -> Result<ReaderPoll> {
+            let mut fds = [
+                libc::pollfd { fd, events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: shutdown_fd, events: libc::POLLIN, revents: 0 },
+            ];
+            // SAFETY: fds is a valid 2-element array on the stack.
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
+            if ready < 0 {
+                return Err(anyhow!(
+                    "Failed to poll PTY: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            if ready == 0 {
+                return Ok(ReaderPoll::Timeout);
+            }
+            // Shutdown signaled (write end closed -> POLLHUP, or any activity).
+            if fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                return Ok(ReaderPoll::Shutdown);
+            }
+            // PTY fd closed out from under us -> treat as a clean shutdown.
+            if fds[0].revents & libc::POLLNVAL != 0 {
+                return Ok(ReaderPoll::Shutdown);
+            }
+            if fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                return Ok(ReaderPoll::Data);
+            }
+            Ok(ReaderPoll::Timeout)
+        }
+
         /// Block until the fd is writable (POLLOUT) or the timeout elapses.
         pub fn wait_fd_writable(fd: RawFd, timeout_ms: i32) -> Result<bool> {
             let mut poll_fd = libc::pollfd {
@@ -566,7 +628,7 @@ mod windows_pty {
 }
 
 #[cfg(unix)]
-pub use unix_pty::Pty;
+pub use unix_pty::{Pty, ReaderPoll};
 
 #[cfg(windows)]
 pub use windows_pty::Pty;

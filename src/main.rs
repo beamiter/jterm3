@@ -24,7 +24,7 @@ use iced::widget::{
     text, text_input, Space,
 };
 use iced::{keyboard, Color, Element, Length, Size, Subscription, Task};
-use pty::Pty;
+use pty::{Pty, ReaderPoll};
 use terminal::{TerminalCell, TerminalState};
 use terminal_view::{KittyRender, Metrics, MouseButton, MouseInput, TermWidget};
 use theme::Theme;
@@ -918,6 +918,21 @@ impl Jterm {
                 self.config_panel_open = !self.config_panel_open;
                 Task::none()
             }
+            C::FontZoomIn => {
+                self.config.font_size = Config::clamp_font_size(self.config.font_size + 1.0);
+                self.apply_config();
+                Task::none()
+            }
+            C::FontZoomOut => {
+                self.config.font_size = Config::clamp_font_size(self.config.font_size - 1.0);
+                self.apply_config();
+                Task::none()
+            }
+            C::FontZoomReset => {
+                self.config.font_size = Config::clamp_font_size(14.0);
+                self.apply_config();
+                Task::none()
+            }
         };
         Some(task)
     }
@@ -1097,10 +1112,12 @@ impl Jterm {
         if !mods.shift() {
             return false;
         }
-        let page = self.rows.saturating_sub(1).max(1) as isize;
         let Some(sess) = self.sessions.get_mut(self.active) else {
             return false;
         };
+        // Page by the active pane's own row count, not the whole window — when
+        // split, a pane is shorter than `self.rows`.
+        let page = sess.terminal.grid.rows().saturating_sub(1).max(1) as isize;
         match key {
             Key::Named(Named::PageUp) => sess.terminal.scroll(page),
             Key::Named(Named::PageDown) => sess.terminal.scroll(-page),
@@ -1597,6 +1614,11 @@ impl Jterm {
             }
             Message::Focus(f) => {
                 self.focused = f;
+                // The blink tick stops while unfocused; leave the cursor solid so
+                // it can't get stuck in the "off" half of a blink.
+                if !f {
+                    self.blink_on = true;
+                }
                 if let Some(sess) = self.sessions.get_mut(self.active) {
                     if sess.terminal.is_focus_event_mode() {
                         if f {
@@ -2181,7 +2203,12 @@ impl Jterm {
             })
             .unwrap_or_default();
         let (cur_row, cur_col) = sess.map(|s| s.cursor).unwrap_or((0, 0));
-        let grid = format!("{}×{}", self.cols, self.rows);
+        // Report the active pane's own grid size; when split it differs from the
+        // whole-window `self.cols`×`self.rows`.
+        let (grid_cols, grid_rows) = sess
+            .map(|s| (s.terminal.grid.cols(), s.terminal.grid.rows()))
+            .unwrap_or((self.cols, self.rows));
+        let grid = format!("{}×{}", grid_cols, grid_rows);
         let pos = format!("{}:{}", cur_row + 1, cur_col + 1);
 
         let dim = self.c_text_dim();
@@ -3106,10 +3133,25 @@ impl Jterm {
             iced::time::every(std::time::Duration::from_millis(1500))
                 .map(|_| Message::ConfigTick),
         );
-        subs.push(
-            iced::time::every(std::time::Duration::from_millis(530))
-                .map(|_| Message::BlinkTick),
-        );
+        // The blink tick redraws and re-shapes the whole grid every 530ms purely
+        // to animate blinking cells. Run it only while focused AND when a visible
+        // pane actually has blinking text — the common case (no blink, or
+        // unfocused) then stays fully idle.
+        let has_blink = self.panes.iter().any(|&idx| {
+            self.sessions.get(idx).is_some_and(|s| {
+                s.terminal
+                    .grid
+                    .iter()
+                    .flatten()
+                    .any(|cell| cell.flags.blink())
+            })
+        });
+        if self.focused && has_blink {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(530))
+                    .map(|_| Message::BlinkTick),
+            );
+        }
         Subscription::batch(subs)
     }
 }
@@ -3215,6 +3257,10 @@ fn pty_stream(fd: RawFd) -> impl iced::futures::Stream<Item = Message> {
     use iced::futures::{SinkExt, StreamExt};
     iced::stream::channel(256, move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
         let (tx, mut rx) = iced::futures::channel::mpsc::unbounded::<Message>();
+        // Self-pipe so dropping this subscription (session/tab closed) wakes the
+        // reader thread and stops it BEFORE it can read from a PTY fd whose
+        // number may have been reused by a freshly spawned session.
+        let (shutdown_r, shutdown_w) = Pty::make_shutdown_pipe().unwrap_or((-1, -1));
         std::thread::spawn(move || {
             // Drain everything currently readable into one message instead of
             // emitting a separate message per 64 KiB read. Bursty output (e.g.
@@ -3225,8 +3271,10 @@ fn pty_stream(fd: RawFd) -> impl iced::futures::Stream<Item = Message> {
             const COALESCE_CAP: usize = 1 << 20; // 1 MiB per message
             let mut buf = vec![0u8; 65536];
             loop {
-                match Pty::wait_fd_readable(fd, 200) {
-                    Ok(true) => {
+                match Pty::wait_fd_or_shutdown(fd, shutdown_r, 200) {
+                    Ok(ReaderPoll::Shutdown) => break,
+                    Ok(ReaderPoll::Timeout) => continue,
+                    Ok(ReaderPoll::Data) => {
                         let mut acc: Vec<u8> = Vec::new();
                         let mut exited = false;
                         let mut errored = false;
@@ -3265,14 +3313,27 @@ fn pty_stream(fd: RawFd) -> impl iced::futures::Stream<Item = Message> {
                             break;
                         }
                     }
-                    Ok(false) => continue,
                     Err(_) => {
                         let _ = tx.unbounded_send(Message::PtyExited(fd, -1));
                         break;
                     }
                 }
             }
+            // Reader is done; release our end of the shutdown pipe.
+            if shutdown_r >= 0 {
+                unsafe { libc::close(shutdown_r); }
+            }
         });
+        // Closing the write end on drop (subscription removed) signals the reader.
+        struct ShutdownGuard(RawFd);
+        impl Drop for ShutdownGuard {
+            fn drop(&mut self) {
+                if self.0 >= 0 {
+                    unsafe { libc::close(self.0); }
+                }
+            }
+        }
+        let _shutdown_guard = ShutdownGuard(shutdown_w);
         while let Some(msg) = rx.next().await {
             if output.send(msg).await.is_err() {
                 break;

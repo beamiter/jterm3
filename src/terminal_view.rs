@@ -901,7 +901,7 @@ where
         }
 
         // Kitty graphics: paint each placement (already z-sorted) as a texture
-        // stretched into its cell span, with a border + id/size label.
+        // stretched into its cell span.
         for im in &self.images {
             let x = ox + im.col as f32 * cw;
             let y = oy + im.row as f32 * ch;
@@ -916,38 +916,6 @@ where
             renderer.draw_image(
                 iced::advanced::image::Image::new(im.handle.clone()),
                 rect,
-                clip,
-            );
-            let accent = Color::from_rgb8(100, 150, 200);
-            renderer.fill_quad(
-                Quad {
-                    bounds: rect,
-                    border: Border {
-                        color: accent,
-                        width: 1.0,
-                        radius: 0.0.into(),
-                    },
-                    shadow: Shadow::default(),
-                    snap: true,
-                },
-                Background::Color(Color::TRANSPARENT),
-            );
-            let info = format!("#{} ({}x{})", im.id, im.px_w, im.px_h);
-            let label_size = self.metrics.font_size * 0.6;
-            renderer.fill_text(
-                Text {
-                    content: info,
-                    bounds: Size::new(w, ch),
-                    size: Pixels(label_size),
-                    line_height: text::LineHeight::Absolute(Pixels(label_size * 1.2)),
-                    font: self.mono,
-                    align_x: text::Alignment::Left,
-                    align_y: iced::alignment::Vertical::Top,
-                    shaping: text::Shaping::Advanced,
-                    wrapping: text::Wrapping::None,
-                },
-                Point::new(x + 2.0, y + 2.0),
-                accent,
                 clip,
             );
         }

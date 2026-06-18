@@ -55,25 +55,37 @@ impl SearchAndReplaceEngine {
         config: &SearchConfig,
         options: &ReplaceOptions,
     ) -> Result<(String, usize), String> {
-        let mut result = text.to_string();
-        let mut count = 0;
-
         let search_pattern = if config.case_sensitive {
             pattern.to_string()
         } else {
             pattern.to_lowercase()
         };
 
+        // Empty pattern would match endlessly; treat as a no-op.
+        if search_pattern.is_empty() {
+            return Ok((text.to_string(), 0));
+        }
+
+        let mut result = String::with_capacity(text.len());
+        let mut count = 0;
+        let mut rest = text;
+
         loop {
-            let search_text = if config.case_sensitive {
-                result.clone()
+            let hay = if config.case_sensitive {
+                rest.to_string()
             } else {
-                result.to_lowercase()
+                rest.to_lowercase()
             };
 
-            if let Some(pos) = search_text.find(&search_pattern) {
-                result.replace_range(pos..pos + pattern.len(), replacement);
+            if let Some(pos) = hay.find(&search_pattern) {
+                // Copy the unmatched prefix, emit the replacement, then continue
+                // AFTER the match so replaced text is never rescanned (the old
+                // code rescanned from 0 and looped forever when the replacement
+                // still contained the pattern, e.g. "a" -> "ba").
+                result.push_str(&rest[..pos]);
+                result.push_str(replacement);
                 count += 1;
+                rest = &rest[pos + pattern.len()..];
 
                 if !options.replace_all {
                     break;
@@ -82,6 +94,7 @@ impl SearchAndReplaceEngine {
                 break;
             }
         }
+        result.push_str(rest);
 
         Ok((result, count))
     }
@@ -91,12 +104,16 @@ impl SearchAndReplaceEngine {
         text: &str,
         pattern: &str,
         replacement: &str,
-        _config: &SearchConfig,
+        config: &SearchConfig,
         options: &ReplaceOptions,
     ) -> Result<(String, usize), String> {
-        use regex::Regex;
+        use regex::RegexBuilder;
 
-        let regex = Regex::new(pattern).map_err(|e| format!("Invalid regex: {}", e))?;
+        let regex = RegexBuilder::new(pattern)
+            .case_insensitive(!config.case_sensitive)
+            .multi_line(config.multi_line)
+            .build()
+            .map_err(|e| format!("Invalid regex: {}", e))?;
 
         let result = if options.replace_all {
             regex.replace_all(text, replacement).to_string()

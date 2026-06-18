@@ -241,6 +241,7 @@ impl SearchEngine {
             query.to_lowercase()
         };
 
+        let query_chars = search_query.chars().count();
         for (line_idx, line) in grid.iter().enumerate() {
             let line_str = Self::grid_line_to_string(line);
             let search_line = if case_sensitive {
@@ -249,15 +250,24 @@ impl SearchEngine {
                 line_str.to_lowercase()
             };
 
-            let mut start_pos = 0;
-            while let Some(pos) = search_line[start_pos..].find(&search_query) {
-                let actual_pos = start_pos + pos;
+            let mut start_byte = 0;
+            while let Some(rel) = search_line[start_byte..].find(&search_query) {
+                let match_byte = start_byte + rel;
+                // Grid columns are char indices, not byte offsets.
+                let col_start = search_line[..match_byte].chars().count();
                 matches.push(SearchMatch {
                     line: line_idx,
-                    col_start: actual_pos,
-                    col_end: actual_pos + search_query.len(),
+                    col_start,
+                    col_end: col_start + query_chars,
                 });
-                start_pos = actual_pos + 1;
+                // Advance one char past the match start, staying on a UTF-8
+                // boundary (a raw +1 would panic inside a multi-byte char).
+                let step = search_line[match_byte..]
+                    .chars()
+                    .next()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(1);
+                start_byte = match_byte + step;
             }
         }
 
@@ -289,10 +299,13 @@ impl SearchEngine {
             let line_str = Self::grid_line_to_string(line);
 
             for mat in regex.find_iter(&line_str) {
+                // Map byte offsets to char/column indices.
+                let col_start = line_str[..mat.start()].chars().count();
+                let col_end = line_str[..mat.end()].chars().count();
                 matches.push(SearchMatch {
                     line: line_idx,
-                    col_start: mat.start(),
-                    col_end: mat.end(),
+                    col_start,
+                    col_end,
                 });
             }
         }

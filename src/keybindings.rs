@@ -46,6 +46,11 @@ pub enum Command {
     ConfigOpen,
     ConfigClose,
     ConfigToggle,
+
+    // === 字体缩放 ===
+    FontZoomIn,
+    FontZoomOut,
+    FontZoomReset,
 }
 
 impl std::fmt::Display for Command {
@@ -78,6 +83,9 @@ impl std::fmt::Display for Command {
             Command::ConfigOpen => write!(f, "config:open"),
             Command::ConfigClose => write!(f, "config:close"),
             Command::ConfigToggle => write!(f, "config:toggle"),
+            Command::FontZoomIn => write!(f, "font:zoom_in"),
+            Command::FontZoomOut => write!(f, "font:zoom_out"),
+            Command::FontZoomReset => write!(f, "font:zoom_reset"),
         }
     }
 }
@@ -113,6 +121,9 @@ impl std::str::FromStr for Command {
             "config:open" => Ok(Command::ConfigOpen),
             "config:close" => Ok(Command::ConfigClose),
             "config:toggle" => Ok(Command::ConfigToggle),
+            "font:zoom_in" => Ok(Command::FontZoomIn),
+            "font:zoom_out" => Ok(Command::FontZoomOut),
+            "font:zoom_reset" => Ok(Command::FontZoomReset),
             s if s.starts_with("session:jump:") => {
                 let num_str = &s[13..];
                 let num = num_str
@@ -208,6 +219,50 @@ impl KeyBinding {
         Ok(Self::new(key, modifiers, command))
     }
 
+    /// Canonicalize a binding string to the `ctrl+shift+alt+super+key` order
+    /// (all lowercase) used internally, accepting any modifier order and the
+    /// common aliases (`cmd`/`command`/`win`/`meta` -> super, `option` -> alt,
+    /// `control` -> ctrl). Returns `None` if the string isn't a valid binding.
+    /// This is what lets a user-written `shift+ctrl+f` or `cmd+c` actually match.
+    pub fn canonical(binding_str: &str) -> Option<String> {
+        let lower = binding_str.to_lowercase();
+        let (mut ctrl, mut shift, mut alt, mut sup) = (false, false, false, false);
+        let mut key: Option<String> = None;
+        let parts: Vec<&str> = lower.split('+').collect();
+        for (i, part) in parts.iter().enumerate() {
+            match *part {
+                "ctrl" | "control" => ctrl = true,
+                "shift" => shift = true,
+                "alt" | "option" => alt = true,
+                "super" | "cmd" | "command" | "win" | "meta" => sup = true,
+                "" => return None,
+                other => {
+                    if i == parts.len() - 1 {
+                        key = Some(other.to_string());
+                    } else {
+                        return None;
+                    }
+                }
+            }
+        }
+        let key = key?;
+        let mut out = String::new();
+        if ctrl {
+            out.push_str("ctrl+");
+        }
+        if shift {
+            out.push_str("shift+");
+        }
+        if alt {
+            out.push_str("alt+");
+        }
+        if sup {
+            out.push_str("super+");
+        }
+        out.push_str(&key);
+        Some(out)
+    }
+
     /// 转换为快捷键字符串表示
     pub fn to_string(&self) -> String {
         let mut parts = Vec::new();
@@ -279,11 +334,12 @@ impl KeyBindings {
             .bindings
             .insert("ctrl+pageup".to_string(), "session:prev".to_string());
 
-        // 会话切换（数字快捷键）
+        // 会话切换（数字快捷键）。键是 1-indexed（ctrl+1 跳到第一个会话），
+        // 让 ctrl+0 空出来给字体缩放重置使用。
         for i in 0..9 {
             bindings
                 .bindings
-                .insert(format!("ctrl+{}", i), format!("session:jump:{}", i));
+                .insert(format!("ctrl+{}", i + 1), format!("session:jump:{}", i));
         }
 
         // 编辑操作
@@ -326,12 +382,23 @@ impl KeyBindings {
             .bindings
             .insert("ctrl+down".to_string(), "terminal:scroll_down".to_string());
 
+        // 字体缩放
+        bindings
+            .bindings
+            .insert("ctrl+=".to_string(), "font:zoom_in".to_string());
+        bindings
+            .bindings
+            .insert("ctrl+-".to_string(), "font:zoom_out".to_string());
+        bindings
+            .bindings
+            .insert("ctrl+0".to_string(), "font:zoom_reset".to_string());
+
         bindings
     }
 
     /// 获取快捷键对应的命令
     pub fn get_command(&self, key_str: &str) -> Option<Command> {
-        let normalized = key_str.to_lowercase();
+        let normalized = KeyBinding::canonical(key_str)?;
         self.bindings
             .get(&normalized)
             .and_then(|cmd_str| cmd_str.parse::<Command>().ok())
@@ -361,8 +428,11 @@ impl KeyBindings {
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
             let user_bindings: KeyBindings = toml::from_str(&content)?;
-            // 合并用户配置到默认配置，用户配置会覆盖默认值
+            // 合并用户配置到默认配置，用户配置会覆盖默认值。
+            // Canonicalize each user key so a different modifier order or an
+            // alias (cmd/option/…) still overrides the matching default.
             for (key, value) in user_bindings.bindings {
+                let key = KeyBinding::canonical(&key).unwrap_or(key);
                 bindings.bindings.insert(key, value);
             }
         }

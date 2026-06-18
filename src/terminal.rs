@@ -1821,12 +1821,16 @@ impl TerminalState {
             let byte = data_slice[i];
 
             match byte {
-                b'\x08' | b'\x7f' => {
-                    // Backspace (0x08) and Delete (0x7f) - just move cursor left
-                    // Shell handles actual deletion and sends back updated display
+                b'\x08' => {
+                    // Backspace (0x08) - just move cursor left.
+                    // Shell handles actual deletion and sends back updated display.
                     if self.cursor_col > 0 {
                         self.cursor_col -= 1;
                     }
+                    i += 1;
+                }
+                b'\x7f' => {
+                    // DEL (0x7f) is a fill/padding character; xterm ignores it.
                     i += 1;
                 }
                 b'\n' => {
@@ -2184,7 +2188,10 @@ impl TerminalState {
                             i += 1;
                         }
                         _ => {
-                            i += 1;
+                            // Unknown 2-byte escape (e.g. SS2 `ESC N`, SS3 `ESC O`).
+                            // Consume BOTH bytes so the trailing letter isn't printed
+                            // as literal text.
+                            i += 2;
                         }
                     }
                 }
@@ -2324,11 +2331,11 @@ impl TerminalState {
                 self.cursor_row = (self.cursor_row + n).min(limit);
             }
             'C' => {
-                let n = params.first().copied().unwrap_or(1) as usize;
+                let n = params.first().copied().unwrap_or(1).max(1) as usize;
                 self.cursor_col = (self.cursor_col + n).min(self.grid.row_len() - 1);
             }
             'D' => {
-                let n = params.first().copied().unwrap_or(1) as usize;
+                let n = params.first().copied().unwrap_or(1).max(1) as usize;
                 self.cursor_col = self.cursor_col.saturating_sub(n);
             }
             'E' => {
@@ -2461,8 +2468,8 @@ impl TerminalState {
                         self.mark_rows_dirty(0, self.cursor_row);
                     }
                     2 => {
-                        self.clear_screen();
-                        // clear_screen already marks all rows as dirty
+                        // ED 2: erase the whole screen but leave the cursor in place.
+                        self.clear_screen_no_home();
                     }
                     3 => {
                         // Clear scrollback (xterm extension)
@@ -2506,7 +2513,7 @@ impl TerminalState {
                 }
             }
             'L' => {
-                let n = params.first().copied().unwrap_or(1) as usize;
+                let n = params.first().copied().unwrap_or(1).max(1) as usize;
                 for _ in 0..n {
                     if self.cursor_row >= self.scroll_region_top
                         && self.cursor_row <= self.scroll_region_bottom
@@ -2522,7 +2529,7 @@ impl TerminalState {
                 self.mark_rows_dirty(self.cursor_row, self.scroll_region_bottom);
             }
             'M' => {
-                let n = params.first().copied().unwrap_or(1) as usize;
+                let n = params.first().copied().unwrap_or(1).max(1) as usize;
                 for _ in 0..n {
                     if self.cursor_row >= self.scroll_region_top
                         && self.cursor_row <= self.scroll_region_bottom
@@ -2618,7 +2625,7 @@ impl TerminalState {
             }
             'S' => {
                 // Scroll up (Scroll Up, SU) - content moves up, new lines appear at bottom
-                let n = params.first().copied().unwrap_or(1) as usize;
+                let n = params.first().copied().unwrap_or(1).max(1) as usize;
                 // Scroll within the scroll region by moving lines
                 for _ in 0..n {
                     self.scroll_region_up(self.scroll_region_top, self.scroll_region_bottom);
@@ -2626,7 +2633,7 @@ impl TerminalState {
             }
             'T' => {
                 // Scroll down (Scroll Down, SD) - content moves down, new lines appear at top
-                let n = params.first().copied().unwrap_or(1) as usize;
+                let n = params.first().copied().unwrap_or(1).max(1) as usize;
                 for _ in 0..n {
                     self.scroll_region_down(self.scroll_region_top, self.scroll_region_bottom);
                 }
@@ -2666,7 +2673,10 @@ impl TerminalState {
                 }
             }
             'p' => {
-                if private_prefix == Some(b'?') && intermediates == [b'$']
+                if intermediates == [b'!'] && private_prefix.is_none() {
+                    // DECSTR (CSI ! p) - soft terminal reset.
+                    self.soft_reset();
+                } else if private_prefix == Some(b'?') && intermediates == [b'$']
                     && params.first().copied() == Some(5522) {
                         let state = if self.modes.contains(&5522) { 1 } else { 2 };
                         let response = format!("\x1b[?5522;{}$y", state);
@@ -2715,7 +2725,7 @@ impl TerminalState {
             }
             '@' => {
                 // ICH - Insert Character(s)
-                let n = params.first().copied().unwrap_or(1) as usize;
+                let n = params.first().copied().unwrap_or(1).max(1) as usize;
                 let cols = self.grid.row_len();
                 let blank_cell = self.create_blank_cell();
                 if self.cursor_col < cols {
@@ -2736,7 +2746,7 @@ impl TerminalState {
             }
             'P' => {
                 // DCH - Delete Character(s)
-                let n = params.first().copied().unwrap_or(1) as usize;
+                let n = params.first().copied().unwrap_or(1).max(1) as usize;
                 let blank_cell = self.create_blank_cell();
                 for _ in 0..n {
                     if self.cursor_col < self.grid.row_len() {
@@ -2752,7 +2762,7 @@ impl TerminalState {
             }
             'X' => {
                 // ECH - Erase Character(s)
-                let n = params.first().copied().unwrap_or(1) as usize;
+                let n = params.first().copied().unwrap_or(1).max(1) as usize;
                 for i in 0..n {
                     let col = self.cursor_col + i;
                     if col < self.grid.row_len() {
@@ -2947,6 +2957,15 @@ impl TerminalState {
                         self.global_bg = self.current_bg;
                     }
                 }
+                58 => {
+                    // SGR 58: set underline color. We don't render a distinct
+                    // underline color yet, but its arguments MUST be consumed so
+                    // the legacy `58;2;r;g;b` form doesn't leak r/g/b as SGR codes.
+                    let _ = Self::parse_ext_color(groups, &mut gi);
+                }
+                59 => {
+                    // SGR 59: reset underline color to default - no-op.
+                }
                 _ => {}
             }
             gi += 1;
@@ -2991,10 +3010,52 @@ impl TerminalState {
         self.modes.insert(25); // cursor visible
         self.modes.insert(7); // autowrap on
         self.scroll_offset = 0;
+        // xterm RIS also discards saved lines and resets cursor style, dynamic
+        // colors, keyboard-protocol state, selection, and any open hyperlink.
+        self.scrollback.clear();
+        self.cursor_shape = CursorShape::default();
+        self.dynamic_fg = None;
+        self.dynamic_bg = None;
+        self.dynamic_cursor_color = None;
+        self.keyboard_enhancement_flags = 0;
+        self.keyboard_enhancement_stack.clear();
+        self.alt_keyboard_enhancement_flags = 0;
+        self.alt_keyboard_enhancement_stack.clear();
+        self.selection = None;
+        self.current_hyperlink = None;
         self.clear_screen();
     }
 
+    /// DECSTR (CSI ! p): soft terminal reset. Unlike RIS this does NOT clear the
+    /// screen or scrollback; it resets modes, margins, SGR, charsets and the
+    /// saved cursor to their power-on defaults.
+    fn soft_reset(&mut self) {
+        self.current_fg = Color::Default;
+        self.current_bg = Color::Default;
+        self.global_bg = Color::Default;
+        self.current_flags = StyleFlags::default();
+        self.g0_charset = Charset::Ascii;
+        self.g1_charset = Charset::Ascii;
+        self.active_charset = Charset::Ascii;
+        self.scroll_region_top = 0;
+        self.scroll_region_bottom = self.grid.rows().saturating_sub(1);
+        self.saved_cursor = None;
+        // Reset the modes DECSTR is defined to touch: DECOM (6) off, IRM (4) off,
+        // DECTCEM (25) on, DECAWM (7) on. Leave everything else as-is.
+        self.modes.remove(&6);
+        self.modes.remove(&4);
+        self.modes.insert(25);
+        self.modes.insert(7);
+    }
+
     fn clear_screen(&mut self) {
+        self.clear_screen_no_home();
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+    }
+
+    /// Erase the whole screen WITHOUT moving the cursor (ED / CSI 2 J).
+    fn clear_screen_no_home(&mut self) {
         let bg_color = self.current_bg;
         for row in self.grid.iter_mut() {
             for cell in row.iter_mut() {
@@ -3006,8 +3067,6 @@ impl TerminalState {
                 };
             }
         }
-        self.cursor_row = 0;
-        self.cursor_col = 0;
         // Mark all rows as dirty
         self.dirty_region.mark_all(self.grid.rows());
         self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
@@ -3048,8 +3107,14 @@ impl TerminalState {
                 // SGR mouse reporting format
                 self.modes.insert(mode);
             }
-            1049 => {
-                // Alternate screen buffer
+            1048 => {
+                // Save cursor (DECSC equivalent), no buffer switch.
+                self.save_cursor();
+                self.modes.insert(1048);
+            }
+            47 | 1047 | 1049 => {
+                // Alternate screen buffer (47/1047 = swap only, 1049 also saves
+                // the main-screen cursor). We treat all three as a buffer swap.
                 if !self.use_alt_buffer {
                     // Save main buffer state (cursor position)
                     self.saved_cursor_row = self.cursor_row;
@@ -3074,7 +3139,7 @@ impl TerminalState {
 
                     // Clear alt buffer and move cursor to home
                     self.clear_screen();
-                    self.modes.insert(1049);
+                    self.modes.insert(mode);
                 }
             }
             2026 => {
@@ -3126,7 +3191,12 @@ impl TerminalState {
                 // Disable SGR mouse reporting format
                 self.modes.remove(&mode);
             }
-            1049 => {
+            1048 => {
+                // Restore cursor (DECRC equivalent), no buffer switch.
+                self.restore_cursor();
+                self.modes.remove(&1048);
+            }
+            47 | 1047 | 1049 => {
                 // Restore main screen buffer
                 if self.use_alt_buffer {
                     // Save alt buffer state (cursor position)
@@ -3146,7 +3216,7 @@ impl TerminalState {
                         &mut self.alt_keyboard_enhancement_stack,
                     );
                     self.use_alt_buffer = false;
-                    self.modes.remove(&1049);
+                    self.modes.remove(&mode);
 
                     // Reset SGR attributes to prevent alternate screen colors from bleeding through
                     self.current_fg = Color::Default;
