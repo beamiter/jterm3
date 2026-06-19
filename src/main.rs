@@ -1147,6 +1147,7 @@ impl Jterm {
             &self.search.query,
             self.search.use_regex,
             self.search.case_sensitive,
+            &mut self.search.regex_cache,
         );
         self.search.matches = matches;
         self.search.error_message = error;

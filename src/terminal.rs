@@ -1585,6 +1585,13 @@ impl TerminalState {
             self.scrollback.pop_front();
         }
         self.scrollback.push_back(line);
+        // Pin the viewport when the user is reading history: without this,
+        // start_idx = scrollback.len() - scroll_offset - rows drifts by +1
+        // for every new line, sliding the visible region toward the bottom.
+        if self.scroll_offset > 0 {
+            self.scroll_offset = (self.scroll_offset + 1).min(self.scrollback.len());
+            self.visible_cells_cache = None;
+        }
     }
 
     fn scroll_region_down(&mut self, top: usize, bottom: usize) {
@@ -3137,6 +3144,15 @@ impl TerminalState {
                     );
                     self.use_alt_buffer = true;
 
+                    // Selection anchors are absolute (scrollback+grid) row indices
+                    // tied to the buffer that was visible. After a buffer swap they
+                    // would highlight unrelated lines, so drop the selection.
+                    self.selection = None;
+                    // DECSTBM is a per-buffer attribute; reset to full-screen so a
+                    // partial scroll region from the main buffer doesn't leak in.
+                    self.scroll_region_top = 0;
+                    self.scroll_region_bottom = self.grid.rows().saturating_sub(1);
+
                     // Clear alt buffer and move cursor to home
                     self.clear_screen();
                     self.modes.insert(mode);
@@ -3217,6 +3233,13 @@ impl TerminalState {
                     );
                     self.use_alt_buffer = false;
                     self.modes.remove(&mode);
+
+                    // See the matching set_mode arm: clear selection because its
+                    // anchors point into the alt buffer, and reset DECSTBM so the
+                    // alt buffer's scroll region doesn't carry into the main one.
+                    self.selection = None;
+                    self.scroll_region_top = 0;
+                    self.scroll_region_bottom = self.grid.rows().saturating_sub(1);
 
                     // Reset SGR attributes to prevent alternate screen colors from bleeding through
                     self.current_fg = Color::Default;
@@ -3306,8 +3329,10 @@ impl TerminalState {
         if self.modes.contains(&1006) {
             // SGR format: CSI < button ; x ; y M (button press) or m (button release)
             // For now, we'll generate press events (M) - release tracking would need more state
-            let x = (col as u32 + 1).min(255); // 1-indexed, max 255
-            let y = (row as u32 + 1).min(255); // 1-indexed, max 255
+            // SGR encodes coordinates as decimal integers, so the 223/255 cap that
+            // applies to the legacy X10 byte form is not needed here.
+            let x = col as u32 + 1;
+            let y = row as u32 + 1;
             Some(format!("\x1b[<{};{};{}M", button, x, y))
         } else {
             // Standard xterm format: CSI M button col row (raw bytes)
@@ -3331,8 +3356,8 @@ impl TerminalState {
 
         if self.modes.contains(&1006) {
             // SGR format: lowercase 'm' for release
-            let x = (col as u32 + 1).min(255);
-            let y = (row as u32 + 1).min(255);
+            let x = col as u32 + 1;
+            let y = row as u32 + 1;
             Some(format!("\x1b[<{};{};{}m", button, x, y))
         } else {
             // Standard xterm: release is button 3
@@ -4382,5 +4407,79 @@ mod tests {
             String::from_utf8(terminal.get_output()).unwrap(),
             "\x1b[?5522;2$y"
         );
+    }
+
+    #[test]
+    fn scrollback_viewport_pinned_when_new_output_arrives() {
+        // Reading history while output streams in should not slide the viewport
+        // toward the bottom: scroll_offset must compensate when push_scrollback
+        // grows the deque.
+        let mut terminal = TerminalState::new(2, 2);
+        // Push three lines into scrollback.
+        terminal.grid.get_mut(0, 0).character = 'A';
+        terminal.grid.get_mut(1, 0).character = 'B';
+        terminal.cursor_row = 1;
+        terminal.process_input(b"\n");
+        terminal.grid.get_mut(1, 0).character = 'C';
+        terminal.process_input(b"\n");
+        terminal.grid.get_mut(1, 0).character = 'D';
+        terminal.process_input(b"\n");
+
+        // Scroll up to view 'A','B'.
+        terminal.set_scroll_offset(3);
+        let before = terminal.get_visible_cells();
+        let top_before = before[0][0].character;
+        assert_eq!(top_before, 'A');
+
+        // New line arrives — viewport must still show the same top row.
+        terminal.grid.get_mut(1, 0).character = 'E';
+        terminal.process_input(b"\n");
+        let after = terminal.get_visible_cells();
+        assert_eq!(after[0][0].character, 'A');
+    }
+
+    #[test]
+    fn alt_buffer_switch_clears_selection_and_scroll_region() {
+        let mut terminal = TerminalState::new(4, 4);
+        // Set a partial scroll region and a selection on the main buffer.
+        terminal.process_input(b"\x1b[2;3r");
+        assert_eq!(terminal.scroll_region_top, 1);
+        assert_eq!(terminal.scroll_region_bottom, 2);
+        terminal.start_selection((0, 0));
+        terminal.update_selection((1, 1));
+        assert!(terminal.selection.is_some());
+
+        // Enter alt buffer.
+        terminal.process_input(b"\x1b[?1049h");
+
+        assert!(terminal.is_alt_buffer_active());
+        assert!(terminal.selection.is_none(), "selection must clear on alt switch");
+        assert_eq!(terminal.scroll_region_top, 0);
+        assert_eq!(terminal.scroll_region_bottom, 3);
+
+        // Restore some region & selection in alt buffer, then leave.
+        terminal.process_input(b"\x1b[1;2r");
+        terminal.start_selection((0, 0));
+        terminal.update_selection((1, 1));
+        terminal.process_input(b"\x1b[?1049l");
+
+        assert!(!terminal.is_alt_buffer_active());
+        assert!(terminal.selection.is_none(), "selection must clear on alt restore");
+        assert_eq!(terminal.scroll_region_top, 0);
+        assert_eq!(terminal.scroll_region_bottom, 3);
+    }
+
+    #[test]
+    fn sgr_mouse_report_is_not_capped_at_255() {
+        let mut terminal = TerminalState::new(400, 50);
+        // Enable mouse tracking + SGR encoding.
+        terminal.process_input(b"\x1b[?1000h\x1b[?1006h");
+
+        let report = terminal.get_mouse_report(0, 299, 10).unwrap();
+        // 1-indexed: column 300, row 11. Pre-fix this would have been 256.
+        assert_eq!(report, "\x1b[<0;300;11M");
+
+        let release = terminal.get_mouse_release_report(0, 299, 10).unwrap();
+        assert_eq!(release, "\x1b[<0;300;11m");
     }
 }

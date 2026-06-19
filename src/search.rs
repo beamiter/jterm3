@@ -1,8 +1,18 @@
 /// 搜索功能模块
 use crate::terminal::TerminalCell;
-use regex::RegexBuilder;
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+
+/// Compiled-regex cache slot. Held by `SearchState` so consecutive
+/// `recompute_search` calls with the same pattern reuse the same `Regex`
+/// instead of paying a fresh `RegexBuilder::build()` per keypress / PTY chunk.
+#[derive(Clone, Debug)]
+pub struct RegexCache {
+    pattern: String,
+    case_sensitive: bool,
+    regex: Regex,
+}
 
 /// 单个搜索匹配项
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
@@ -47,6 +57,9 @@ pub struct SearchState {
 
     /// 搜索错误消息（正则表达式编译错误等）
     pub error_message: Option<String>,
+
+    /// Cached compiled regex; reused while pattern + case-sensitive flag are unchanged.
+    pub regex_cache: Option<RegexCache>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -77,6 +90,7 @@ impl SearchState {
             history_nav_index: None,
             last_query: String::new(),
             error_message: None,
+            regex_cache: None,
         }
     }
 
@@ -215,13 +229,14 @@ impl SearchEngine {
         query: &str,
         use_regex: bool,
         case_sensitive: bool,
+        regex_cache: &mut Option<RegexCache>,
     ) -> (Vec<SearchMatch>, Option<String>) {
         if query.is_empty() {
             return (Vec::new(), None);
         }
 
         if use_regex {
-            Self::search_regex(grid, query, case_sensitive)
+            Self::search_regex(grid, query, case_sensitive, regex_cache)
         } else {
             (Self::search_plaintext(grid, query, case_sensitive), None)
         }
@@ -279,21 +294,37 @@ impl SearchEngine {
         grid: &[Vec<TerminalCell>],
         pattern: &str,
         case_sensitive: bool,
+        cache: &mut Option<RegexCache>,
     ) -> (Vec<SearchMatch>, Option<String>) {
         let mut matches = Vec::new();
 
-        // 编译正则表达式
-        let mut builder = RegexBuilder::new(pattern);
-        if !case_sensitive {
-            builder.case_insensitive(true);
-        }
-
-        let regex = match builder.build() {
-            Ok(r) => r,
-            Err(e) => {
-                return (Vec::new(), Some(format!("Invalid regex: {}", e)));
-            }
+        // Reuse the cached regex when the pattern + case flag are unchanged;
+        // otherwise (re)build and store. `RegexBuilder::build` is what we want
+        // to avoid on every keystroke.
+        let stale = match cache.as_ref() {
+            Some(c) => c.pattern != pattern || c.case_sensitive != case_sensitive,
+            None => true,
         };
+        if stale {
+            let mut builder = RegexBuilder::new(pattern);
+            if !case_sensitive {
+                builder.case_insensitive(true);
+            }
+            match builder.build() {
+                Ok(r) => {
+                    *cache = Some(RegexCache {
+                        pattern: pattern.to_string(),
+                        case_sensitive,
+                        regex: r,
+                    });
+                }
+                Err(e) => {
+                    *cache = None;
+                    return (Vec::new(), Some(format!("Invalid regex: {}", e)));
+                }
+            }
+        }
+        let regex = &cache.as_ref().unwrap().regex;
 
         for (line_idx, line) in grid.iter().enumerate() {
             let line_str = Self::grid_line_to_string(line);
