@@ -3828,7 +3828,8 @@ impl TerminalState {
             let total_rows = scrollback_len + grid_rows;
 
             let block = matches!(sel.mode, SelectionMode::Block);
-            for abs_row in start.0..=end.0.min(total_rows.saturating_sub(1)) {
+            let last_abs_row = end.0.min(total_rows.saturating_sub(1));
+            for abs_row in start.0..=last_abs_row {
                 let (start_col, end_col) = if block {
                     // Rectangular: same column span on every row.
                     let lo = sel.anchor.1.min(sel.active.1);
@@ -3842,6 +3843,13 @@ impl TerminalState {
                         cols.saturating_sub(1)
                     };
                     (s, e)
+                };
+
+                let row_is_wrapped = if abs_row < scrollback_len {
+                    self.scrollback[abs_row].is_wrapped
+                } else {
+                    let grid_row = abs_row - scrollback_len;
+                    grid_row < grid_rows && self.grid.row_wrapped[grid_row]
                 };
 
                 if abs_row < scrollback_len {
@@ -3865,7 +3873,10 @@ impl TerminalState {
                     }
                 }
 
-                if abs_row < end.0 {
+                // In block mode each row is an independent record; always
+                // separate with newline. Otherwise, soft-wrapped rows continue
+                // onto the next physical row without a hard newline.
+                if abs_row < last_abs_row && (block || !row_is_wrapped) {
                     result.push('\n');
                 }
             }
