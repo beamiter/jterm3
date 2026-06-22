@@ -133,8 +133,15 @@ enum Message {
     Focus(bool),
     NewSession,
     CloseTab(usize),
-    SelectTab(usize),
     TabHover(Option<usize>),
+    /// User pressed the mouse over tab `usize` — start tracking a potential drag.
+    TabDragStart(usize),
+    /// User released the mouse over tab `usize`. If a drag was in progress and
+    /// the source differs from the target, reorder; otherwise treat as a click.
+    TabDragEnd(usize),
+    /// Global mouse-up: clear `dragging_tab` if a drag was started but the
+    /// release happened outside any tab.
+    TabDragCancel,
     ToggleSidebar,
     SetSidebarPanel(SidebarPanel),
     SetTabPosition(config::TabPosition),
@@ -337,6 +344,10 @@ struct Jterm {
     dragging_divider: bool,
     /// Tab index the pointer is currently hovering (drives close-button reveal).
     hovered_tab: Option<usize>,
+    /// Source-tab index recorded on mouse press over a tab. Cleared on mouse
+    /// release (anywhere) by the global mouse-up listener; in between, it
+    /// drives tab-drag visual feedback and the reorder-on-release.
+    dragging_tab: Option<usize>,
     /// Held for the process lifetime to enforce single-instance behavior. When
     /// `None`, another instance already holds the lock and this one runs fresh
     /// (no session restore, no snapshot writes) to avoid clobbering its history.
@@ -420,6 +431,7 @@ impl Jterm {
             split_ratio: 0.5,
             dragging_divider: false,
             hovered_tab: None,
+            dragging_tab: None,
             _instance_lock: instance_lock,
             is_first_instance,
         };
@@ -642,6 +654,34 @@ impl Jterm {
             self.session_dirty = true;
             self.unsplit();
         }
+    }
+
+    /// Move `sessions[from]` to position `to`, shifting items between them.
+    /// `active` and any indices in `panes` are rewritten so the same tab stays
+    /// selected before/after the reorder.
+    fn reorder_session(&mut self, from: usize, to: usize) {
+        if from >= self.sessions.len() || to >= self.sessions.len() || from == to {
+            return;
+        }
+        let sess = self.sessions.remove(from);
+        self.sessions.insert(to, sess);
+        let remap = |idx: usize| -> usize {
+            if idx == from {
+                to
+            } else if from < idx && to >= idx {
+                idx - 1
+            } else if from > idx && to <= idx {
+                idx + 1
+            } else {
+                idx
+            }
+        };
+        self.active = remap(self.active);
+        for p in self.panes.iter_mut() {
+            *p = remap(*p);
+        }
+        self.session_dirty = true;
+        self.save_session_snapshot();
     }
 
     /// Per-pane (cols, rows) for the current split mode and window size.
@@ -1633,8 +1673,26 @@ impl Jterm {
             }
             Message::NewSession => self.new_session(),
             Message::CloseTab(i) => return self.close_session(i),
-            Message::SelectTab(i) => self.jump_session(i),
             Message::TabHover(i) => self.hovered_tab = i,
+            Message::TabDragStart(i) => {
+                if i < self.sessions.len() {
+                    self.dragging_tab = Some(i);
+                }
+            }
+            Message::TabDragEnd(i) => {
+                if let Some(from) = self.dragging_tab.take() {
+                    if from < self.sessions.len() && i < self.sessions.len() {
+                        if from == i {
+                            self.jump_session(i);
+                        } else {
+                            self.reorder_session(from, i);
+                        }
+                    }
+                }
+            }
+            Message::TabDragCancel => {
+                self.dragging_tab = None;
+            }
             Message::DividerDragStart => self.dragging_divider = true,
             Message::DividerDragEnd => self.dragging_divider = false,
             Message::DividerDragMove(pt) => {
@@ -2029,6 +2087,46 @@ impl Jterm {
         }
     }
 
+    /// Container-flavored variant of `tab_btn_style`, used when wrapping a tab
+    /// in `mouse_area` (which can't hand the hover status off to a Button).
+    /// `hovered`/`dragging` are pushed in by the caller from `self.hovered_tab`
+    /// and `self.dragging_tab`.
+    fn tab_container_style(
+        &self,
+        active: bool,
+        hovered: bool,
+        dragging: bool,
+    ) -> impl Fn(&iced::Theme) -> container::Style {
+        let base = Theme::rgb_to_color32(self.theme.tabbar.bg);
+        let accent = self.c_accent();
+        let active_text = Theme::rgb_to_color32(self.theme.tabbar.active_text);
+        let inactive_text = Theme::rgb_to_color32(self.theme.tabbar.inactive_text);
+        move |_t| {
+            let (mut bg, txt, bw) = if active {
+                (blend(base, accent, 0.22), active_text, 1.0)
+            } else if hovered {
+                (blend(base, accent, 0.10), inactive_text, 0.0)
+            } else {
+                (base, inactive_text, 0.0)
+            };
+            // Dim the source tab while it is being dragged so the user sees
+            // which one will move.
+            if dragging {
+                bg = Color { a: 0.55, ..bg };
+            }
+            container::Style {
+                text_color: Some(txt),
+                background: Some(bg.into()),
+                border: iced::Border {
+                    color: accent,
+                    width: bw,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            }
+        }
+    }
+
     /// Tab button: accent-tinted + bordered when active, flat otherwise.
     fn tab_btn_style(&self, active: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
         let base = Theme::rgb_to_color32(self.theme.tabbar.bg);
@@ -2144,14 +2242,25 @@ impl Jterm {
             } else {
                 label
             };
-            let tab = button(text(label).size(13))
-                .on_press(Message::SelectTab(i))
+            // The tab's label area is a styled container wrapped in a
+            // mouse_area so we get on_press/on_release/on_enter/on_exit. The
+            // styling mirrors `tab_btn_style` so visually it matches the rest
+            // of the chrome.
+            let hovered = self.hovered_tab == Some(i);
+            let dragging_this = self.dragging_tab == Some(i);
+            let tab_label = container(text(label).size(13))
                 .padding([3, 8])
-                .style(self.tab_btn_style(active));
+                .style(self.tab_container_style(active, hovered, dragging_this));
+            // Drag press/release lives on the label so a press on the close
+            // button never starts a tab drag.
+            let tab: Element<'_, Message> = mouse_area(tab_label)
+                .on_press(Message::TabDragStart(i))
+                .on_release(Message::TabDragEnd(i))
+                .into();
             // Reveal the close button only on the active or hovered tab to cut
             // visual noise; keep its footprint reserved otherwise so tabs don't
             // jump when hovered.
-            let show_close = active || self.hovered_tab == Some(i);
+            let show_close = active || hovered;
             let close: Element<'_, Message> = if show_close {
                 button(text("×").size(13))
                     .on_press(Message::CloseTab(i))
@@ -2164,6 +2273,8 @@ impl Jterm {
             let cell = row![tab, close]
                 .spacing(1)
                 .align_y(iced::Alignment::Center);
+            // Hover tracking on the whole cell so moving onto the close
+            // button does not collapse it out of the layout.
             tabs = tabs.push(
                 mouse_area(cell)
                     .on_enter(Message::TabHover(Some(i)))
@@ -2404,17 +2515,20 @@ impl Jterm {
             } else {
                 label
             };
-            let tab = button(
-                text(label)
-                    .size(13)
-                    .wrapping(text::Wrapping::None),
+            let hovered = self.hovered_tab == Some(i);
+            let dragging_this = self.dragging_tab == Some(i);
+            let tab_label = container(
+                text(label).size(13).wrapping(text::Wrapping::None),
             )
-            .on_press(Message::SelectTab(i))
             .width(Length::Fill)
             .padding([4, 8])
-            .style(self.tab_btn_style(active));
+            .style(self.tab_container_style(active, hovered, dragging_this));
+            let tab: Element<'_, Message> = mouse_area(tab_label)
+                .on_press(Message::TabDragStart(i))
+                .on_release(Message::TabDragEnd(i))
+                .into();
             // Reveal the close button on the active or hovered tab only.
-            let show_close = active || self.hovered_tab == Some(i);
+            let show_close = active || hovered;
             let close_inner: Element<'_, Message> = if show_close {
                 button(text("×").size(13))
                     .on_press(Message::CloseTab(i))
@@ -3127,6 +3241,13 @@ impl Jterm {
             }
             iced::Event::Window(iced::window::Event::Focused) => Some(Message::Focus(true)),
             iced::Event::Window(iced::window::Event::Unfocused) => Some(Message::Focus(false)),
+            // Catch every left-button release so a tab drag that ends outside
+            // any tab still clears `dragging_tab`. When the release lands on a
+            // tab, mouse_area's on_release fires Message::TabDragEnd first
+            // (which already consumes `dragging_tab`), so this becomes a no-op.
+            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                iced::mouse::Button::Left,
+            )) => Some(Message::TabDragCancel),
             _ => None,
         });
         subs.push(events);
