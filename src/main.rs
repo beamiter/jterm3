@@ -46,6 +46,32 @@ static SEARCH_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-search-input"));
 static PALETTE_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-palette-input"));
+static TAB_SWITCHER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-tab-switcher-input"));
+
+/// Toast kind drives the accent color of the floating notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToastKind {
+    Info,
+    Success,
+    Warning,
+}
+
+/// Transient bottom-right notification. `expires_at` is absolute monotonic time.
+#[derive(Debug, Clone)]
+struct Toast {
+    text: String,
+    kind: ToastKind,
+    expires_at: std::time::Instant,
+}
+
+/// State for the Ctrl+Shift+K quick tab switcher overlay.
+#[derive(Debug, Clone, Default)]
+struct TabSwitcherState {
+    query: String,
+    /// Highlighted row in the filtered list.
+    selected: usize,
+}
 
 /// Which content the left sidebar dock currently shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +203,35 @@ enum Message {
     ConfigReset,
     ConfigTick,
     BlinkTick,
+    /// Right-click on a tab opened its context menu (close/duplicate/etc).
+    TabMenuOpen(usize),
+    /// Dismiss the tab context menu without an action.
+    TabMenuClose,
+    /// Execute a menu action against the target tab.
+    TabMenuAction(TabMenuAction),
+    /// Toast queue tick (drop expired entries).
+    ToastTick,
+    /// Dismiss a specific toast by index.
+    ToastDismiss(usize),
+    /// Filter text changed in the tab switcher.
+    TabSwitcherInput(String),
+    /// Cancel the tab switcher overlay.
+    TabSwitcherClose,
+    /// Jump to the given session index from the tab switcher (and close it).
+    TabSwitcherJump(usize),
+    /// User confirmed closing a tab with a running foreground process.
+    TabCloseConfirmYes,
+    /// User cancelled the close-confirmation overlay.
+    TabCloseConfirmNo,
+}
+
+/// Context-menu actions that target a specific tab index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabMenuAction {
+    Close(usize),
+    CloseOthers(usize),
+    CloseToRight(usize),
+    Duplicate(usize),
 }
 
 /// In-progress custom theme being edited in the theme editor overlay. UI-chrome
@@ -201,6 +256,10 @@ struct Session {
     /// Cached working directory, refreshed periodically so the status bar can
     /// display it without a `readlink` syscall on every render frame.
     cwd_cache: Option<String>,
+    /// Cached foreground process name (via tcgetpgrp + /proc/<pgid>/comm),
+    /// refreshed on the same cadence as `cwd_cache`. Empty/None when the
+    /// shell itself is in the foreground so tab labels can hide it.
+    fg_proc_cache: Option<String>,
 }
 
 impl Session {
@@ -227,17 +286,68 @@ impl Session {
             cursor,
             cursor_visible,
             cwd_cache: None,
+            fg_proc_cache: None,
         })
     }
 
-    /// Tab label: OSC-set window title, falling back to a session number.
+    /// Tab label: prefer an OSC-set window title; otherwise show the foreground
+    /// process and/or cwd basename so a fresh shell with no title still tells
+    /// the user where they are. Falls back to "Session N" only when none of
+    /// those are known yet.
     fn label(&self) -> String {
         let t = self.terminal.window_title.trim();
-        if t.is_empty() {
-            format!("Session {}", self.id + 1)
-        } else {
-            t.to_string()
+        if !t.is_empty() {
+            return t.to_string();
         }
+        let cwd_short = self
+            .cwd_cache
+            .as_deref()
+            .and_then(Self::cwd_basename);
+        match (&self.fg_proc_cache, cwd_short) {
+            (Some(p), Some(d)) => format!("{p} · {d}"),
+            (Some(p), None) => p.clone(),
+            (None, Some(d)) => d,
+            (None, None) => format!("Session {}", self.id + 1),
+        }
+    }
+
+    /// Short, human-friendly form of an absolute cwd: "~" for $HOME, just the
+    /// basename otherwise. Returns None for "/" or unparsable paths.
+    fn cwd_basename(cwd: &str) -> Option<String> {
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = home.to_string_lossy();
+            if cwd == home {
+                return Some("~".to_string());
+            }
+        }
+        let p = std::path::Path::new(cwd);
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
+
+    /// Foreground process name on the PTY, or None when it's the shell itself
+    /// (so the tab label doesn't redundantly show "bash" / "zsh" / "fish").
+    fn fg_proc(&self) -> Option<String> {
+        let pgid = unsafe { libc::tcgetpgrp(self.master_fd) };
+        if pgid <= 0 {
+            return None;
+        }
+        let comm = std::fs::read_to_string(format!("/proc/{pgid}/comm")).ok()?;
+        let comm = comm.trim().to_string();
+        if comm.is_empty() {
+            return None;
+        }
+        // Hide when the foreground process *is* the shell — that's the idle case.
+        if pgid as i32 == self.pty.get_child_pid() {
+            return None;
+        }
+        const SHELLS: &[&str] = &["bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh"];
+        if SHELLS.contains(&comm.as_str()) {
+            return None;
+        }
+        Some(comm)
     }
 
     fn refresh(&mut self) {
@@ -348,6 +458,19 @@ struct Jterm {
     /// release (anywhere) by the global mouse-up listener; in between, it
     /// drives tab-drag visual feedback and the reorder-on-release.
     dragging_tab: Option<usize>,
+    /// Right-click context menu state: which tab the menu belongs to, or None.
+    /// Rendered as a centered floating panel (Esc / click-outside dismiss).
+    tab_menu: Option<usize>,
+    /// Transient bottom-right toast queue with absolute expiry timestamps.
+    /// Cleared lazily on each render and on ConfigTick.
+    toasts: Vec<Toast>,
+    /// Tab-switcher overlay (Ctrl+Shift+K): when open, a small fuzzy list of
+    /// tab labels lets the user jump by typing. Field holds the typed query
+    /// and current selection index.
+    tab_switcher: Option<TabSwitcherState>,
+    /// Close-confirmation overlay for a tab with a running foreground process.
+    /// Holds `(session_index, process_name)`; cleared on cancel/confirm.
+    tab_close_confirm: Option<(usize, String)>,
     /// Held for the process lifetime to enforce single-instance behavior. When
     /// `None`, another instance already holds the lock and this one runs fresh
     /// (no session restore, no snapshot writes) to avoid clobbering its history.
@@ -432,6 +555,10 @@ impl Jterm {
             dragging_divider: false,
             hovered_tab: None,
             dragging_tab: None,
+            tab_menu: None,
+            toasts: Vec::new(),
+            tab_switcher: None,
+            tab_close_confirm: None,
             _instance_lock: instance_lock,
             is_first_instance,
         };
@@ -632,6 +759,22 @@ impl Jterm {
         Task::none()
     }
 
+    /// Public entry point for close requests originating from user actions.
+    /// Pops a confirmation overlay when the target tab is running a non-shell
+    /// foreground process; otherwise closes immediately. Force-close paths
+    /// (close-others, batch close) still call `close_session` directly.
+    fn request_close_session(&mut self, index: usize) -> Task<Message> {
+        let busy = self
+            .sessions
+            .get(index)
+            .and_then(|s| s.fg_proc_cache.clone().or_else(|| s.fg_proc()));
+        if let Some(name) = busy {
+            self.tab_close_confirm = Some((index, name));
+            return Task::none();
+        }
+        self.close_session(index)
+    }
+
     fn next_session(&mut self) {
         if !self.sessions.is_empty() {
             self.active = (self.active + 1) % self.sessions.len();
@@ -653,6 +796,88 @@ impl Jterm {
             self.active = index;
             self.session_dirty = true;
             self.unsplit();
+        }
+    }
+
+    /// Push a transient bottom-right toast. Auto-expires; dismissable.
+    fn push_toast(&mut self, text: impl Into<String>, kind: ToastKind) {
+        const TOAST_TTL_MS: u64 = 2400;
+        const MAX_TOASTS: usize = 4;
+        self.toasts.push(Toast {
+            text: text.into(),
+            kind,
+            expires_at: std::time::Instant::now()
+                + std::time::Duration::from_millis(TOAST_TTL_MS),
+        });
+        // Drop oldest if we exceed cap so the stack never grows past MAX_TOASTS.
+        if self.toasts.len() > MAX_TOASTS {
+            let drop = self.toasts.len() - MAX_TOASTS;
+            self.toasts.drain(0..drop);
+        }
+    }
+
+    /// Drop expired toasts. Cheap; called from the periodic tick.
+    fn expire_toasts(&mut self) {
+        let now = std::time::Instant::now();
+        self.toasts.retain(|t| t.expires_at > now);
+    }
+
+    /// Apply a tab context-menu action. Close/CloseOthers/CloseToRight close
+    /// the matching sessions (terminating their PTYs); Duplicate clones the
+    /// target's cwd into a new tab adjacent to it.
+    fn execute_tab_menu_action(&mut self, action: TabMenuAction) -> Task<Message> {
+        match action {
+            TabMenuAction::Close(i) => self.request_close_session(i),
+            TabMenuAction::CloseOthers(keep) => {
+                if keep >= self.sessions.len() {
+                    return Task::none();
+                }
+                // Close from the back so indices stay valid; skip `keep`.
+                let mut tasks: Vec<Task<Message>> = Vec::new();
+                let mut i = self.sessions.len();
+                while i > 0 {
+                    i -= 1;
+                    if i != keep {
+                        tasks.push(self.close_session(i));
+                    }
+                }
+                self.push_toast("Closed other tabs", ToastKind::Info);
+                Task::batch(tasks)
+            }
+            TabMenuAction::CloseToRight(anchor) => {
+                if anchor >= self.sessions.len() {
+                    return Task::none();
+                }
+                let mut tasks: Vec<Task<Message>> = Vec::new();
+                while self.sessions.len() > anchor + 1 {
+                    let last = self.sessions.len() - 1;
+                    tasks.push(self.close_session(last));
+                }
+                self.push_toast("Closed tabs to the right", ToastKind::Info);
+                Task::batch(tasks)
+            }
+            TabMenuAction::Duplicate(i) => {
+                let cwd = self
+                    .sessions
+                    .get(i)
+                    .and_then(|s| s.cwd_cache.clone().or_else(|| s.cwd()));
+                if let Some(sess) = Session::spawn(
+                    &self.config,
+                    self.next_id,
+                    self.cols,
+                    self.rows,
+                    cwd.as_deref(),
+                ) {
+                    self.next_id += 1;
+                    let insert = (i + 1).min(self.sessions.len());
+                    self.sessions.insert(insert, sess);
+                    self.active = insert;
+                    self.unsplit();
+                    self.save_session_snapshot();
+                    self.push_toast("Duplicated tab", ToastKind::Success);
+                }
+                Task::none()
+            }
         }
     }
 
@@ -787,7 +1012,7 @@ impl Jterm {
     /// Close the focused pane's session and collapse to the remaining one.
     fn close_focused_pane(&mut self) -> Task<Message> {
         if self.split_mode == SplitMode::Single {
-            return self.close_session(self.active);
+            return self.request_close_session(self.active);
         }
         let victim = self.panes[self.focused_pane];
         let keep = self.panes[1 - self.focused_pane];
@@ -836,7 +1061,7 @@ impl Jterm {
                 self.new_session();
                 Task::none()
             }
-            C::SessionClose | C::WindowClose => return Some(self.close_session(self.active)),
+            C::SessionClose | C::WindowClose => return Some(self.request_close_session(self.active)),
             C::SessionNext => {
                 self.next_session();
                 Task::none()
@@ -856,7 +1081,14 @@ impl Jterm {
                     .and_then(|s| s.terminal.copy_selection())
                     .filter(|t| !t.is_empty());
                 match text {
-                    Some(text) => iced::clipboard::write(text),
+                    Some(text) => {
+                        let n = text.chars().count();
+                        self.push_toast(
+                            format!("Copied {} char{}", n, if n == 1 { "" } else { "s" }),
+                            ToastKind::Success,
+                        );
+                        iced::clipboard::write(text)
+                    }
                     None => Task::none(),
                 }
             }
@@ -1014,10 +1246,87 @@ impl Jterm {
                     self.help_open = !self.help_open;
                     return Some(Task::none());
                 }
+                'k' => {
+                    if self.tab_switcher.is_some() {
+                        self.tab_switcher = None;
+                        return Some(Task::none());
+                    }
+                    self.tab_switcher = Some(TabSwitcherState::default());
+                    return Some(iced::widget::operation::focus(
+                        TAB_SWITCHER_INPUT_ID.clone(),
+                    ));
+                }
                 _ => {}
             }
         }
         None
+    }
+
+    /// Tab switcher key handling. Mirrors `handle_palette_key`: filters by
+    /// typed text, arrows move selection, Enter jumps, Esc closes.
+    fn handle_tab_switcher_key(
+        &mut self,
+        key: &keyboard::Key,
+        mods: keyboard::Modifiers,
+        text: Option<&str>,
+    ) -> Option<Task<Message>> {
+        use keyboard::key::Named;
+        use keyboard::Key;
+        let state = self.tab_switcher.as_mut()?;
+        // Recompute the visible order once so Enter/arrows agree with what's drawn.
+        let filtered = tab_switcher_filtered(&self.sessions, &state.query);
+        match key {
+            Key::Named(Named::Escape) => {
+                self.tab_switcher = None;
+                return Some(Task::none());
+            }
+            Key::Named(Named::Enter) => {
+                let target = filtered.get(state.selected).map(|&(_, i)| i);
+                self.tab_switcher = None;
+                if let Some(i) = target {
+                    if i < self.sessions.len() && i != self.active {
+                        self.active = i;
+                        self.panes[self.focused_pane] = i;
+                        self.session_dirty = true;
+                    }
+                }
+                return Some(Task::none());
+            }
+            Key::Named(Named::ArrowDown) => {
+                if !filtered.is_empty() {
+                    state.selected = (state.selected + 1) % filtered.len();
+                }
+                return Some(Task::none());
+            }
+            Key::Named(Named::ArrowUp) => {
+                if !filtered.is_empty() {
+                    state.selected = if state.selected == 0 {
+                        filtered.len() - 1
+                    } else {
+                        state.selected - 1
+                    };
+                }
+                return Some(Task::none());
+            }
+            Key::Named(Named::Backspace) => {
+                state.query.pop();
+                state.selected = 0;
+                return Some(Task::none());
+            }
+            _ => {}
+        }
+        if !mods.control() && !mods.alt() {
+            if let Some(t) = text {
+                let printable: String = t.chars().filter(|c| !c.is_control()).collect();
+                if !printable.is_empty() {
+                    state.query.push_str(&printable);
+                    state.selected = 0;
+                    return Some(Task::none());
+                }
+            }
+        }
+        // Swallow all other keys while the overlay owns the keyboard.
+        Some(Task::none())
     }
 
     /// Route a grid mouse interaction either to the running application (when it
@@ -1356,12 +1665,13 @@ impl Jterm {
     /// Dispatch a palette action to the matching existing operation.
     fn execute_palette_action(&mut self, action: command_palette::PaletteAction) -> Task<Message> {
         use command_palette::PaletteAction;
+        self.palette.record_use(action);
         match action {
             PaletteAction::NewTab => {
                 self.new_session();
                 Task::none()
             }
-            PaletteAction::CloseTab => self.close_session(self.active),
+            PaletteAction::CloseTab => self.request_close_session(self.active),
             PaletteAction::NextTab => {
                 self.next_session();
                 Task::none()
@@ -1377,6 +1687,11 @@ impl Jterm {
                     .and_then(|s| s.terminal.copy_selection())
                     .filter(|t| !t.is_empty())
                 {
+                    let n = text.chars().count();
+                    self.push_toast(
+                        format!("Copied {} char{}", n, if n == 1 { "" } else { "s" }),
+                        ToastKind::Success,
+                    );
                     iced::clipboard::write(text)
                 } else {
                     Task::none()
@@ -1536,6 +1851,32 @@ impl Jterm {
                     ..
                 } = event
                 {
+                    // Tab switcher swallows keys while open (Enter to jump,
+                    // arrows to move, Esc/Ctrl+K to dismiss). Handle before the
+                    // generic keybindings so its Esc/Ctrl+K shortcut wins.
+                    if self.tab_switcher.is_some() {
+                        if let Some(task) =
+                            self.handle_tab_switcher_key(&key, modifiers, text.as_deref())
+                        {
+                            return task;
+                        }
+                    }
+                    // Esc dismisses the tab context menu and the tab switcher
+                    // when no other handler claimed them.
+                    if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                        if self.tab_close_confirm.is_some() {
+                            self.tab_close_confirm = None;
+                            return Task::none();
+                        }
+                        if self.tab_menu.is_some() {
+                            self.tab_menu = None;
+                            return Task::none();
+                        }
+                        if self.tab_switcher.is_some() {
+                            self.tab_switcher = None;
+                            return Task::none();
+                        }
+                    }
                     if let Some(task) = self.handle_keybinding(&key, modifiers) {
                         return task;
                     }
@@ -1672,7 +2013,7 @@ impl Jterm {
                 }
             }
             Message::NewSession => self.new_session(),
-            Message::CloseTab(i) => return self.close_session(i),
+            Message::CloseTab(i) => return self.request_close_session(i),
             Message::TabHover(i) => self.hovered_tab = i,
             Message::TabDragStart(i) => {
                 if i < self.sessions.len() {
@@ -1878,6 +2219,7 @@ impl Jterm {
                 }
             }
             Message::ThemeEditSave => {
+                let mut save_error: Option<String> = None;
                 if let Some(ed) = &mut self.theme_editor {
                     let name = ed.name.trim().to_string();
                     if name.is_empty() {
@@ -1898,26 +2240,50 @@ impl Jterm {
                         }
                         match theme.save_custom_theme() {
                             Ok(()) => {
-                                self.config.theme = name;
+                                self.config.theme = name.clone();
                                 self.theme_editor = None;
                                 self.apply_config();
+                                self.push_toast(
+                                    format!("Saved theme \"{}\"", name),
+                                    ToastKind::Success,
+                                );
                             }
                             Err(e) => {
-                                ed.error = Some(format!("Save failed: {}", e));
+                                let msg = format!("Save failed: {}", e);
+                                ed.error = Some(msg.clone());
+                                save_error = Some(msg);
                             }
                         }
                     }
                 }
+                if let Some(msg) = save_error {
+                    self.push_toast(format!("Theme {}", msg), ToastKind::Warning);
+                }
             }
             Message::ThemeDelete(name) => {
-                let _ = Theme::delete_custom_theme(&name);
+                match Theme::delete_custom_theme(&name) {
+                    Ok(()) => self.push_toast(
+                        format!("Deleted theme \"{}\"", name),
+                        ToastKind::Info,
+                    ),
+                    Err(e) => self.push_toast(
+                        format!("Delete failed: {}", e),
+                        ToastKind::Warning,
+                    ),
+                }
                 if self.config.theme == name {
                     self.config.theme = "dark".to_string();
                     self.apply_config();
                 }
             }
             Message::ConfigSave => {
-                let _ = self.config.save();
+                match self.config.save() {
+                    Ok(()) => self.push_toast("Config saved", ToastKind::Success),
+                    Err(e) => self.push_toast(
+                        format!("Save failed: {}", e),
+                        ToastKind::Warning,
+                    ),
+                }
                 self.config_mtime = Config::config_mtime();
             }
             Message::ConfigReset => {
@@ -1925,6 +2291,7 @@ impl Jterm {
                 self.apply_config();
                 let _ = self.config.save();
                 self.config_mtime = Config::config_mtime();
+                self.push_toast("Config reset to defaults", ToastKind::Info);
             }
             Message::ConfigTick => {
                 // Skip while editing so live (unsaved) edits aren't reverted.
@@ -1948,9 +2315,52 @@ impl Jterm {
                 if self.session_dirty {
                     self.save_session_snapshot();
                 }
-                // Refresh the active session's cwd cache for the status bar.
-                if let Some(sess) = self.sessions.get_mut(self.active) {
+                // Refresh cwd + foreground-process caches for every session so
+                // tab labels reflect both. These are cheap /proc reads at 1.5s
+                // cadence and let inactive tabs still show "vim · src" etc.
+                for sess in self.sessions.iter_mut() {
                     sess.cwd_cache = sess.cwd();
+                    sess.fg_proc_cache = sess.fg_proc();
+                }
+                self.expire_toasts();
+            }
+            Message::TabMenuOpen(i) => {
+                if i < self.sessions.len() {
+                    self.tab_menu = Some(i);
+                }
+            }
+            Message::TabMenuClose => self.tab_menu = None,
+            Message::TabMenuAction(action) => {
+                self.tab_menu = None;
+                return self.execute_tab_menu_action(action);
+            }
+            Message::ToastTick => self.expire_toasts(),
+            Message::ToastDismiss(i) => {
+                if i < self.toasts.len() {
+                    self.toasts.remove(i);
+                }
+            }
+            Message::TabSwitcherClose => self.tab_switcher = None,
+            Message::TabSwitcherInput(q) => {
+                if let Some(s) = self.tab_switcher.as_mut() {
+                    s.query = q;
+                    s.selected = 0;
+                }
+            }
+            Message::TabSwitcherJump(i) => {
+                self.tab_switcher = None;
+                if i < self.sessions.len() && i != self.active {
+                    self.active = i;
+                    self.panes[self.focused_pane] = i;
+                    self.session_dirty = true;
+                }
+            }
+            Message::TabCloseConfirmNo => {
+                self.tab_close_confirm = None;
+            }
+            Message::TabCloseConfirmYes => {
+                if let Some((index, _)) = self.tab_close_confirm.take() {
+                    return self.close_session(index);
                 }
             }
         }
@@ -2252,10 +2662,11 @@ impl Jterm {
                 .padding([3, 8])
                 .style(self.tab_container_style(active, hovered, dragging_this));
             // Drag press/release lives on the label so a press on the close
-            // button never starts a tab drag.
+            // button never starts a tab drag. Right-click opens the context menu.
             let tab: Element<'_, Message> = mouse_area(tab_label)
                 .on_press(Message::TabDragStart(i))
                 .on_release(Message::TabDragEnd(i))
+                .on_right_press(Message::TabMenuOpen(i))
                 .into();
             // Reveal the close button only on the active or hovered tab to cut
             // visual noise; keep its footprint reserved otherwise so tabs don't
@@ -2297,6 +2708,224 @@ impl Jterm {
             .height(Length::Fixed(TAB_BAR_H))
             .style(self.chrome_bar_style())
             .into()
+    }
+
+    /// Floating tab context menu — Close, Close Others, Close to Right, Duplicate.
+    /// Background mouse_area dismisses on outside-click; Esc also closes via key handler.
+    fn tab_context_menu(&self, i: usize) -> Element<'_, Message> {
+        let label = self
+            .sessions
+            .get(i)
+            .map(|s| s.label())
+            .unwrap_or_else(|| format!("Tab {}", i + 1));
+        let row_btn = |t: &str, msg: Message| -> Element<'_, Message> {
+            button(text(t.to_string()).size(13))
+                .on_press(msg)
+                .padding([4, 10])
+                .width(Length::Fill)
+                .style(self.ghost_btn_style())
+                .into()
+        };
+        let only_one = self.sessions.len() <= 1;
+        let last_idx = self.sessions.len().saturating_sub(1);
+
+        let mut menu = column![
+            text(label).size(12).style(text::secondary),
+            row_btn(
+                "Close",
+                Message::TabMenuAction(TabMenuAction::Close(i)),
+            ),
+        ]
+        .spacing(2);
+        if !only_one {
+            menu = menu.push(row_btn(
+                "Close Others",
+                Message::TabMenuAction(TabMenuAction::CloseOthers(i)),
+            ));
+        }
+        if i < last_idx {
+            menu = menu.push(row_btn(
+                "Close to Right",
+                Message::TabMenuAction(TabMenuAction::CloseToRight(i)),
+            ));
+        }
+        menu = menu.push(row_btn(
+            "Duplicate",
+            Message::TabMenuAction(TabMenuAction::Duplicate(i)),
+        ));
+
+        let panel = container(menu)
+            .width(Length::Fixed(200.0))
+            .padding(8)
+            .style(container::dark);
+
+        // Dismiss-on-outside-click sheet behind the panel.
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::TabMenuClose);
+        let top_gap = TAB_BAR_H + 4.0;
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .align_top(Length::Fill)
+            .padding(iced::Padding::from(0).top(top_gap));
+        stack![Element::from(dismiss), Element::from(centered)].into()
+    }
+
+    /// Centered modal: "Tab is running `<proc>`. Close anyway?". Esc / outside
+    /// click cancel; only TabCloseConfirmYes proceeds with the close.
+    fn tab_close_confirm_view(&self, index: usize, proc_name: &str) -> Element<'_, Message> {
+        let label = self
+            .sessions
+            .get(index)
+            .map(|s| s.label())
+            .unwrap_or_else(|| format!("Tab {}", index + 1));
+        let body = column![
+            text(format!("Close \"{}\"?", label)).size(14),
+            text(format!("Foreground process: {}", proc_name))
+                .size(12)
+                .style(text::secondary),
+            row![
+                button(text("Cancel").size(13))
+                    .on_press(Message::TabCloseConfirmNo)
+                    .padding([4, 12])
+                    .style(self.ghost_btn_style()),
+                Space::new().width(Length::Fill),
+                button(text("Close anyway").size(13))
+                    .on_press(Message::TabCloseConfirmYes)
+                    .padding([4, 12])
+                    .style(button::danger),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        ]
+        .spacing(10);
+        let panel = container(body)
+            .width(Length::Fixed(320.0))
+            .padding(14)
+            .style(container::dark);
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::TabCloseConfirmNo);
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        stack![Element::from(dismiss), Element::from(centered)].into()
+    }
+
+    /// Bottom-right toast stack. Each toast is click-dismissable.
+    fn toast_overlay(&self) -> Element<'_, Message> {
+        let mut col = column![].spacing(6);
+        for (idx, t) in self.toasts.iter().enumerate() {
+            let accent = match t.kind {
+                ToastKind::Info => self.c_accent(),
+                ToastKind::Success => self.theme.ansi_color(2),
+                ToastKind::Warning => self.theme.ansi_color(3),
+            };
+            let style_accent = accent;
+            let style = move |_t: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(Color {
+                    a: 0.96,
+                    ..Color::BLACK
+                })),
+                text_color: Some(Color::WHITE),
+                border: iced::Border {
+                    color: style_accent,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            };
+            let body = container(text(t.text.clone()).size(13))
+                .padding([6, 12])
+                .style(style);
+            let clickable = mouse_area(body).on_press(Message::ToastDismiss(idx));
+            col = col.push(clickable);
+        }
+        container(col)
+            .align_right(Length::Fill)
+            .align_bottom(Length::Fill)
+            .padding(
+                iced::Padding::from(0)
+                    .right(16.0)
+                    .bottom(STATUS_BAR_H + 12.0),
+            )
+            .into()
+    }
+
+    /// Ctrl+Shift+K fuzzy tab switcher overlay (palette-style).
+    fn tab_switcher_view(&self, state: &TabSwitcherState) -> Element<'_, Message> {
+        let filtered = tab_switcher_filtered(&self.sessions, &state.query);
+
+        let query: Element<'_, Message> = text_input("Jump to tab…", &state.query)
+            .id(TAB_SWITCHER_INPUT_ID.clone())
+            .on_input(Message::TabSwitcherInput)
+            .size(14)
+            .into();
+        let query_line = row![text("↦").size(16), query]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+
+        let mut list = column![].spacing(2);
+        if filtered.is_empty() {
+            list = list.push(text("No tabs match").size(13).style(text::secondary));
+        } else {
+            for &(pos, idx) in filtered.iter() {
+                let selected = pos == state.selected;
+                let label = self
+                    .sessions
+                    .get(idx)
+                    .map(|s| s.label())
+                    .unwrap_or_default();
+                let info = row![
+                    text(format!("{:>2}", idx + 1)).size(12).style(text::secondary),
+                    text(label).size(13),
+                    Space::new().width(Length::Fill),
+                ]
+                .spacing(10)
+                .align_y(iced::Alignment::Center);
+                let accent = self.c_accent();
+                let body = container(info)
+                    .width(Length::Fill)
+                    .padding([3, 8])
+                    .style(move |_t: &iced::Theme| container::Style {
+                        background: if selected {
+                            Some(iced::Background::Color(Color { a: 0.28, ..accent }))
+                        } else {
+                            None
+                        },
+                        border: iced::Border {
+                            radius: 4.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    });
+                let row_btn = mouse_area(body).on_press(Message::TabSwitcherJump(idx));
+                list = list.push(row_btn);
+            }
+        }
+
+        let body = column![query_line, list].spacing(8);
+        let panel = container(body)
+            .width(Length::Fixed(420.0))
+            .max_height(420.0)
+            .padding(12)
+            .style(container::dark);
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::TabSwitcherClose);
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        stack![Element::from(dismiss), Element::from(centered)].into()
     }
 
     /// Bottom status bar: cwd, grid size, cursor position, and search state.
@@ -2722,10 +3351,32 @@ impl Jterm {
         };
         // The top bar is always present: in Top mode it holds the tab strip; in
         // Side mode it holds the dock toggle so chrome never overlaps the grid.
-        column![self.tab_bar(), main_area, self.status_bar()]
+        let root: Element<'_, Message> = column![self.tab_bar(), main_area, self.status_bar()]
             .width(Length::Fill)
             .height(Length::Fill)
-            .into()
+            .into();
+        // Tab context menu, tab switcher, and toasts float above everything
+        // so they remain accessible regardless of which other panel is open.
+        let root = if let Some(i) = self.tab_menu {
+            stack![root, self.tab_context_menu(i)].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if let Some(s) = &self.tab_switcher {
+            stack![root, self.tab_switcher_view(s)].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if let Some((idx, proc)) = &self.tab_close_confirm {
+            stack![root, self.tab_close_confirm_view(*idx, proc)].into()
+        } else {
+            root
+        };
+        if self.toasts.is_empty() {
+            root
+        } else {
+            stack![root, self.toast_overlay()].into()
+        }
     }
 
     /// Search bar overlaid at the top-right of the terminal. The query is an
@@ -3274,6 +3925,12 @@ impl Jterm {
                     .map(|_| Message::BlinkTick),
             );
         }
+        if !self.toasts.is_empty() {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(250))
+                    .map(|_| Message::ToastTick),
+            );
+        }
         Subscription::batch(subs)
     }
 }
@@ -3292,6 +3949,33 @@ fn slider_row<'a>(
     .spacing(10)
     .align_y(iced::Alignment::Center)
     .into()
+}
+
+/// Score and sort tabs against the switcher query. Empty query returns all in
+/// declaration order; otherwise returns matches highest score first as
+/// `(filtered_position, session_index)` tuples. Used by both the renderer and
+/// the key handler so navigation matches the visible list.
+fn tab_switcher_filtered(
+    sessions: &[Session],
+    query: &str,
+) -> Vec<(usize, usize)> {
+    use fuzzy_matcher::skim::SkimMatcherV2;
+    use fuzzy_matcher::FuzzyMatcher;
+    if query.is_empty() {
+        return sessions.iter().enumerate().map(|(i, _)| (i, i)).collect();
+    }
+    let matcher = SkimMatcherV2::default();
+    let mut scored: Vec<(i64, usize)> = sessions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| matcher.fuzzy_match(&s.label(), query).map(|sc| (sc, i)))
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored
+        .into_iter()
+        .enumerate()
+        .map(|(pos, (_, idx))| (pos, idx))
+        .collect()
 }
 
 /// Resident set size of this process in MB (Linux /proc), for the debug panel.

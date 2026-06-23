@@ -35,6 +35,9 @@ pub struct PaletteState {
     pub selected: usize,
     all: Vec<PaletteItem>,
     matcher: SkimMatcherV2,
+    /// Most-recent-first list of actions the user has executed. Drives the
+    /// empty-query order so frequent commands surface first. Capped to 16.
+    mru: Vec<PaletteAction>,
 }
 
 impl Default for PaletteState {
@@ -113,6 +116,19 @@ impl PaletteState {
             selected: 0,
             all,
             matcher: SkimMatcherV2::default(),
+            mru: Vec::new(),
+        }
+    }
+
+    /// Record an action as just-used so it sorts to the top of the empty-query
+    /// list next time the palette is opened. Caps at 16 entries; duplicate
+    /// inserts are deduplicated to the front.
+    pub fn record_use(&mut self, action: PaletteAction) {
+        self.mru.retain(|a| *a != action);
+        self.mru.insert(0, action);
+        const MRU_CAP: usize = 16;
+        if self.mru.len() > MRU_CAP {
+            self.mru.truncate(MRU_CAP);
         }
     }
 
@@ -134,11 +150,33 @@ impl PaletteState {
         }
     }
 
-    /// 当前过滤结果，元素为 `(all 中的索引, 命令项)`。空查询时按声明顺序返回全部；
-    /// 否则按模糊匹配分数降序排列，丢弃不匹配项。
+    /// 当前过滤结果，元素为 `(all 中的索引, 命令项)`。空查询时按 MRU 排序(最近使用
+    /// 优先,其余按声明顺序);否则按模糊匹配分数降序排列,丢弃不匹配项。
     pub fn filtered(&self) -> Vec<(usize, &PaletteItem)> {
         if self.query.is_empty() {
-            return self.all.iter().enumerate().collect();
+            // MRU first (preserving recency order), then everything else in
+            // declaration order so the list is stable and complete.
+            let mut out: Vec<(usize, &PaletteItem)> = Vec::with_capacity(self.all.len());
+            let mut seen = vec![false; self.all.len()];
+            for a in &self.mru {
+                if let Some((i, item)) = self
+                    .all
+                    .iter()
+                    .enumerate()
+                    .find(|(_, it)| it.action == *a)
+                {
+                    if !seen[i] {
+                        seen[i] = true;
+                        out.push((i, item));
+                    }
+                }
+            }
+            for (i, item) in self.all.iter().enumerate() {
+                if !seen[i] {
+                    out.push((i, item));
+                }
+            }
+            return out;
         }
         let mut scored: Vec<(i64, usize, &PaletteItem)> = self
             .all
