@@ -111,8 +111,7 @@ impl LinkDetector {
         // Parens are allowed in the body (e.g. Wikipedia `/wiki/Foo_(bar)`); an
         // unbalanced trailing `)` is trimmed in code below.
         let url_regex =
-            Regex::new(r"(?:https?|ftp)://[^\s<>\[\]{}|\\^`]*[^\s<>\[\]{}|\\^`.,;:!?\-]")
-                .unwrap();
+            Regex::new(r"(?:https?|ftp)://[^\s<>\[\]{}|\\^`]*[^\s<>\[\]{}|\\^`.,;:!?\-]").unwrap();
 
         // IP 地址正则：x.x.x.x 格式
         let ip_regex = Regex::new(
@@ -148,9 +147,7 @@ impl LinkDetector {
                 // Drop trailing unbalanced `)` so a URL inside parentheses like
                 // `(https://example.com)` doesn't swallow the closing paren,
                 // while a balanced `/wiki/Foo_(bar)` is kept intact.
-                while url.ends_with(')')
-                    && url.matches(')').count() > url.matches('(').count()
-                {
+                while url.ends_with(')') && url.matches(')').count() > url.matches('(').count() {
                     url = &url[..url.len() - 1];
                 }
                 let col_start = Self::byte_offset_to_char_offset(line, mat.start());
@@ -196,7 +193,8 @@ impl LinkDetector {
                 let lead_ws = raw.len() - raw.trim_start().len();
                 let start_byte = mat.start() + lead_ws;
                 let col_start = Self::byte_offset_to_char_offset(line, start_byte);
-                let col_end = Self::byte_offset_to_char_offset(line, start_byte + matched_text.len());
+                let col_end =
+                    Self::byte_offset_to_char_offset(line, start_byte + matched_text.len());
 
                 // 避免与 URL 重复
                 if !links

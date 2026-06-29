@@ -142,15 +142,15 @@ impl std::str::FromStr for Command {
 
 /// 快捷键修饰符
 #[allow(dead_code)]
-#[derive(Clone, Debug, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(
+    Clone, Debug, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
+)]
 pub struct Modifiers {
     pub ctrl: bool,
     pub shift: bool,
     pub alt: bool,
     pub super_key: bool,
 }
-
 
 impl Modifiers {
     pub fn is_none(&self) -> bool {
@@ -351,15 +351,18 @@ impl KeyBindings {
             .insert("ctrl+shift+v".to_string(), "edit:paste".to_string());
 
         // 分屏操作
-        bindings
-            .bindings
-            .insert("ctrl+shift+d".to_string(), "terminal:split_vertical".to_string());
-        bindings
-            .bindings
-            .insert("ctrl+shift+e".to_string(), "terminal:split_horizontal".to_string());
-        bindings
-            .bindings
-            .insert("ctrl+shift+w".to_string(), "terminal:close_pane".to_string());
+        bindings.bindings.insert(
+            "ctrl+shift+d".to_string(),
+            "terminal:split_vertical".to_string(),
+        );
+        bindings.bindings.insert(
+            "ctrl+shift+e".to_string(),
+            "terminal:split_horizontal".to_string(),
+        );
+        bindings.bindings.insert(
+            "ctrl+shift+w".to_string(),
+            "terminal:close_pane".to_string(),
+        );
         bindings
             .bindings
             .insert("ctrl+shift+j".to_string(), "pane:focus_next".to_string());

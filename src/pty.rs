@@ -44,7 +44,10 @@ mod unix_pty {
             if is_executable(Path::new(path)) {
                 return path.to_string();
             }
-            eprintln!("[PTY] Configured shell '{}' is not executable, falling back", path);
+            eprintln!(
+                "[PTY] Configured shell '{}' is not executable, falling back",
+                path
+            );
         }
 
         // Priority 2: rsh (preferred shell with advanced features)
@@ -209,7 +212,8 @@ mod unix_pty {
                         CString::new(format!("TERM_PROGRAM_VERSION={}", TERM_PROGRAM_VERSION))
                             .unwrap(),
                     );
-                    env_cstrings.push(CString::new(format!("VTE_VERSION={}", VTE_VERSION)).unwrap());
+                    env_cstrings
+                        .push(CString::new(format!("VTE_VERSION={}", VTE_VERSION)).unwrap());
                     // LESS=FR (not the default FRX, whose -X disables the alternate
                     // screen and leaks pager output into scrollback). Only set when
                     // the user hasn't configured LESS themselves.
@@ -353,8 +357,16 @@ mod unix_pty {
             timeout_ms: i32,
         ) -> Result<ReaderPoll> {
             let mut fds = [
-                libc::pollfd { fd, events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: shutdown_fd, events: libc::POLLIN, revents: 0 },
+                libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: shutdown_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
             ];
             // SAFETY: fds is a valid 2-element array on the stack.
             let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
@@ -368,7 +380,8 @@ mod unix_pty {
                 return Ok(ReaderPoll::Timeout);
             }
             // Shutdown signaled (write end closed -> POLLHUP, or any activity).
-            if fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            if fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+            {
                 return Ok(ReaderPoll::Shutdown);
             }
             // PTY fd closed out from under us -> treat as a clean shutdown.

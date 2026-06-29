@@ -105,7 +105,8 @@ impl KittyGraphicsState {
 
     fn enforce_image_limits(&mut self) {
         while self.images.len() > MAX_KITTY_IMAGES
-            || self.total_image_memory > MAX_KITTY_CACHE_MB * 1024 * 1024 {
+            || self.total_image_memory > MAX_KITTY_CACHE_MB * 1024 * 1024
+        {
             if let Some(oldest_id) = self.access_order.pop_front() {
                 if let Some(img) = self.images.remove(&oldest_id) {
                     self.total_image_memory -= img.data.len() as u64;
@@ -247,8 +248,9 @@ impl KittyGraphicsState {
             // memory and its stale access-order entry so the counter doesn't
             // drift (and later underflow in enforce_image_limits).
             if let Some(old) = self.images.get(&image_id) {
-                self.total_image_memory =
-                    self.total_image_memory.saturating_sub(old.data.len() as u64);
+                self.total_image_memory = self
+                    .total_image_memory
+                    .saturating_sub(old.data.len() as u64);
                 self.access_order.retain(|&id| id != image_id);
             }
             self.total_image_memory += data_size;

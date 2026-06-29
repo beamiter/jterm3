@@ -141,14 +141,14 @@ impl TerminalGrid {
             .collect()
     }
 
-
     /// 在行内指定列插入一个cell，右侧cell右移，末尾cell被丢弃
     pub fn insert_cell_in_row(&mut self, row: usize, col: usize, cell: TerminalCell) {
         if row >= self.rows || col >= self.cols {
             return;
         }
         let start = row * self.cols;
-        self.cells.copy_within(start + col..start + self.cols - 1, start + col + 1);
+        self.cells
+            .copy_within(start + col..start + self.cols - 1, start + col + 1);
         self.cells[start + col] = cell;
     }
 
@@ -158,7 +158,8 @@ impl TerminalGrid {
             return;
         }
         let start = row * self.cols;
-        self.cells.copy_within(start + col + 1..start + self.cols, start + col);
+        self.cells
+            .copy_within(start + col + 1..start + self.cols, start + col);
         // Fill last cell with default
         self.cells[start + self.cols - 1] = TerminalCell::default();
     }
@@ -263,29 +264,26 @@ pub enum Color {
     Default,
 }
 
-#[derive(Clone, Debug)]
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub enum CursorShape {
     #[default]
-    Block,     // 0 or 1 - block cursor (default)
+    Block, // 0 or 1 - block cursor (default)
     Underline, // 2 - underline cursor
     Beam,      // 3 - beam/vertical line cursor
 }
 
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum UnderlineStyle {
     #[default]
     None,
     Single,
     Double,
     #[allow(dead_code)]
-    Curly,   // SGR 4:3
+    Curly, // SGR 4:3
     #[allow(dead_code)]
-    Dotted,  // SGR 4:4
+    Dotted, // SGR 4:4
     #[allow(dead_code)]
-    Dashed,  // SGR 4:5
+    Dashed, // SGR 4:5
 }
 
 /// Packed style flags in a u16 bitfield (includes wide character bits).
@@ -330,12 +328,18 @@ const WIDE_CONT_BIT: u16 = 1 << 10;
 
 impl StyleFlags {
     #[inline(always)]
-    pub fn new() -> Self { Self(0) }
+    pub fn new() -> Self {
+        Self(0)
+    }
 
     #[inline(always)]
-    pub fn bold(&self) -> bool { self.0 & BOLD_BIT != 0 }
+    pub fn bold(&self) -> bool {
+        self.0 & BOLD_BIT != 0
+    }
     #[inline(always)]
-    pub fn italic(&self) -> bool { self.0 & ITALIC_BIT != 0 }
+    pub fn italic(&self) -> bool {
+        self.0 & ITALIC_BIT != 0
+    }
     #[inline(always)]
     pub fn underline(&self) -> UnderlineStyle {
         match (self.0 & UNDERLINE_MASK) >> UNDERLINE_SHIFT {
@@ -348,41 +352,103 @@ impl StyleFlags {
         }
     }
     #[inline(always)]
-    pub fn inverse(&self) -> bool { self.0 & INVERSE_BIT != 0 }
+    pub fn inverse(&self) -> bool {
+        self.0 & INVERSE_BIT != 0
+    }
     #[inline(always)]
-    pub fn dim(&self) -> bool { self.0 & DIM_BIT != 0 }
+    pub fn dim(&self) -> bool {
+        self.0 & DIM_BIT != 0
+    }
     #[inline(always)]
-    pub fn blink(&self) -> bool { self.0 & BLINK_BIT != 0 }
+    pub fn blink(&self) -> bool {
+        self.0 & BLINK_BIT != 0
+    }
     #[inline(always)]
-    pub fn strikethrough(&self) -> bool { self.0 & STRIKETHROUGH_BIT != 0 }
+    pub fn strikethrough(&self) -> bool {
+        self.0 & STRIKETHROUGH_BIT != 0
+    }
     #[inline(always)]
-    pub fn wide(&self) -> bool { self.0 & WIDE_BIT != 0 }
+    pub fn wide(&self) -> bool {
+        self.0 & WIDE_BIT != 0
+    }
     #[inline(always)]
-    pub fn wide_continuation(&self) -> bool { self.0 & WIDE_CONT_BIT != 0 }
+    pub fn wide_continuation(&self) -> bool {
+        self.0 & WIDE_CONT_BIT != 0
+    }
 
     #[inline(always)]
-    pub fn set_bold(&mut self, v: bool) { if v { self.0 |= BOLD_BIT; } else { self.0 &= !BOLD_BIT; } }
+    pub fn set_bold(&mut self, v: bool) {
+        if v {
+            self.0 |= BOLD_BIT;
+        } else {
+            self.0 &= !BOLD_BIT;
+        }
+    }
     #[inline(always)]
-    pub fn set_italic(&mut self, v: bool) { if v { self.0 |= ITALIC_BIT; } else { self.0 &= !ITALIC_BIT; } }
+    pub fn set_italic(&mut self, v: bool) {
+        if v {
+            self.0 |= ITALIC_BIT;
+        } else {
+            self.0 &= !ITALIC_BIT;
+        }
+    }
     #[inline(always)]
     pub fn set_underline(&mut self, v: UnderlineStyle) {
         self.0 = (self.0 & !UNDERLINE_MASK) | ((v as u16) << UNDERLINE_SHIFT);
     }
     #[inline(always)]
-    pub fn set_inverse(&mut self, v: bool) { if v { self.0 |= INVERSE_BIT; } else { self.0 &= !INVERSE_BIT; } }
+    pub fn set_inverse(&mut self, v: bool) {
+        if v {
+            self.0 |= INVERSE_BIT;
+        } else {
+            self.0 &= !INVERSE_BIT;
+        }
+    }
     #[inline(always)]
-    pub fn set_dim(&mut self, v: bool) { if v { self.0 |= DIM_BIT; } else { self.0 &= !DIM_BIT; } }
+    pub fn set_dim(&mut self, v: bool) {
+        if v {
+            self.0 |= DIM_BIT;
+        } else {
+            self.0 &= !DIM_BIT;
+        }
+    }
     #[inline(always)]
-    pub fn set_blink(&mut self, v: bool) { if v { self.0 |= BLINK_BIT; } else { self.0 &= !BLINK_BIT; } }
+    pub fn set_blink(&mut self, v: bool) {
+        if v {
+            self.0 |= BLINK_BIT;
+        } else {
+            self.0 &= !BLINK_BIT;
+        }
+    }
     #[inline(always)]
-    pub fn set_strikethrough(&mut self, v: bool) { if v { self.0 |= STRIKETHROUGH_BIT; } else { self.0 &= !STRIKETHROUGH_BIT; } }
+    pub fn set_strikethrough(&mut self, v: bool) {
+        if v {
+            self.0 |= STRIKETHROUGH_BIT;
+        } else {
+            self.0 &= !STRIKETHROUGH_BIT;
+        }
+    }
     #[inline(always)]
-    pub fn set_wide(&mut self, v: bool) { if v { self.0 |= WIDE_BIT; } else { self.0 &= !WIDE_BIT; } }
+    pub fn set_wide(&mut self, v: bool) {
+        if v {
+            self.0 |= WIDE_BIT;
+        } else {
+            self.0 &= !WIDE_BIT;
+        }
+    }
     #[inline(always)]
-    pub fn set_wide_continuation(&mut self, v: bool) { if v { self.0 |= WIDE_CONT_BIT; } else { self.0 &= !WIDE_CONT_BIT; } }
+    pub fn set_wide_continuation(&mut self, v: bool) {
+        if v {
+            self.0 |= WIDE_CONT_BIT;
+        } else {
+            self.0 &= !WIDE_CONT_BIT;
+        }
+    }
 
     #[inline(always)]
-    pub fn is_default_style(&self) -> bool { self.0 & 0x1FF == 0 }
+    pub fn is_default_style(&self) -> bool {
+        self.0 & 0x1FF == 0
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -401,18 +467,27 @@ enum CompressedLineData {
 impl ScrollbackLine {
     pub fn compress(cells: &[TerminalCell], is_wrapped: bool) -> Self {
         let cols = cells.len() as u16;
-        let trailing_blanks = cells.iter().rev()
-            .take_while(|c| c.character == ' ' && c.foreground == Color::Default
-                && c.background == Color::Default && c.flags.is_default_style()
-                && !c.flags.wide() && !c.flags.wide_continuation())
+        let trailing_blanks = cells
+            .iter()
+            .rev()
+            .take_while(|c| {
+                c.character == ' '
+                    && c.foreground == Color::Default
+                    && c.background == Color::Default
+                    && c.flags.is_default_style()
+                    && !c.flags.wide()
+                    && !c.flags.wide_continuation()
+            })
             .count();
 
         let active_len = cells.len() - trailing_blanks;
-        let all_default_attrs = cells[..active_len].iter().all(|c|
-            c.foreground == Color::Default && c.background == Color::Default
-            && c.flags.is_default_style()
-            && !c.flags.wide() && !c.flags.wide_continuation()
-        );
+        let all_default_attrs = cells[..active_len].iter().all(|c| {
+            c.foreground == Color::Default
+                && c.background == Color::Default
+                && c.flags.is_default_style()
+                && !c.flags.wide()
+                && !c.flags.wide_continuation()
+        });
 
         if all_default_attrs {
             let text: String = cells[..active_len].iter().map(|c| c.character).collect();
@@ -434,15 +509,17 @@ impl ScrollbackLine {
     pub fn decompress(&self) -> Vec<TerminalCell> {
         match &self.data {
             CompressedLineData::Plain(text, trailing) => {
-                let mut cells: Vec<TerminalCell> = text.chars()
-                    .map(|ch| TerminalCell { character: ch, ..Default::default() })
+                let mut cells: Vec<TerminalCell> = text
+                    .chars()
+                    .map(|ch| TerminalCell {
+                        character: ch,
+                        ..Default::default()
+                    })
                     .collect();
                 cells.resize(cells.len() + *trailing as usize, TerminalCell::default());
                 cells
             }
-            CompressedLineData::Encoded(data) => {
-                Self::decode_cells(data, self.cols as usize)
-            }
+            CompressedLineData::Encoded(data) => Self::decode_cells(data, self.cols as usize),
         }
     }
 
@@ -470,13 +547,23 @@ impl ScrollbackLine {
             Color::BrightMagenta => buf.push(14),
             Color::BrightCyan => buf.push(15),
             Color::BrightWhite => buf.push(16),
-            Color::Indexed(i) => { buf.push(17); buf.push(*i); }
-            Color::Rgb(r, g, b) => { buf.push(18); buf.push(*r); buf.push(*g); buf.push(*b); }
+            Color::Indexed(i) => {
+                buf.push(17);
+                buf.push(*i);
+            }
+            Color::Rgb(r, g, b) => {
+                buf.push(18);
+                buf.push(*r);
+                buf.push(*g);
+                buf.push(*b);
+            }
         }
     }
 
     fn decode_color(data: &[u8], pos: &mut usize) -> Color {
-        if *pos >= data.len() { return Color::Default; }
+        if *pos >= data.len() {
+            return Color::Default;
+        }
         let tag = data[*pos];
         *pos += 1;
         match tag {
@@ -515,8 +602,12 @@ impl ScrollbackLine {
 
     fn encode_flags(flags: &StyleFlags) -> u8 {
         let mut f = 0u8;
-        if flags.bold() { f |= 1; }
-        if flags.italic() { f |= 2; }
+        if flags.bold() {
+            f |= 1;
+        }
+        if flags.italic() {
+            f |= 2;
+        }
         match flags.underline() {
             UnderlineStyle::None => {}
             UnderlineStyle::Single => f |= 4,
@@ -525,9 +616,15 @@ impl ScrollbackLine {
             UnderlineStyle::Dotted => f |= 16,
             UnderlineStyle::Dashed => f |= 20,
         }
-        if flags.inverse() { f |= 32; }
-        if flags.dim() { f |= 64; }
-        if flags.strikethrough() { f |= 128; }
+        if flags.inverse() {
+            f |= 32;
+        }
+        if flags.dim() {
+            f |= 64;
+        }
+        if flags.strikethrough() {
+            f |= 128;
+        }
         f
     }
 
@@ -563,8 +660,10 @@ impl ScrollbackLine {
             let mut run = 1u8;
             while (run as u16) < 255 && (i + run as usize) < cells.len() {
                 let next = &cells[i + run as usize];
-                if next.character == cell.character && next.foreground == cell.foreground
-                    && next.background == cell.background && next.flags == cell.flags
+                if next.character == cell.character
+                    && next.foreground == cell.foreground
+                    && next.background == cell.background
+                    && next.flags == cell.flags
                 {
                     run += 1;
                 } else {
@@ -579,7 +678,8 @@ impl ScrollbackLine {
             Self::encode_color(&cell.background, &mut buf);
             let f = Self::encode_flags(&cell.flags);
             buf.push(f);
-            let wide_bits = if cell.flags.wide() { 1u8 } else { 0 } | if cell.flags.wide_continuation() { 2 } else { 0 };
+            let wide_bits = if cell.flags.wide() { 1u8 } else { 0 }
+                | if cell.flags.wide_continuation() { 2 } else { 0 };
             buf.push(wide_bits);
             buf.push(run);
 
@@ -594,7 +694,9 @@ impl ScrollbackLine {
         while pos < data.len() {
             let ch_len = data[pos] as usize;
             pos += 1;
-            if pos + ch_len > data.len() { break; }
+            if pos + ch_len > data.len() {
+                break;
+            }
             let ch = std::str::from_utf8(&data[pos..pos + ch_len])
                 .ok()
                 .and_then(|s| s.chars().next())
@@ -699,7 +801,6 @@ impl DirtyRegion {
     pub fn clear(&mut self) {
         self.rows.clear();
     }
-
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -940,7 +1041,9 @@ impl TerminalState {
         for &byte in param_bytes {
             match byte {
                 b'0'..=b'9' => {
-                    current = current.saturating_mul(10).saturating_add((byte - b'0') as u16);
+                    current = current
+                        .saturating_mul(10)
+                        .saturating_add((byte - b'0') as u16);
                     has_digits = true;
                 }
                 b';' | b':' => {
@@ -972,7 +1075,9 @@ impl TerminalState {
         for &byte in param_bytes {
             match byte {
                 b'0'..=b'9' => {
-                    current = current.saturating_mul(10).saturating_add((byte - b'0') as u16);
+                    current = current
+                        .saturating_mul(10)
+                        .saturating_add((byte - b'0') as u16);
                 }
                 b':' => {
                     group.push(current);
@@ -1054,7 +1159,7 @@ impl TerminalState {
             grid_version: 1,
             // IMPORTANT: row_versions must match grid.rows(), not the parameter 'rows'
             // This ensures dirty tracking works correctly even with scrollback
-            row_versions: vec![1; rows],  // Use 'rows' here since grid.rows() == rows at init
+            row_versions: vec![1; rows], // Use 'rows' here since grid.rows() == rows at init
             visible_cells_cache: None,
             current_hyperlink: None,
             osc8_hyperlinks: Vec::new(),
@@ -1158,7 +1263,8 @@ impl TerminalState {
             }
             'C' => {
                 // Command executed (output begins)
-                if let ZoneState::CommandStarted(prompt_start, cmd_start) = self.current_zone_state {
+                if let ZoneState::CommandStarted(prompt_start, cmd_start) = self.current_zone_state
+                {
                     self.current_zone_state =
                         ZoneState::OutputStarted(prompt_start, cmd_start, absolute_row);
                 }
@@ -1420,8 +1526,7 @@ impl TerminalState {
         let row0 = row_1based.saturating_sub(1);
         let col0 = col_1based.saturating_sub(1);
         if self.modes.contains(&6) {
-            self.cursor_row =
-                (self.scroll_region_top + row0).min(self.scroll_region_bottom);
+            self.cursor_row = (self.scroll_region_top + row0).min(self.scroll_region_bottom);
         } else {
             self.cursor_row = row0.min(self.grid.rows().saturating_sub(1));
         }
@@ -1432,8 +1537,7 @@ impl TerminalState {
     fn set_cursor_row_abs(&mut self, row_1based: usize) {
         let row0 = row_1based.saturating_sub(1);
         if self.modes.contains(&6) {
-            self.cursor_row =
-                (self.scroll_region_top + row0).min(self.scroll_region_bottom);
+            self.cursor_row = (self.scroll_region_top + row0).min(self.scroll_region_bottom);
         } else {
             self.cursor_row = row0.min(self.grid.rows().saturating_sub(1));
         }
@@ -1471,13 +1575,16 @@ impl TerminalState {
             && self
                 .grid
                 .get(self.cursor_row, self.cursor_col)
-                .flags.wide_continuation()
+                .flags
+                .wide_continuation()
         {
             *self.grid.get_mut(self.cursor_row, self.cursor_col - 1) = blank_cell.clone();
         }
 
         // If current position has a wide character, clear its continuation cell
-        if self.grid.get(self.cursor_row, self.cursor_col).flags.wide() && self.cursor_col + 1 < cols {
+        if self.grid.get(self.cursor_row, self.cursor_col).flags.wide()
+            && self.cursor_col + 1 < cols
+        {
             *self.grid.get_mut(self.cursor_row, self.cursor_col + 1) = blank_cell.clone();
         }
 
@@ -1623,7 +1730,10 @@ impl TerminalState {
         // Compress the removed line directly from the grid slice before mutating,
         // avoiding a per-line Vec allocation from get_row.
         let scrollback_line = if is_full_screen_region && !self.use_alt_buffer {
-            Some(ScrollbackLine::compress(&self.grid[top], self.grid.row_wrapped[top]))
+            Some(ScrollbackLine::compress(
+                &self.grid[top],
+                self.grid.row_wrapped[top],
+            ))
         } else {
             None
         };
@@ -1876,7 +1986,8 @@ impl TerminalState {
                     let esc_start = i;
 
                     if i + 1 >= data_slice.len() {
-                        self.pending_escape.extend_from_slice(&data_slice[esc_start..]);
+                        self.pending_escape
+                            .extend_from_slice(&data_slice[esc_start..]);
                         break;
                     }
 
@@ -1949,11 +2060,16 @@ impl TerminalState {
                             }
 
                             if !terminated {
-                                self.pending_escape.extend_from_slice(&data_slice[esc_start..]);
+                                self.pending_escape
+                                    .extend_from_slice(&data_slice[esc_start..]);
                                 break;
                             }
 
-                            let payload_end = if data_slice[i - 1] == 0x07 { i - 1 } else { i - 2 };
+                            let payload_end = if data_slice[i - 1] == 0x07 {
+                                i - 1
+                            } else {
+                                i - 2
+                            };
                             if payload_end >= payload_start {
                                 if let Ok(payload) =
                                     std::str::from_utf8(&data_slice[payload_start..payload_end])
@@ -1977,13 +2093,17 @@ impl TerminalState {
                                                         .split(':')
                                                         .find_map(|p| p.strip_prefix("id="))
                                                         .map(|s| s.to_string());
-                                                    self.current_hyperlink = Some((uri.to_string(), id));
+                                                    self.current_hyperlink =
+                                                        Some((uri.to_string(), id));
                                                 }
                                             } else if value.is_empty() {
                                                 // OSC 8 ; ; (close hyperlink)
                                                 self.current_hyperlink = None;
                                             }
-                                        } else if command == "10" || command == "11" || command == "12" {
+                                        } else if command == "10"
+                                            || command == "11"
+                                            || command == "12"
+                                        {
                                             self.handle_osc_color(command, value);
                                         } else if command == "9" {
                                             // Desktop notification (iTerm2/ConEmu)
@@ -1996,8 +2116,18 @@ impl TerminalState {
                                             // rxvt notification: 777;notify;title;body
                                             let parts: Vec<&str> = value.splitn(3, ';').collect();
                                             if parts.len() >= 2 && parts[0] == "notify" {
-                                                let title = parts.get(1).unwrap_or(&"").chars().take(256).collect();
-                                                let body = parts.get(2).unwrap_or(&"").chars().take(256).collect();
+                                                let title = parts
+                                                    .get(1)
+                                                    .unwrap_or(&"")
+                                                    .chars()
+                                                    .take(256)
+                                                    .collect();
+                                                let body = parts
+                                                    .get(2)
+                                                    .unwrap_or(&"")
+                                                    .chars()
+                                                    .take(256)
+                                                    .collect();
                                                 if self.pending_notifications.len() < 8 {
                                                     self.pending_notifications.push((title, body));
                                                 }
@@ -2027,7 +2157,10 @@ impl TerminalState {
                             let mut terminated = false;
                             let dcs_start = i;
                             while i < data_slice.len() {
-                                if i + 1 < data_slice.len() && data_slice[i] == 0x1b && data_slice[i + 1] == 0x5c {
+                                if i + 1 < data_slice.len()
+                                    && data_slice[i] == 0x1b
+                                    && data_slice[i + 1] == 0x5c
+                                {
                                     // Extract DCS payload
                                     let payload = &data_slice[dcs_start..i];
 
@@ -2058,7 +2191,8 @@ impl TerminalState {
                             }
 
                             if !terminated {
-                                self.pending_escape.extend_from_slice(&data_slice[esc_start..]);
+                                self.pending_escape
+                                    .extend_from_slice(&data_slice[esc_start..]);
                                 break;
                             }
                         }
@@ -2079,7 +2213,8 @@ impl TerminalState {
                         }
                         b'(' | b')' => {
                             if i + 2 >= data_slice.len() {
-                                self.pending_escape.extend_from_slice(&data_slice[esc_start..]);
+                                self.pending_escape
+                                    .extend_from_slice(&data_slice[esc_start..]);
                                 break;
                             }
 
@@ -2167,7 +2302,8 @@ impl TerminalState {
                             }
 
                             let Some(final_byte) = final_byte else {
-                                self.pending_escape.extend_from_slice(&data_slice[esc_start..]);
+                                self.pending_escape
+                                    .extend_from_slice(&data_slice[esc_start..]);
                                 break;
                             };
 
@@ -2269,7 +2405,12 @@ impl TerminalState {
                         && (data_slice[i + 2] & 0xC0) == 0x80
                         && (data_slice[i + 3] & 0xC0) == 0x80
                     {
-                        let buf = [byte, data_slice[i + 1], data_slice[i + 2], data_slice[i + 3]];
+                        let buf = [
+                            byte,
+                            data_slice[i + 1],
+                            data_slice[i + 2],
+                            data_slice[i + 3],
+                        ];
                         if let Ok(s) = std::str::from_utf8(&buf[..4]) {
                             if let Some(ch) = s.chars().next() {
                                 self.put_char(ch);
@@ -2547,7 +2688,8 @@ impl TerminalState {
                         let dst = self.cursor_row * cols;
                         self.grid.cells.copy_within(src_start..src_end, dst);
                         let blank_start = self.scroll_region_bottom * cols;
-                        self.grid.cells[blank_start..blank_start + cols].fill(TerminalCell::default());
+                        self.grid.cells[blank_start..blank_start + cols]
+                            .fill(TerminalCell::default());
                     }
                 }
                 self.mark_rows_dirty(self.cursor_row, self.scroll_region_bottom);
@@ -2683,13 +2825,15 @@ impl TerminalState {
                 if intermediates == [b'!'] && private_prefix.is_none() {
                     // DECSTR (CSI ! p) - soft terminal reset.
                     self.soft_reset();
-                } else if private_prefix == Some(b'?') && intermediates == [b'$']
-                    && params.first().copied() == Some(5522) {
-                        let state = if self.modes.contains(&5522) { 1 } else { 2 };
-                        let response = format!("\x1b[?5522;{}$y", state);
-                        crate::debug_log!("[OSC5522] DECRQM query -> {}", response);
-                        self.output_buffer.extend_from_slice(response.as_bytes());
-                    }
+                } else if private_prefix == Some(b'?')
+                    && intermediates == [b'$']
+                    && params.first().copied() == Some(5522)
+                {
+                    let state = if self.modes.contains(&5522) { 1 } else { 2 };
+                    let response = format!("\x1b[?5522;{}$y", state);
+                    crate::debug_log!("[OSC5522] DECRQM query -> {}", response);
+                    self.output_buffer.extend_from_slice(response.as_bytes());
+                }
             }
             'h' => {
                 // Set mode: DECSET (CSI ? Pn h) vs ANSI SM (CSI Pn h). The two
@@ -2782,11 +2926,13 @@ impl TerminalState {
                 self.mark_row_dirty(self.cursor_row);
             }
             'q' => {
-                if private_prefix == Some(b'>') && intermediates.is_empty()
-                    && params.first().copied().unwrap_or(0) == 0 {
-                        crate::debug_log!("[XTVERSION] report terminal version request");
-                        self.output_buffer.extend_from_slice(XTERM_VERSION_RESPONSE);
-                    }
+                if private_prefix == Some(b'>')
+                    && intermediates.is_empty()
+                    && params.first().copied().unwrap_or(0) == 0
+                {
+                    crate::debug_log!("[XTVERSION] report terminal version request");
+                    self.output_buffer.extend_from_slice(XTERM_VERSION_RESPONSE);
+                }
 
                 // DECSCUSR - Set cursor style
                 if private_prefix.is_none() && intermediates == [b' '] {
@@ -3350,7 +3496,8 @@ impl TerminalState {
     }
 
     pub fn get_mouse_release_report(&self, button: u8, col: usize, row: usize) -> Option<String> {
-        if !self.modes.contains(&1000) && !self.modes.contains(&1002) && !self.modes.contains(&1003) {
+        if !self.modes.contains(&1000) && !self.modes.contains(&1002) && !self.modes.contains(&1003)
+        {
             return None;
         }
 
@@ -3514,8 +3661,11 @@ impl TerminalState {
                     }
                 }
                 let arc = recycled.unwrap();
-                self.visible_cells_cache =
-                    Some((self.grid_version, self.scroll_offset, std::sync::Arc::clone(&arc)));
+                self.visible_cells_cache = Some((
+                    self.grid_version,
+                    self.scroll_offset,
+                    std::sync::Arc::clone(&arc),
+                ));
                 return arc;
             }
         }
@@ -3527,12 +3677,16 @@ impl TerminalState {
             // Slow path: reflow scrollback
             let blank_cell = self.create_blank_cell();
 
-            let mut start_idx = self.scrollback.len().saturating_sub(self.scroll_offset + rows);
+            let mut start_idx = self
+                .scrollback
+                .len()
+                .saturating_sub(self.scroll_offset + rows);
             while start_idx > 0 && self.scrollback[start_idx - 1].is_wrapped {
                 start_idx -= 1;
             }
             let end_idx = self.scrollback.len();
-            let to_reflow: Vec<ScrollbackLine> = self.scrollback
+            let to_reflow: Vec<ScrollbackLine> = self
+                .scrollback
                 .iter()
                 .skip(start_idx)
                 .take(end_idx - start_idx)
@@ -3542,7 +3696,10 @@ impl TerminalState {
             let reflowed = Self::reflow_lines(&to_reflow, cols, &blank_cell);
             let skip = reflowed.len().saturating_sub(self.scroll_offset + rows);
             let visible_start = skip + (reflowed.len() - skip).saturating_sub(self.scroll_offset);
-            let mut result: Vec<Vec<TerminalCell>> = reflowed[visible_start..].iter().map(|l| l.decompress()).collect();
+            let mut result: Vec<Vec<TerminalCell>> = reflowed[visible_start..]
+                .iter()
+                .map(|l| l.decompress())
+                .collect();
 
             if result.len() > rows {
                 result.truncate(rows);
@@ -3571,7 +3728,11 @@ impl TerminalState {
             }
             None => std::sync::Arc::new(cells),
         };
-        self.visible_cells_cache = Some((self.grid_version, self.scroll_offset, std::sync::Arc::clone(&arc)));
+        self.visible_cells_cache = Some((
+            self.grid_version,
+            self.scroll_offset,
+            std::sync::Arc::clone(&arc),
+        ));
         arc
     }
 
@@ -3605,7 +3766,11 @@ impl TerminalState {
 
     #[allow(dead_code)]
     pub fn select_text(&mut self, anchor: (usize, usize), active: (usize, usize)) {
-        self.selection = Some(Selection { anchor, active, mode: SelectionMode::Normal });
+        self.selection = Some(Selection {
+            anchor,
+            active,
+            mode: SelectionMode::Normal,
+        });
     }
 
     /// Start a new selection at a viewport-relative position.
@@ -3911,13 +4076,22 @@ impl TerminalState {
 
     fn strip_trailing_blanks(cells: &[TerminalCell]) -> &[TerminalCell] {
         let mut end = cells.len();
-        while end > 0 && cells[end - 1].character == ' ' && cells[end - 1].background == Color::Default && !cells[end - 1].flags.wide() && !cells[end - 1].flags.wide_continuation() {
+        while end > 0
+            && cells[end - 1].character == ' '
+            && cells[end - 1].background == Color::Default
+            && !cells[end - 1].flags.wide()
+            && !cells[end - 1].flags.wide_continuation()
+        {
             end -= 1;
         }
         &cells[..end]
     }
 
-    fn reflow_lines(lines: &[ScrollbackLine], new_cols: usize, blank_cell: &TerminalCell) -> Vec<ScrollbackLine> {
+    fn reflow_lines(
+        lines: &[ScrollbackLine],
+        new_cols: usize,
+        blank_cell: &TerminalCell,
+    ) -> Vec<ScrollbackLine> {
         let mut result = Vec::new();
         let len = lines.len();
         let mut i = 0;
@@ -3936,7 +4110,10 @@ impl TerminalState {
             i += 1;
 
             if logical_line.is_empty() {
-                result.push(ScrollbackLine::compress(&vec![blank_cell.clone(); new_cols], false));
+                result.push(ScrollbackLine::compress(
+                    &vec![blank_cell.clone(); new_cols],
+                    false,
+                ));
                 continue;
             }
 
@@ -3982,8 +4159,7 @@ impl TerminalState {
             if top_remove > 0 {
                 let cols_now = self.grid.row_len();
                 for r in 0..top_remove {
-                    let line =
-                        ScrollbackLine::compress(&self.grid[r], self.grid.row_wrapped[r]);
+                    let line = ScrollbackLine::compress(&self.grid[r], self.grid.row_wrapped[r]);
                     self.push_scrollback_compressed(line);
                 }
                 let src_start = top_remove * cols_now;
@@ -4464,7 +4640,10 @@ mod tests {
         terminal.process_input(b"\x1b[?1049h");
 
         assert!(terminal.is_alt_buffer_active());
-        assert!(terminal.selection.is_none(), "selection must clear on alt switch");
+        assert!(
+            terminal.selection.is_none(),
+            "selection must clear on alt switch"
+        );
         assert_eq!(terminal.scroll_region_top, 0);
         assert_eq!(terminal.scroll_region_bottom, 3);
 
@@ -4475,7 +4654,10 @@ mod tests {
         terminal.process_input(b"\x1b[?1049l");
 
         assert!(!terminal.is_alt_buffer_active());
-        assert!(terminal.selection.is_none(), "selection must clear on alt restore");
+        assert!(
+            terminal.selection.is_none(),
+            "selection must clear on alt restore"
+        );
         assert_eq!(terminal.scroll_region_top, 0);
         assert_eq!(terminal.scroll_region_bottom, 3);
     }

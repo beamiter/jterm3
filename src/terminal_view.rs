@@ -5,11 +5,11 @@ use crate::theme::Theme;
 
 use std::time::Instant;
 
+use iced::advanced::input_method::{self, InputMethod};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer::{self, Quad};
 use iced::advanced::text::{self, Text};
 use iced::advanced::widget::{tree, Tree, Widget};
-use iced::advanced::input_method::{self, InputMethod};
 use iced::advanced::{Clipboard, Shell};
 use iced::mouse;
 use iced::{
@@ -308,7 +308,12 @@ impl<'a, Message> TermWidget<'a, Message> {
         let rel_x = (pos.x - bounds.x - pad).max(0.0);
         let rel_y = (pos.y - bounds.y - pad).max(0.0);
         let max_row = self.grid.len().saturating_sub(1);
-        let max_col = self.grid.first().map(|r| r.len()).unwrap_or(1).saturating_sub(1);
+        let max_col = self
+            .grid
+            .first()
+            .map(|r| r.len())
+            .unwrap_or(1)
+            .saturating_sub(1);
         let col = ((rel_x / cw) as usize).min(max_col);
         let row = ((rel_y / ch) as usize).min(max_row);
         (col, row)
@@ -378,13 +383,14 @@ where
                     ),
                     Size::new(self.metrics.cell_w, self.metrics.cell_h),
                 );
-                let preedit = self.preedit.as_ref().map(|(content, selection)| {
-                    input_method::Preedit {
-                        content: content.as_str(),
-                        selection: selection.clone(),
-                        text_size: Some(Pixels(self.metrics.font_size)),
-                    }
-                });
+                let preedit =
+                    self.preedit
+                        .as_ref()
+                        .map(|(content, selection)| input_method::Preedit {
+                            content: content.as_str(),
+                            selection: selection.clone(),
+                            text_size: Some(Pixels(self.metrics.font_size)),
+                        });
                 shell.request_input_method(&InputMethod::Enabled {
                     cursor: cursor_rect,
                     purpose: input_method::Purpose::Terminal,
@@ -724,7 +730,11 @@ where
                 if selected {
                     fg = self.theme.selection_fg_color();
                 }
-                let glyph_font = if cell.flags.italic() { italic_font } else { font };
+                let glyph_font = if cell.flags.italic() {
+                    italic_font
+                } else {
+                    font
+                };
                 // Blink: during the off phase, blinking cells show no glyph.
                 let blink_hidden = cell.flags.blink() && !self.blink_on;
 
@@ -921,16 +931,11 @@ where
         }
 
         // Scrollbar (only when scrollback exists).
-        if let Some((track_top, track_h, sb_x, thumb_y, thumb_h)) = self.scrollbar_geometry(bounds) {
+        if let Some((track_top, track_h, sb_x, thumb_y, thumb_h)) = self.scrollbar_geometry(bounds)
+        {
             let fg = self.theme.terminal_foreground();
-            let track = Color {
-                a: 0.10,
-                ..fg
-            };
-            let thumb = Color {
-                a: 0.45,
-                ..fg
-            };
+            let track = Color { a: 0.10, ..fg };
+            let thumb = Color { a: 0.45, ..fg };
             renderer.fill_quad(
                 solid_quad(Rectangle {
                     x: sb_x,

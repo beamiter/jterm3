@@ -2,15 +2,13 @@
 use serde::{Deserialize, Serialize};
 
 /// 高级搜索配置
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct SearchConfig {
     pub use_regex: bool,
     pub case_sensitive: bool,
     pub whole_word: bool,
     pub multi_line: bool,
 }
-
 
 /// 替换选项
 #[derive(Clone, Debug)]

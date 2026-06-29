@@ -159,11 +159,7 @@ impl PaletteState {
             let mut out: Vec<(usize, &PaletteItem)> = Vec::with_capacity(self.all.len());
             let mut seen = vec![false; self.all.len()];
             for a in &self.mru {
-                if let Some((i, item)) = self
-                    .all
-                    .iter()
-                    .enumerate()
-                    .find(|(_, it)| it.action == *a)
+                if let Some((i, item)) = self.all.iter().enumerate().find(|(_, it)| it.action == *a)
                 {
                     if !seen[i] {
                         seen[i] = true;

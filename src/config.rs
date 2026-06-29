@@ -35,7 +35,6 @@ pub enum FontBackendType {
     AbGlyph,
 }
 
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
@@ -45,7 +44,6 @@ pub enum AppRendererType {
     Wgpu,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
@@ -54,7 +52,6 @@ pub enum ScrollbarVisibility {
     #[default]
     Always,
 }
-
 
 /// Where the session tab strip is rendered.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -67,7 +64,6 @@ pub enum TabPosition {
     /// Vertical tab list docked in the left sidebar.
     Side,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {

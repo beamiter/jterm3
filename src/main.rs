@@ -299,10 +299,7 @@ impl Session {
         if !t.is_empty() {
             return t.to_string();
         }
-        let cwd_short = self
-            .cwd_cache
-            .as_deref()
-            .and_then(Self::cwd_basename);
+        let cwd_short = self.cwd_cache.as_deref().and_then(Self::cwd_basename);
         match (&self.fg_proc_cache, cwd_short) {
             (Some(p), Some(d)) => format!("{p} · {d}"),
             (Some(p), None) => p.clone(),
@@ -605,7 +602,8 @@ impl Jterm {
             self.rows = rows;
         }
         for sess in &mut self.sessions {
-            sess.terminal.set_max_scrollback(self.config.scrollback_lines);
+            sess.terminal
+                .set_max_scrollback(self.config.scrollback_lines);
             if resized {
                 sess.terminal.on_resize(cols, rows);
                 let _ = sess.pty.resize(cols, rows);
@@ -656,8 +654,8 @@ impl Jterm {
         is_first_instance: bool,
     ) -> (Vec<Session>, usize, usize) {
         let default = |id_start: usize| {
-            let s = Session::spawn(config, id_start, cols, rows, None)
-                .expect("failed to spawn PTY");
+            let s =
+                Session::spawn(config, id_start, cols, rows, None).expect("failed to spawn PTY");
             (vec![s], 0usize, id_start + 1)
         };
         if !config.restore_session || !is_first_instance {
@@ -673,9 +671,7 @@ impl Jterm {
         let mut sessions = Vec::new();
         let mut next_id = 0usize;
         for snap in &snapshot.sessions {
-            if let Some(sess) =
-                Session::spawn(config, next_id, cols, rows, snap.cwd.as_deref())
-            {
+            if let Some(sess) = Session::spawn(config, next_id, cols, rows, snap.cwd.as_deref()) {
                 sessions.push(sess);
                 next_id += 1;
             }
@@ -683,10 +679,7 @@ impl Jterm {
         if sessions.is_empty() {
             return default(0);
         }
-        let active = snapshot
-            .active_index
-            .unwrap_or(0)
-            .min(sessions.len() - 1);
+        let active = snapshot.active_index.unwrap_or(0).min(sessions.len() - 1);
         eprintln!(
             "[SessionPersistence] Restored {} session(s) from {}",
             sessions.len(),
@@ -725,9 +718,13 @@ impl Jterm {
 
     fn new_session(&mut self) {
         let cwd = self.sessions.get(self.active).and_then(|s| s.cwd());
-        if let Some(sess) =
-            Session::spawn(&self.config, self.next_id, self.cols, self.rows, cwd.as_deref())
-        {
+        if let Some(sess) = Session::spawn(
+            &self.config,
+            self.next_id,
+            self.cols,
+            self.rows,
+            cwd.as_deref(),
+        ) {
             self.next_id += 1;
             let insert = (self.active + 1).min(self.sessions.len());
             self.sessions.insert(insert, sess);
@@ -806,8 +803,7 @@ impl Jterm {
         self.toasts.push(Toast {
             text: text.into(),
             kind,
-            expires_at: std::time::Instant::now()
-                + std::time::Duration::from_millis(TOAST_TTL_MS),
+            expires_at: std::time::Instant::now() + std::time::Duration::from_millis(TOAST_TTL_MS),
         });
         // Drop oldest if we exceed cap so the stack never grows past MAX_TOASTS.
         if self.toasts.len() > MAX_TOASTS {
@@ -985,9 +981,13 @@ impl Jterm {
             return;
         }
         let cwd = self.sessions.get(self.active).and_then(|s| s.cwd());
-        if let Some(sess) =
-            Session::spawn(&self.config, self.next_id, self.cols, self.rows, cwd.as_deref())
-        {
+        if let Some(sess) = Session::spawn(
+            &self.config,
+            self.next_id,
+            self.cols,
+            self.rows,
+            cwd.as_deref(),
+        ) {
             self.next_id += 1;
             self.sessions.push(sess);
             let new_idx = self.sessions.len() - 1;
@@ -1061,7 +1061,9 @@ impl Jterm {
                 self.new_session();
                 Task::none()
             }
-            C::SessionClose | C::WindowClose => return Some(self.request_close_session(self.active)),
+            C::SessionClose | C::WindowClose => {
+                return Some(self.request_close_session(self.active))
+            }
             C::SessionNext => {
                 self.next_session();
                 Task::none()
@@ -1382,7 +1384,8 @@ impl Jterm {
                         n if n >= 3 => {
                             let (cols, _) = sess.terminal.get_dimensions();
                             sess.terminal.start_selection((row, 0));
-                            sess.terminal.update_selection((row, cols.saturating_sub(1)));
+                            sess.terminal
+                                .update_selection((row, cols.saturating_sub(1)));
                         }
                         _ if alt => sess.terminal.start_block_selection((row, col)),
                         _ => sess.terminal.start_selection((row, col)),
@@ -1407,16 +1410,15 @@ impl Jterm {
             MouseInput::Release { col, row, button } => {
                 if report_to_app {
                     if let Some(report) =
-                        sess.terminal.get_mouse_release_report(btn_code(button), col, row)
+                        sess.terminal
+                            .get_mouse_release_report(btn_code(button), col, row)
                     {
                         sess.write_pty(report.as_bytes());
                     }
                     return Task::none();
                 }
                 if button == MouseButton::Left {
-                    if let Some(text) =
-                        sess.terminal.copy_selection().filter(|t| !t.is_empty())
-                    {
+                    if let Some(text) = sess.terminal.copy_selection().filter(|t| !t.is_empty()) {
                         return iced::clipboard::write_primary(text);
                     }
                 }
@@ -1451,11 +1453,7 @@ impl Jterm {
 
     /// Shift+Page/Home/End scrolls the scrollback viewport. Returns true if the
     /// keypress was consumed.
-    fn handle_scroll_shortcut(
-        &mut self,
-        key: &keyboard::Key,
-        mods: keyboard::Modifiers,
-    ) -> bool {
+    fn handle_scroll_shortcut(&mut self, key: &keyboard::Key, mods: keyboard::Modifiers) -> bool {
         use keyboard::key::Named;
         use keyboard::Key;
         if !mods.shift() {
@@ -2230,8 +2228,7 @@ impl Jterm {
                         ed.hexes.iter().position(|h| Theme::hex_to_rgb(h).is_none())
                     {
                         let labels = Theme::editable_color_labels();
-                        ed.error =
-                            Some(format!("Invalid hex for {}", labels[bad]));
+                        ed.error = Some(format!("Invalid hex for {}", labels[bad]));
                     } else {
                         let mut theme = ed.base.clone();
                         theme.name = name.clone();
@@ -2262,14 +2259,10 @@ impl Jterm {
             }
             Message::ThemeDelete(name) => {
                 match Theme::delete_custom_theme(&name) {
-                    Ok(()) => self.push_toast(
-                        format!("Deleted theme \"{}\"", name),
-                        ToastKind::Info,
-                    ),
-                    Err(e) => self.push_toast(
-                        format!("Delete failed: {}", e),
-                        ToastKind::Warning,
-                    ),
+                    Ok(()) => {
+                        self.push_toast(format!("Deleted theme \"{}\"", name), ToastKind::Info)
+                    }
+                    Err(e) => self.push_toast(format!("Delete failed: {}", e), ToastKind::Warning),
                 }
                 if self.config.theme == name {
                     self.config.theme = "dark".to_string();
@@ -2279,10 +2272,7 @@ impl Jterm {
             Message::ConfigSave => {
                 match self.config.save() {
                     Ok(()) => self.push_toast("Config saved", ToastKind::Success),
-                    Err(e) => self.push_toast(
-                        format!("Save failed: {}", e),
-                        ToastKind::Warning,
-                    ),
+                    Err(e) => self.push_toast(format!("Save failed: {}", e), ToastKind::Warning),
                 }
                 self.config_mtime = Config::config_mtime();
             }
@@ -2538,7 +2528,10 @@ impl Jterm {
     }
 
     /// Tab button: accent-tinted + bordered when active, flat otherwise.
-    fn tab_btn_style(&self, active: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    fn tab_btn_style(
+        &self,
+        active: bool,
+    ) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
         let base = Theme::rgb_to_color32(self.theme.tabbar.bg);
         let accent = self.c_accent();
         let active_text = Theme::rgb_to_color32(self.theme.tabbar.active_text);
@@ -2681,9 +2674,7 @@ impl Jterm {
             } else {
                 Space::new().width(Length::Fixed(18.0)).into()
             };
-            let cell = row![tab, close]
-                .spacing(1)
-                .align_y(iced::Alignment::Center);
+            let cell = row![tab, close].spacing(1).align_y(iced::Alignment::Center);
             // Hover tracking on the whole cell so moving onto the close
             // button does not collapse it out of the layout.
             tabs = tabs.push(
@@ -2731,10 +2722,7 @@ impl Jterm {
 
         let mut menu = column![
             text(label).size(12).style(text::secondary),
-            row_btn(
-                "Close",
-                Message::TabMenuAction(TabMenuAction::Close(i)),
-            ),
+            row_btn("Close", Message::TabMenuAction(TabMenuAction::Close(i)),),
         ]
         .spacing(2);
         if !only_one {
@@ -2883,17 +2871,17 @@ impl Jterm {
                     .map(|s| s.label())
                     .unwrap_or_default();
                 let info = row![
-                    text(format!("{:>2}", idx + 1)).size(12).style(text::secondary),
+                    text(format!("{:>2}", idx + 1))
+                        .size(12)
+                        .style(text::secondary),
                     text(label).size(13),
                     Space::new().width(Length::Fill),
                 ]
                 .spacing(10)
                 .align_y(iced::Alignment::Center);
                 let accent = self.c_accent();
-                let body = container(info)
-                    .width(Length::Fill)
-                    .padding([3, 8])
-                    .style(move |_t: &iced::Theme| container::Style {
+                let body = container(info).width(Length::Fill).padding([3, 8]).style(
+                    move |_t: &iced::Theme| container::Style {
                         background: if selected {
                             Some(iced::Background::Color(Color { a: 0.28, ..accent }))
                         } else {
@@ -2904,7 +2892,8 @@ impl Jterm {
                             ..Default::default()
                         },
                         ..Default::default()
-                    });
+                    },
+                );
                 let row_btn = mouse_area(body).on_press(Message::TabSwitcherJump(idx));
                 list = list.push(row_btn);
             }
@@ -2998,8 +2987,7 @@ impl Jterm {
         // An open overlay input owns the keyboard and IME, so the terminal pane
         // renders unfocused (no blinking cursor, no competing IME request).
         let overlay_input_active = self.search.is_open || self.palette.is_open;
-        let focused =
-            self.focused && pane_pos == self.focused_pane && !overlay_input_active;
+        let focused = self.focused && pane_pos == self.focused_pane && !overlay_input_active;
         let is_active = sess_idx == self.active;
         // Only walk the grid to build per-row selection spans when a selection
         // actually exists; otherwise hand the widget an empty Vec (no highlight).
@@ -3114,14 +3102,13 @@ impl Jterm {
             .and_then(|n| n.to_str())
             .unwrap_or("/")
             .to_string();
-        let mut rows: Vec<Element<'_, Message>> = vec![container(
-            text(title).size(12).font(iced::Font {
+        let mut rows: Vec<Element<'_, Message>> =
+            vec![container(text(title).size(12).font(iced::Font {
                 weight: iced::font::Weight::Bold,
                 ..iced::Font::DEFAULT
-            }),
-        )
-        .padding([4, 6])
-        .into()];
+            }))
+            .padding([4, 6])
+            .into()];
         if let Some(root) = &self.sidebar.root {
             for child in &root.children {
                 self.collect_sidebar_nodes(child, 0, &mut rows);
@@ -3146,12 +3133,10 @@ impl Jterm {
             };
             let hovered = self.hovered_tab == Some(i);
             let dragging_this = self.dragging_tab == Some(i);
-            let tab_label = container(
-                text(label).size(13).wrapping(text::Wrapping::None),
-            )
-            .width(Length::Fill)
-            .padding([4, 8])
-            .style(self.tab_container_style(active, hovered, dragging_this));
+            let tab_label = container(text(label).size(13).wrapping(text::Wrapping::None))
+                .width(Length::Fill)
+                .padding([4, 8])
+                .style(self.tab_container_style(active, hovered, dragging_this));
             let tab: Element<'_, Message> = mouse_area(tab_label)
                 .on_press(Message::TabDragStart(i))
                 .on_release(Message::TabDragEnd(i))
@@ -3170,9 +3155,7 @@ impl Jterm {
             let close = container(close_inner)
                 .width(Length::Fixed(24.0))
                 .center_x(Length::Fixed(24.0));
-            let cell = row![tab, close]
-                .spacing(2)
-                .align_y(iced::Alignment::Center);
+            let cell = row![tab, close].spacing(2).align_y(iced::Alignment::Center);
             list = list.push(
                 mouse_area(cell)
                     .on_enter(Message::TabHover(Some(i)))
@@ -3306,7 +3289,9 @@ impl Jterm {
         } else {
             panes_body
         };
-        let body = container(panes_body).width(Length::Fill).height(Length::Fill);
+        let body = container(panes_body)
+            .width(Length::Fill)
+            .height(Length::Fill);
         let body: Element<'_, Message> = if self.config_panel_open {
             let overlay = if self.theme_editor.is_some() {
                 self.theme_editor_view()
@@ -3427,9 +3412,7 @@ impl Jterm {
             bar = bar.push(text(status).size(13));
         }
         bar = bar.push(regex_btn).push(case_btn);
-        let inner = container(bar)
-            .padding([4, 10])
-            .style(container::dark);
+        let inner = container(bar).padding([4, 10]).style(container::dark);
         container(inner)
             .align_right(Length::Fill)
             .align_top(Length::Fill)
@@ -3731,10 +3714,7 @@ impl Jterm {
     /// Ctrl-based — jterm3 never binds Alt (reserved by the JWM window manager).
     fn help_panel(&self) -> Element<'_, Message> {
         let section = |title: &str| -> Element<'_, Message> {
-            text(title.to_string())
-                .size(13)
-                .style(text::primary)
-                .into()
+            text(title.to_string()).size(13).style(text::primary).into()
         };
         let kb = |key: &str, desc: &str| -> Element<'_, Message> {
             row![
@@ -3810,8 +3790,12 @@ impl Jterm {
                 "Split",
                 match self.split_mode {
                     SplitMode::Single => "Single".to_string(),
-                    SplitMode::Vertical => format!("V {}/{}", self.focused_pane + 1, self.panes.len()),
-                    SplitMode::Horizontal => format!("H {}/{}", self.focused_pane + 1, self.panes.len()),
+                    SplitMode::Vertical => {
+                        format!("V {}/{}", self.focused_pane + 1, self.panes.len())
+                    }
+                    SplitMode::Horizontal => {
+                        format!("H {}/{}", self.focused_pane + 1, self.panes.len())
+                    }
                 },
             ));
         if let Some(sess) = self.sessions.get(self.active) {
@@ -3887,24 +3871,21 @@ impl Jterm {
             iced::Event::Keyboard(_) if status == iced::event::Status::Captured => None,
             iced::Event::Keyboard(k) => Some(Message::Key(k)),
             iced::Event::InputMethod(ime) => Some(Message::Ime(ime)),
-            iced::Event::Window(iced::window::Event::Resized(size)) => {
-                Some(Message::Resized(size))
-            }
+            iced::Event::Window(iced::window::Event::Resized(size)) => Some(Message::Resized(size)),
             iced::Event::Window(iced::window::Event::Focused) => Some(Message::Focus(true)),
             iced::Event::Window(iced::window::Event::Unfocused) => Some(Message::Focus(false)),
             // Catch every left-button release so a tab drag that ends outside
             // any tab still clears `dragging_tab`. When the release lands on a
             // tab, mouse_area's on_release fires Message::TabDragEnd first
             // (which already consumes `dragging_tab`), so this becomes a no-op.
-            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
-                iced::mouse::Button::Left,
-            )) => Some(Message::TabDragCancel),
+            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
+                Some(Message::TabDragCancel)
+            }
             _ => None,
         });
         subs.push(events);
         subs.push(
-            iced::time::every(std::time::Duration::from_millis(1500))
-                .map(|_| Message::ConfigTick),
+            iced::time::every(std::time::Duration::from_millis(1500)).map(|_| Message::ConfigTick),
         );
         // The blink tick redraws and re-shapes the whole grid every 530ms purely
         // to animate blinking cells. Run it only while focused AND when a visible
@@ -3955,10 +3936,7 @@ fn slider_row<'a>(
 /// declaration order; otherwise returns matches highest score first as
 /// `(filtered_position, session_index)` tuples. Used by both the renderer and
 /// the key handler so navigation matches the visible list.
-fn tab_switcher_filtered(
-    sessions: &[Session],
-    query: &str,
-) -> Vec<(usize, usize)> {
+fn tab_switcher_filtered(sessions: &[Session], query: &str) -> Vec<(usize, usize)> {
     use fuzzy_matcher::skim::SkimMatcherV2;
     use fuzzy_matcher::FuzzyMatcher;
     if query.is_empty() {
@@ -4061,91 +4039,98 @@ fn pty_subscription(id: usize, fd: RawFd) -> Subscription<Message> {
 
 fn pty_stream(fd: RawFd) -> impl iced::futures::Stream<Item = Message> {
     use iced::futures::{SinkExt, StreamExt};
-    iced::stream::channel(256, move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
-        let (tx, mut rx) = iced::futures::channel::mpsc::unbounded::<Message>();
-        // Self-pipe so dropping this subscription (session/tab closed) wakes the
-        // reader thread and stops it BEFORE it can read from a PTY fd whose
-        // number may have been reused by a freshly spawned session.
-        let (shutdown_r, shutdown_w) = Pty::make_shutdown_pipe().unwrap_or((-1, -1));
-        std::thread::spawn(move || {
-            // Drain everything currently readable into one message instead of
-            // emitting a separate message per 64 KiB read. Bursty output (e.g.
-            // `cat bigfile`) then triggers far fewer process/refresh/render
-            // cycles, while a lone keystroke still hits WouldBlock immediately
-            // and is delivered with no added latency. Capped so the UI gets a
-            // chance to repaint between very large bursts.
-            const COALESCE_CAP: usize = 1 << 20; // 1 MiB per message
-            let mut buf = vec![0u8; 65536];
-            loop {
-                match Pty::wait_fd_or_shutdown(fd, shutdown_r, 200) {
-                    Ok(ReaderPoll::Shutdown) => break,
-                    Ok(ReaderPoll::Timeout) => continue,
-                    Ok(ReaderPoll::Data) => {
-                        let mut acc: Vec<u8> = Vec::new();
-                        let mut exited = false;
-                        let mut errored = false;
-                        loop {
-                            let n = unsafe {
-                                libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-                            };
-                            if n > 0 {
-                                acc.extend_from_slice(&buf[..n as usize]);
-                                if acc.len() >= COALESCE_CAP {
+    iced::stream::channel(
+        256,
+        move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            let (tx, mut rx) = iced::futures::channel::mpsc::unbounded::<Message>();
+            // Self-pipe so dropping this subscription (session/tab closed) wakes the
+            // reader thread and stops it BEFORE it can read from a PTY fd whose
+            // number may have been reused by a freshly spawned session.
+            let (shutdown_r, shutdown_w) = Pty::make_shutdown_pipe().unwrap_or((-1, -1));
+            std::thread::spawn(move || {
+                // Drain everything currently readable into one message instead of
+                // emitting a separate message per 64 KiB read. Bursty output (e.g.
+                // `cat bigfile`) then triggers far fewer process/refresh/render
+                // cycles, while a lone keystroke still hits WouldBlock immediately
+                // and is delivered with no added latency. Capped so the UI gets a
+                // chance to repaint between very large bursts.
+                const COALESCE_CAP: usize = 1 << 20; // 1 MiB per message
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    match Pty::wait_fd_or_shutdown(fd, shutdown_r, 200) {
+                        Ok(ReaderPoll::Shutdown) => break,
+                        Ok(ReaderPoll::Timeout) => continue,
+                        Ok(ReaderPoll::Data) => {
+                            let mut acc: Vec<u8> = Vec::new();
+                            let mut exited = false;
+                            let mut errored = false;
+                            loop {
+                                let n = unsafe {
+                                    libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                                };
+                                if n > 0 {
+                                    acc.extend_from_slice(&buf[..n as usize]);
+                                    if acc.len() >= COALESCE_CAP {
+                                        break;
+                                    }
+                                } else if n == 0 {
+                                    exited = true;
+                                    break;
+                                } else {
+                                    let err = std::io::Error::last_os_error();
+                                    if err.kind() == std::io::ErrorKind::WouldBlock {
+                                        break;
+                                    }
+                                    errored = true;
                                     break;
                                 }
-                            } else if n == 0 {
-                                exited = true;
+                            }
+                            if !acc.is_empty()
+                                && tx.unbounded_send(Message::PtyOutput(fd, acc)).is_err()
+                            {
                                 break;
-                            } else {
-                                let err = std::io::Error::last_os_error();
-                                if err.kind() == std::io::ErrorKind::WouldBlock {
-                                    break;
-                                }
-                                errored = true;
+                            }
+                            if exited {
+                                let _ = tx.unbounded_send(Message::PtyExited(fd, 0));
+                                break;
+                            }
+                            if errored {
+                                let _ = tx.unbounded_send(Message::PtyExited(fd, -1));
                                 break;
                             }
                         }
-                        if !acc.is_empty()
-                            && tx.unbounded_send(Message::PtyOutput(fd, acc)).is_err()
-                        {
-                            break;
-                        }
-                        if exited {
-                            let _ = tx.unbounded_send(Message::PtyExited(fd, 0));
-                            break;
-                        }
-                        if errored {
+                        Err(_) => {
                             let _ = tx.unbounded_send(Message::PtyExited(fd, -1));
                             break;
                         }
                     }
-                    Err(_) => {
-                        let _ = tx.unbounded_send(Message::PtyExited(fd, -1));
-                        break;
+                }
+                // Reader is done; release our end of the shutdown pipe.
+                if shutdown_r >= 0 {
+                    unsafe {
+                        libc::close(shutdown_r);
+                    }
+                }
+            });
+            // Closing the write end on drop (subscription removed) signals the reader.
+            struct ShutdownGuard(RawFd);
+            impl Drop for ShutdownGuard {
+                fn drop(&mut self) {
+                    if self.0 >= 0 {
+                        unsafe {
+                            libc::close(self.0);
+                        }
                     }
                 }
             }
-            // Reader is done; release our end of the shutdown pipe.
-            if shutdown_r >= 0 {
-                unsafe { libc::close(shutdown_r); }
-            }
-        });
-        // Closing the write end on drop (subscription removed) signals the reader.
-        struct ShutdownGuard(RawFd);
-        impl Drop for ShutdownGuard {
-            fn drop(&mut self) {
-                if self.0 >= 0 {
-                    unsafe { libc::close(self.0); }
+            let _shutdown_guard = ShutdownGuard(shutdown_w);
+            while let Some(msg) = rx.next().await {
+                if output.send(msg).await.is_err() {
+                    break;
                 }
             }
-        }
-        let _shutdown_guard = ShutdownGuard(shutdown_w);
-        while let Some(msg) = rx.next().await {
-            if output.send(msg).await.is_err() {
-                break;
-            }
-        }
-    })
+        },
+    )
 }
 
 /// Load keybindings from disk (merged onto defaults), logging any load error or
@@ -4446,8 +4431,7 @@ fn xterm_modify_other_keys_encode(
 ) -> Option<Vec<u8>> {
     let codepoint = text_key_code(key, mods)?;
     let modifier_value = keyboard_modifier_value(mods);
-    let has_non_shift_modifier =
-        mods.control() || mods.alt() || (mods.logo() && !mods.control());
+    let has_non_shift_modifier = mods.control() || mods.alt() || (mods.logo() && !mods.control());
     let should_encode = if report_all_keys {
         modifier_value > 1
     } else {
