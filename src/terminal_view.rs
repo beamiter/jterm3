@@ -699,7 +699,7 @@ where
                         font: run_font,
                         align_x: text::Alignment::Left,
                         align_y: iced::alignment::Vertical::Center,
-                        shaping: text::Shaping::Advanced,
+                        shaping: text::Shaping::Basic,
                         wrapping: text::Wrapping::None,
                     },
                     Point::new(rx, y + ch / 2.0),
@@ -781,6 +781,14 @@ where
                     }
                     run_text.push(glyph);
                     run_len += 1;
+                    emit_run(
+                        renderer,
+                        &mut run_text,
+                        &mut run_len,
+                        run_start,
+                        run_fg,
+                        run_font,
+                    );
                 } else {
                     // Spaces and wide glyphs end any pending run; wide glyphs are
                     // drawn individually, centered over their two-cell span.
@@ -802,7 +810,7 @@ where
                                 font: glyph_font,
                                 align_x: text::Alignment::Center,
                                 align_y: iced::alignment::Vertical::Center,
-                                shaping: text::Shaping::Advanced,
+                                shaping: text::Shaping::Basic,
                                 wrapping: text::Wrapping::None,
                             },
                             Point::new(x + cw * span / 2.0, y + ch / 2.0),
@@ -881,7 +889,7 @@ where
                                 font: self.mono,
                                 align_x: text::Alignment::Center,
                                 align_y: iced::alignment::Vertical::Center,
-                                shaping: text::Shaping::Advanced,
+                                shaping: text::Shaping::Basic,
                                 wrapping: text::Wrapping::None,
                             },
                             Point::new(x + cursor_w / 2.0, y + ch / 2.0),
