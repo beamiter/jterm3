@@ -4274,6 +4274,21 @@ mod tests {
     }
 
     #[test]
+    fn utf8_cjk_input_stores_wide_cells() {
+        let mut terminal = TerminalState::new(8, 2);
+
+        terminal.process_input("中文".as_bytes());
+
+        assert_eq!(terminal.grid[0][0].character, '中');
+        assert!(terminal.grid[0][0].flags.wide());
+        assert!(terminal.grid[0][1].flags.wide_continuation());
+        assert_eq!(terminal.grid[0][2].character, '文');
+        assert!(terminal.grid[0][2].flags.wide());
+        assert!(terminal.grid[0][3].flags.wide_continuation());
+        assert_eq!(terminal.cursor_col, 4);
+    }
+
+    #[test]
     fn linefeed_at_bottom_pushes_to_scrollback_for_full_screen_region() {
         let mut terminal = TerminalState::new(4, 2);
         terminal.grid[0][0].character = 'A';

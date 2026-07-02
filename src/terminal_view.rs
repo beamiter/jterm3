@@ -134,6 +134,7 @@ pub struct TermWidget<'a, Message> {
     theme: &'a Theme,
     metrics: Metrics,
     mono: iced::Font,
+    cjk_mono: Option<iced::Font>,
     /// Per visible row: the inclusive (start_col, end_col) span to highlight,
     /// or `None` for rows with no selection. `end_col` may exceed the row width.
     selection: Vec<Option<(usize, usize)>>,
@@ -172,6 +173,7 @@ impl<'a, Message> TermWidget<'a, Message> {
         theme: &'a Theme,
         metrics: Metrics,
         mono: iced::Font,
+        cjk_mono: Option<iced::Font>,
         selection: Vec<Option<(usize, usize)>>,
         scroll_offset: usize,
         scrollback_len: usize,
@@ -184,6 +186,7 @@ impl<'a, Message> TermWidget<'a, Message> {
             theme,
             metrics,
             mono,
+            cjk_mono,
             selection,
             scroll_offset,
             scrollback_len,
@@ -318,6 +321,26 @@ impl<'a, Message> TermWidget<'a, Message> {
         let row = ((rel_y / ch) as usize).min(max_row);
         (col, row)
     }
+}
+
+fn should_use_cjk_font(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x2E80..=0x2EFF
+            | 0x3000..=0x303F
+            | 0x3040..=0x30FF
+            | 0x3100..=0x312F
+            | 0x3130..=0x318F
+            | 0x31A0..=0x31BF
+            | 0x31C0..=0x31EF
+            | 0x31F0..=0x31FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xAC00..=0xD7AF
+            | 0xF900..=0xFAFF
+            | 0xFF00..=0xFFEF
+            | 0x20000..=0x2FA1F
+    )
 }
 
 fn solid_quad(bounds: Rectangle) -> Quad {
@@ -732,6 +755,8 @@ where
                 }
                 let glyph_font = if cell.flags.italic() {
                     italic_font
+                } else if should_use_cjk_font(glyph) {
+                    self.cjk_mono.unwrap_or(font)
                 } else {
                     font
                 };
@@ -886,7 +911,11 @@ where
                                 bounds: Size::new(cursor_w, ch),
                                 size: Pixels(self.metrics.font_size),
                                 line_height: text::LineHeight::Absolute(Pixels(ch)),
-                                font: self.mono,
+                                font: if should_use_cjk_font(glyph) {
+                                    self.cjk_mono.unwrap_or(self.mono)
+                                } else {
+                                    self.mono
+                                },
                                 align_x: text::Alignment::Center,
                                 align_y: iced::alignment::Vertical::Center,
                                 shaping: text::Shaping::Basic,

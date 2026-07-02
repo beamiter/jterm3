@@ -117,6 +117,10 @@ fn resolve_mono_font(family: &str) -> iced::Font {
     }
 }
 
+fn resolve_optional_font(family: Option<&str>) -> Option<iced::Font> {
+    family.map(resolve_mono_font)
+}
+
 fn main() -> iced::Result {
     env_logger::init();
     let config = Config::load();
@@ -397,6 +401,7 @@ struct Jterm {
     focused: bool,
     modifiers: keyboard::Modifiers,
     mono: iced::Font,
+    cjk_mono: Option<iced::Font>,
     search: search::SearchState,
     palette: command_palette::PaletteState,
     keybindings: keybindings::KeyBindings,
@@ -494,6 +499,7 @@ impl Jterm {
         }
 
         let mono = resolve_mono_font(&config.font_family);
+        let cjk_mono = resolve_optional_font(Config::cjk_monospace_font_family());
 
         // Restore prior tabs (their cwds + active index) when enabled and we are
         // the first instance; otherwise start with a single default session.
@@ -522,6 +528,7 @@ impl Jterm {
             focused: true,
             modifiers: keyboard::Modifiers::default(),
             mono,
+            cjk_mono,
             search: search::SearchState::new(),
             palette: command_palette::PaletteState::new(),
             keybindings: load_keybindings(),
@@ -588,6 +595,7 @@ impl Jterm {
     fn apply_config(&mut self) {
         self.theme = Theme::get_theme(&self.config.theme).unwrap_or_default();
         self.mono = resolve_mono_font(&self.config.font_family);
+        self.cjk_mono = resolve_optional_font(Config::cjk_monospace_font_family());
         self.metrics = Metrics::new(
             self.config.font_size,
             self.config.line_spacing,
@@ -3023,6 +3031,7 @@ impl Jterm {
             &self.theme,
             self.metrics,
             self.mono,
+            self.cjk_mono,
             selection,
             sess.terminal.scroll_offset,
             sess.terminal.scrollback_len(),
