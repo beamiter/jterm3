@@ -64,6 +64,31 @@ impl SearchAndReplaceEngine {
             return Ok((text.to_string(), 0));
         }
 
+        if !config.case_sensitive {
+            use regex::RegexBuilder;
+
+            let re = RegexBuilder::new(&regex::escape(pattern))
+                .case_insensitive(true)
+                .build()
+                .map_err(|e| format!("Invalid search pattern: {}", e))?;
+
+            let result = if options.replace_all {
+                re.replace_all(text, |_: &regex::Captures| replacement).to_string()
+            } else {
+                re.replace(text, |_: &regex::Captures| replacement).to_string()
+            };
+
+            let count = if options.replace_all {
+                re.find_iter(text).count()
+            } else if re.is_match(text) {
+                1
+            } else {
+                0
+            };
+
+            return Ok((result, count));
+        }
+
         let mut result = String::with_capacity(text.len());
         let mut count = 0;
         let mut rest = text;
@@ -191,5 +216,24 @@ mod tests {
 
         assert_eq!(count, 2);
         assert_eq!(result, "hi world hi");
+    }
+
+    #[test]
+    fn test_literal_replace_case_insensitive_unicode() {
+        let mut config = SearchConfig::default();
+        config.case_sensitive = false;
+        let options = ReplaceOptions::default();
+
+        let (result, count) = SearchAndReplaceEngine::search_and_replace(
+            "İB",
+            "b",
+            "X",
+            &config,
+            &options,
+        )
+        .unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(result, "İX");
     }
 }
