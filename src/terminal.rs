@@ -856,7 +856,7 @@ enum ZoneState {
 
 #[derive(Clone, Debug, Default)]
 struct TerminalModes {
-    bits: u32,
+    bits: u64,
 }
 
 impl TerminalModes {
@@ -881,6 +881,9 @@ impl TerminalModes {
             1005 => Some(16), // UTF-8 mouse encoding
             1015 => Some(17), // urxvt mouse encoding
             66 => Some(18),   // DECNKM application keypad mode (ESC = / ESC >)
+            47 => Some(19),   // Alternate screen buffer
+            1047 => Some(20), // Alternate screen buffer
+            1048 => Some(21), // Save/restore cursor
             _ => None,
         }
     }
@@ -1492,7 +1495,19 @@ impl TerminalState {
 
     fn decrqm_private_mode_state(&self, mode: u16) -> u8 {
         match mode {
-            1 | 7 | 25 | 47 | 66 | 1000..=1006 | 1015 | 1047..=1049 | 2004 | 2026 | 2031 | 5522 => {
+            1
+            | 6
+            | 7
+            | 25
+            | 47
+            | 66
+            | 1000..=1006
+            | 1015
+            | 1047..=1049
+            | 2004
+            | 2026
+            | 2031
+            | 5522 => {
                 if self.modes.contains(&mode) {
                     1
                 } else {
@@ -5072,17 +5087,19 @@ mod tests {
     fn decrqm_reports_common_vte_private_modes() {
         let mut terminal = TerminalState::new(8, 2);
 
-        terminal.process_input(b"\x1b[?1;7;25;66;1004;1006;2004;2026;2031$p");
+        terminal.process_input(b"\x1b[?1;6;7;25;47;66;1004;1006;1047;1048;1049;2004;2026;2031$p");
         assert_eq!(
             String::from_utf8(terminal.get_output()).unwrap(),
-            "\x1b[?1;2$y\x1b[?7;1$y\x1b[?25;1$y\x1b[?66;2$y\x1b[?1004;2$y\x1b[?1006;2$y\x1b[?2004;2$y\x1b[?2026;2$y\x1b[?2031;2$y"
+            "\x1b[?1;2$y\x1b[?6;2$y\x1b[?7;1$y\x1b[?25;1$y\x1b[?47;2$y\x1b[?66;2$y\x1b[?1004;2$y\x1b[?1006;2$y\x1b[?1047;2$y\x1b[?1048;2$y\x1b[?1049;2$y\x1b[?2004;2$y\x1b[?2026;2$y\x1b[?2031;2$y"
         );
 
-        terminal.process_input(b"\x1b[?1h\x1b=\x1b[?1004h\x1b[?1006h\x1b[?2004h\x1b[?2031h");
-        terminal.process_input(b"\x1b[?1;66;1004;1006;2004;2031$p");
+        terminal.process_input(
+            b"\x1b[?1h\x1b[?6h\x1b=\x1b[?1004h\x1b[?1006h\x1b[?1048h\x1b[?2004h\x1b[?2031h",
+        );
+        terminal.process_input(b"\x1b[?1;6;66;1004;1006;1048;2004;2031$p");
         assert_eq!(
             String::from_utf8(terminal.get_output()).unwrap(),
-            "\x1b[?1;1$y\x1b[?66;1$y\x1b[?1004;1$y\x1b[?1006;1$y\x1b[?2004;1$y\x1b[?2031;1$y"
+            "\x1b[?1;1$y\x1b[?6;1$y\x1b[?66;1$y\x1b[?1004;1$y\x1b[?1006;1$y\x1b[?1048;1$y\x1b[?2004;1$y\x1b[?2031;1$y"
         );
     }
 

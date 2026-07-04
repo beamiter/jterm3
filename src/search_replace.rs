@@ -73,9 +73,11 @@ impl SearchAndReplaceEngine {
                 .map_err(|e| format!("Invalid search pattern: {}", e))?;
 
             let result = if options.replace_all {
-                re.replace_all(text, |_: &regex::Captures| replacement).to_string()
+                re.replace_all(text, |_: &regex::Captures| replacement)
+                    .to_string()
             } else {
-                re.replace(text, |_: &regex::Captures| replacement).to_string()
+                re.replace(text, |_: &regex::Captures| replacement)
+                    .to_string()
             };
 
             let count = if options.replace_all {
@@ -224,14 +226,8 @@ mod tests {
         config.case_sensitive = false;
         let options = ReplaceOptions::default();
 
-        let (result, count) = SearchAndReplaceEngine::search_and_replace(
-            "İB",
-            "b",
-            "X",
-            &config,
-            &options,
-        )
-        .unwrap();
+        let (result, count) =
+            SearchAndReplaceEngine::search_and_replace("İB", "b", "X", &config, &options).unwrap();
 
         assert_eq!(count, 1);
         assert_eq!(result, "İX");

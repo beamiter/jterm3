@@ -762,8 +762,7 @@ where
                     cell.flags.dim(),
                 );
                 if cell.flags.inverse() {
-                    fg =
-                        resolve_bg_with_palette(cell.background, self.theme, self.dynamic_palette);
+                    fg = resolve_bg_with_palette(cell.background, self.theme, self.dynamic_palette);
                 }
                 let selected = sel_range.is_some_and(|(sc, ec)| col_idx >= sc && col_idx <= ec);
                 if selected {
