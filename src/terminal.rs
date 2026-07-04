@@ -1015,6 +1015,7 @@ pub struct TerminalState {
     pub sync_output_active: bool,
     sync_output_start: Option<std::time::Instant>,
     last_archived_screen_snapshot: Vec<String>,
+    last_synced_primary_screen_snapshot: Vec<String>,
 
     // OSC 52 clipboard set requests (selection_param, decoded_text)
     pub pending_osc52_clipboard_set: Option<String>,
@@ -1169,6 +1170,7 @@ impl TerminalState {
             sync_output_active: false,
             sync_output_start: None,
             last_archived_screen_snapshot: Vec::new(),
+            last_synced_primary_screen_snapshot: Vec::new(),
             pending_osc52_clipboard_set: None,
             pending_osc52_clipboard_query: false,
             command_zones: VecDeque::new(),
@@ -1702,6 +1704,36 @@ impl TerminalState {
         self.archive_visible_screen_to_scrollback_with_options(false, false);
     }
 
+    fn visible_screen_snapshot(&self) -> Option<Vec<String>> {
+        if self.grid.rows() == 0 {
+            return None;
+        }
+
+        let first = (0..self.grid.rows()).find(|&row| !self.line_is_blank(row));
+        let last = (0..self.grid.rows()).rfind(|&row| !self.line_is_blank(row));
+        let (Some(first), Some(last)) = (first, last) else {
+            return None;
+        };
+
+        Some(
+            (first..=last)
+                .map(|row| self.grid[row].iter().map(|cell| cell.character).collect())
+                .collect(),
+        )
+    }
+
+    fn archive_primary_screen_unless_last_synced_snapshot(&mut self) {
+        let Some(snapshot) = self.visible_screen_snapshot() else {
+            return;
+        };
+
+        if snapshot == self.last_synced_primary_screen_snapshot {
+            return;
+        }
+
+        self.archive_visible_screen_to_scrollback();
+    }
+
     fn archive_visible_screen_to_scrollback_with_options(
         &mut self,
         allow_alt_buffer: bool,
@@ -1718,9 +1750,7 @@ impl TerminalState {
         };
 
         if dedupe_snapshot {
-            let snapshot: Vec<String> = (first..=last)
-                .map(|row| self.grid[row].iter().map(|cell| cell.character).collect())
-                .collect();
+            let snapshot = self.visible_screen_snapshot().unwrap_or_default();
             if snapshot == self.last_archived_screen_snapshot {
                 return;
             }
@@ -3274,7 +3304,15 @@ impl TerminalState {
 
     /// Erase the whole screen WITHOUT moving the cursor (ED / CSI 2 J).
     fn clear_screen_no_home(&mut self) {
-        self.archive_visible_screen_to_scrollback();
+        if self.sync_output_active {
+            if self.use_alt_buffer {
+                self.archive_visible_screen_to_scrollback_with_options(true, true);
+            } else {
+                self.archive_primary_screen_unless_last_synced_snapshot();
+            }
+        } else {
+            self.archive_visible_screen_to_scrollback();
+        }
         let bg_color = self.current_bg;
         for row in self.grid.iter_mut() {
             for cell in row.iter_mut() {
@@ -3476,8 +3514,12 @@ impl TerminalState {
             }
             2026 => {
                 // End synchronized output: force full render
-                let allow_alt_scrollback = self.use_alt_buffer;
-                self.archive_visible_screen_to_scrollback_with_options(allow_alt_scrollback, true);
+                if self.use_alt_buffer {
+                    self.archive_visible_screen_to_scrollback_with_options(true, true);
+                } else {
+                    self.last_synced_primary_screen_snapshot =
+                        self.visible_screen_snapshot().unwrap_or_default();
+                }
                 self.modes.remove(&2026);
                 self.sync_output_active = false;
                 self.sync_output_start = None;
@@ -4390,6 +4432,53 @@ mod tests {
             text.starts_with("line-"),
             "expected scrollback viewport to show historical output, got {text:?}"
         );
+    }
+
+    #[test]
+    fn synchronized_primary_screen_redraws_do_not_fill_scrollback() {
+        let mut terminal = TerminalState::new(24, 4);
+
+        for seconds in 1..=3 {
+            terminal.process_input(b"\x1b[?2026h\x1b[1;1H\x1b[2J");
+            terminal.process_input(b">_ OpenAI Codex\r\n");
+            terminal.process_input(format!("Booting MCP server ({seconds}s)").as_bytes());
+            terminal.process_input(b"\x1b[?2026l");
+        }
+
+        assert_eq!(
+            terminal.scrollback_len(),
+            0,
+            "primary-screen synchronized redraws should not be recorded as history"
+        );
+    }
+
+    #[test]
+    fn synchronized_primary_screen_entry_preserves_existing_history() {
+        let mut terminal = TerminalState::new(24, 4);
+
+        terminal.process_input(b"previous log\r\nshell prompt");
+        terminal.process_input(b"\x1b[?2026h\x1b[1;1H\x1b[2J");
+        terminal.process_input(b">_ OpenAI Codex\r\nBooting MCP server");
+        terminal.process_input(b"\x1b[?2026l");
+        terminal.process_input(b"\x1b[?2026h\x1b[1;1H\x1b[2J");
+        terminal.process_input(b">_ OpenAI Codex\r\nBooting MCP server");
+        terminal.process_input(b"\x1b[?2026l");
+
+        assert_eq!(terminal.scrollback_len(), 2);
+        let history: Vec<String> = terminal
+            .scrollback
+            .iter()
+            .map(|line| {
+                line.decompress()
+                    .iter()
+                    .map(|cell| cell.character)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+
+        assert_eq!(history, ["previous log", "shell prompt"]);
     }
 
     #[test]
