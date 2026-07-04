@@ -57,6 +57,7 @@ const SECONDARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[>1;7802;0c";
 const XTERM_VERSION_RESPONSE: &[u8] = b"\x1bP>|VTE(7802)\x1b\\";
 pub const MAX_TERMINAL_COLS: usize = 1024;
 pub const MAX_TERMINAL_ROWS: usize = 512;
+pub type DynamicColorPalette = [Option<(u8, u8, u8)>; 256];
 
 pub fn clamp_terminal_dimensions(cols: usize, rows: usize) -> (usize, usize) {
     (
@@ -879,6 +880,7 @@ impl TerminalModes {
             6 => Some(15),    // DECOM origin mode
             1005 => Some(16), // UTF-8 mouse encoding
             1015 => Some(17), // urxvt mouse encoding
+            66 => Some(18),   // DECNKM application keypad mode (ESC = / ESC >)
             _ => None,
         }
     }
@@ -931,6 +933,8 @@ pub struct TerminalState {
     max_scrollback: usize,
     use_alt_buffer: bool,
     disable_alt_screen: bool,
+    viewport_pixel_width: u32,
+    viewport_pixel_height: u32,
 
     pub cursor_row: usize,
     pub cursor_col: usize,
@@ -1030,6 +1034,7 @@ pub struct TerminalState {
     pub dynamic_fg: Option<(u8, u8, u8)>,
     pub dynamic_bg: Option<(u8, u8, u8)>,
     pub dynamic_cursor_color: Option<(u8, u8, u8)>,
+    pub dynamic_palette: DynamicColorPalette,
 
     // OSC 9/777 pending notifications
     pub pending_notifications: Vec<(String, String)>,
@@ -1121,6 +1126,8 @@ impl TerminalState {
             max_scrollback: 10000,
             use_alt_buffer: false,
             disable_alt_screen: false,
+            viewport_pixel_width: (cols as u32).saturating_mul(8),
+            viewport_pixel_height: (rows as u32).saturating_mul(16),
             cursor_row: 0,
             cursor_col: 0,
             saved_cursor_row: 0,
@@ -1178,6 +1185,7 @@ impl TerminalState {
             dynamic_fg: None,
             dynamic_bg: None,
             dynamic_cursor_color: None,
+            dynamic_palette: [None; 256],
             pending_notifications: Vec::new(),
         }
     }
@@ -1203,6 +1211,64 @@ impl TerminalState {
         self.output_buffer.extend_from_slice(Self::osc_terminator());
     }
 
+    fn append_osc_color_response(&mut self, command: &str, color: (u8, u8, u8)) {
+        let response = format!(
+            "\x1b]{};rgb:{:04x}/{:04x}/{:04x}\x1b\\",
+            command,
+            (color.0 as u16) * 257,
+            (color.1 as u16) * 257,
+            (color.2 as u16) * 257,
+        );
+        self.output_buffer.extend_from_slice(response.as_bytes());
+    }
+
+    fn append_osc_palette_response(&mut self, idx: u8, color: (u8, u8, u8)) {
+        let response = format!(
+            "\x1b]4;{};rgb:{:04x}/{:04x}/{:04x}\x1b\\",
+            idx,
+            (color.0 as u16) * 257,
+            (color.1 as u16) * 257,
+            (color.2 as u16) * 257,
+        );
+        self.output_buffer.extend_from_slice(response.as_bytes());
+    }
+
+    fn default_256_color(idx: u8) -> (u8, u8, u8) {
+        const ANSI: [(u8, u8, u8); 16] = [
+            (0, 0, 0),
+            (205, 0, 0),
+            (0, 205, 0),
+            (205, 205, 0),
+            (0, 0, 238),
+            (205, 0, 205),
+            (0, 205, 205),
+            (229, 229, 229),
+            (127, 127, 127),
+            (255, 0, 0),
+            (0, 255, 0),
+            (255, 255, 0),
+            (92, 92, 255),
+            (255, 0, 255),
+            (0, 255, 255),
+            (255, 255, 255),
+        ];
+        match idx {
+            0..=15 => ANSI[idx as usize],
+            16..=231 => {
+                let idx = idx - 16;
+                let r_idx = idx / 36;
+                let g_idx = (idx % 36) / 6;
+                let b_idx = idx % 6;
+                let scale = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+                (scale(r_idx), scale(g_idx), scale(b_idx))
+            }
+            232..=255 => {
+                let gray = 8 + (idx - 232) * 10;
+                (gray, gray, gray)
+            }
+        }
+    }
+
     fn handle_osc_color(&mut self, command: &str, value: &str) {
         if value == "?" {
             // Query: respond with current color
@@ -1212,20 +1278,44 @@ impl TerminalState {
                 "12" => self.dynamic_cursor_color.unwrap_or((255, 255, 255)),
                 _ => return,
             };
-            let response = format!(
-                "\x1b]{};rgb:{:04x}/{:04x}/{:04x}\x1b\\",
-                command,
-                (color.0 as u16) * 257,
-                (color.1 as u16) * 257,
-                (color.2 as u16) * 257,
-            );
-            self.output_buffer.extend_from_slice(response.as_bytes());
+            self.append_osc_color_response(command, color);
         } else if let Some(rgb) = Self::parse_color_spec(value) {
             match command {
                 "10" => self.dynamic_fg = Some(rgb),
                 "11" => self.dynamic_bg = Some(rgb),
                 "12" => self.dynamic_cursor_color = Some(rgb),
                 _ => {}
+            }
+        }
+    }
+
+    fn handle_osc_palette(&mut self, value: &str) {
+        let mut parts = value.split(';');
+        while let Some(idx_s) = parts.next() {
+            let Some(color_s) = parts.next() else {
+                break;
+            };
+            let Ok(idx) = idx_s.parse::<u8>() else {
+                continue;
+            };
+            if color_s == "?" {
+                let color = self.dynamic_palette[idx as usize]
+                    .unwrap_or_else(|| Self::default_256_color(idx));
+                self.append_osc_palette_response(idx, color);
+            } else if let Some(rgb) = Self::parse_color_spec(color_s) {
+                self.dynamic_palette[idx as usize] = Some(rgb);
+            }
+        }
+    }
+
+    fn reset_osc_palette(&mut self, value: &str) {
+        if value.is_empty() {
+            self.dynamic_palette = [None; 256];
+            return;
+        }
+        for idx_s in value.split(';').filter(|s| !s.is_empty()) {
+            if let Ok(idx) = idx_s.parse::<u8>() {
+                self.dynamic_palette[idx as usize] = None;
             }
         }
     }
@@ -1397,6 +1487,75 @@ impl TerminalState {
                     break;
                 }
             }
+        }
+    }
+
+    fn decrqm_private_mode_state(&self, mode: u16) -> u8 {
+        match mode {
+            1 | 7 | 25 | 47 | 66 | 1000..=1006 | 1015 | 1047..=1049 | 2004 | 2026 | 2031 | 5522 => {
+                if self.modes.contains(&mode) {
+                    1
+                } else {
+                    2
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    fn report_private_mode_status(&mut self, mode: u16) {
+        let state = self.decrqm_private_mode_state(mode);
+        let response = format!("\x1b[?{};{}$y", mode, state);
+        self.output_buffer.extend_from_slice(response.as_bytes());
+    }
+
+    fn sanitized_title(&self) -> String {
+        self.window_title
+            .chars()
+            .filter(|&ch| ch != '\x1b' && ch != '\x07')
+            .take(1024)
+            .collect()
+    }
+
+    fn handle_window_ops(&mut self, params: &[u16]) {
+        let op = params.first().copied().unwrap_or(0);
+        let (cols, rows) = self.get_dimensions();
+        match op {
+            // Report window state: normal/non-iconified.
+            11 => self.output_buffer.extend_from_slice(b"\x1b[1t"),
+            // Report window position. jterm3 does not track compositor position,
+            // so report a stable origin like VTE-compatible terminals commonly do
+            // when the window manager will not expose coordinates.
+            13 => self.output_buffer.extend_from_slice(b"\x1b[3;0;0t"),
+            // Report text area size in pixels.
+            14 => {
+                let response = format!(
+                    "\x1b[4;{};{}t",
+                    self.viewport_pixel_height, self.viewport_pixel_width
+                );
+                self.output_buffer.extend_from_slice(response.as_bytes());
+            }
+            // Report text area size in characters.
+            18 => {
+                let response = format!("\x1b[8;{};{}t", rows, cols);
+                self.output_buffer.extend_from_slice(response.as_bytes());
+            }
+            // Report screen size in characters. We do not know monitor geometry
+            // here, so mirror the current terminal grid instead of lying wildly.
+            19 => {
+                let response = format!("\x1b[9;{};{}t", rows, cols);
+                self.output_buffer.extend_from_slice(response.as_bytes());
+            }
+            // Report icon label / window title.
+            20 => {
+                let response = format!("\x1b]L{}\x1b\\", self.sanitized_title());
+                self.output_buffer.extend_from_slice(response.as_bytes());
+            }
+            21 => {
+                let response = format!("\x1b]l{}\x1b\\", self.sanitized_title());
+                self.output_buffer.extend_from_slice(response.as_bytes());
+            }
+            _ => {}
         }
     }
 
@@ -2163,7 +2322,9 @@ impl TerminalState {
                                 if let Ok(payload) =
                                     std::str::from_utf8(&data_slice[payload_start..payload_end])
                                 {
-                                    if let Some((command, value)) = payload.split_once(';') {
+                                    let (command, value) =
+                                        payload.split_once(';').unwrap_or((payload, ""));
+                                    if !command.is_empty() {
                                         if command == "0" || command == "2" {
                                             self.window_title.clear();
                                             self.window_title.push_str(value);
@@ -2189,11 +2350,15 @@ impl TerminalState {
                                                 // OSC 8 ; ; (close hyperlink)
                                                 self.current_hyperlink = None;
                                             }
+                                        } else if command == "4" {
+                                            self.handle_osc_palette(value);
                                         } else if command == "10"
                                             || command == "11"
                                             || command == "12"
                                         {
                                             self.handle_osc_color(command, value);
+                                        } else if command == "104" {
+                                            self.reset_osc_palette(value);
                                         } else if command == "9" {
                                             // Desktop notification (iTerm2/ConEmu)
                                             if self.pending_notifications.len() < 8 {
@@ -2286,8 +2451,8 @@ impl TerminalState {
                             }
                         }
                         b'>' => {
-                            // ESC > - DECKPNM (Keypad Numeric Mode) or other private sequence
-                            // Just skip it and any following bytes that are part of it
+                            // ESC > - DECKPNM (Keypad Numeric Mode)
+                            self.modes.remove(&66);
                             i += 2;
                         }
                         b'<' => {
@@ -2297,7 +2462,7 @@ impl TerminalState {
                         }
                         b'=' => {
                             // ESC = - DECKPAM (Keypad Application Mode)
-                            // Just skip it
+                            self.modes.insert(66);
                             i += 2;
                         }
                         b'(' | b')' => {
@@ -2361,7 +2526,7 @@ impl TerminalState {
                             i += 2;
 
                             // Use stack arrays for CSI params (typical CSI sequences are short)
-                            let mut param_bytes = [0u8; 32];
+                            let mut param_bytes = [0u8; 128];
                             let mut param_len = 0;
                             let mut intermediates = [0u8; 8];
                             let mut inter_len = 0;
@@ -2876,6 +3041,11 @@ impl TerminalState {
                     self.scroll_region_down(self.scroll_region_top, self.scroll_region_bottom);
                 }
             }
+            't' => {
+                if private_prefix.is_none() && intermediates.is_empty() {
+                    self.handle_window_ops(params);
+                }
+            }
             'n' => {
                 // DSR - Device Status Report
                 match params.first().copied().unwrap_or(0) {
@@ -2914,14 +3084,10 @@ impl TerminalState {
                 if intermediates == [b'!'] && private_prefix.is_none() {
                     // DECSTR (CSI ! p) - soft terminal reset.
                     self.soft_reset();
-                } else if private_prefix == Some(b'?')
-                    && intermediates == [b'$']
-                    && params.first().copied() == Some(5522)
-                {
-                    let state = if self.modes.contains(&5522) { 1 } else { 2 };
-                    let response = format!("\x1b[?5522;{}$y", state);
-                    crate::debug_log!("[OSC5522] DECRQM query -> {}", response);
-                    self.output_buffer.extend_from_slice(response.as_bytes());
+                } else if private_prefix == Some(b'?') && intermediates == [b'$'] {
+                    for &mode in params {
+                        self.report_private_mode_status(mode);
+                    }
                 }
             }
             'h' => {
@@ -3265,6 +3431,7 @@ impl TerminalState {
         self.dynamic_fg = None;
         self.dynamic_bg = None;
         self.dynamic_cursor_color = None;
+        self.dynamic_palette = [None; 256];
         self.keyboard_enhancement_flags = 0;
         self.keyboard_enhancement_stack.clear();
         self.alt_keyboard_enhancement_flags = 0;
@@ -3571,6 +3738,11 @@ impl TerminalState {
         self.disable_alt_screen = disable_alt_screen;
     }
 
+    pub fn set_viewport_pixel_size(&mut self, width: u32, height: u32) {
+        self.viewport_pixel_width = width;
+        self.viewport_pixel_height = height;
+    }
+
     pub fn is_cursor_visible(&self) -> bool {
         // Cursor is visible when mode 25 is SET (via \x1b[?25h)
         // Hidden when mode 25 is RESET (via \x1b[?25l)
@@ -3658,6 +3830,10 @@ impl TerminalState {
 
     pub fn is_application_cursor_keys(&self) -> bool {
         self.modes.contains(&1)
+    }
+
+    pub fn is_application_keypad(&self) -> bool {
+        self.modes.contains(&66)
     }
 
     pub fn is_paste_events_enabled(&self) -> bool {
@@ -4743,6 +4919,20 @@ mod tests {
     }
 
     #[test]
+    fn xtwinops_queries_are_reported() {
+        let mut terminal = TerminalState::new(80, 24);
+        terminal.set_viewport_pixel_size(640, 384);
+        terminal.process_input(b"\x1b]0;demo\x1b\\");
+
+        terminal.process_input(b"\x1b[11t\x1b[13t\x1b[14t\x1b[18t\x1b[19t\x1b[20t\x1b[21t");
+
+        assert_eq!(
+            String::from_utf8(terminal.get_output()).unwrap(),
+            "\x1b[1t\x1b[3;0;0t\x1b[4;384;640t\x1b[8;24;80t\x1b[9;24;80t\x1b]Ldemo\x1b\\\x1b]ldemo\x1b\\"
+        );
+    }
+
+    #[test]
     fn double_click_selects_full_url() {
         let mut terminal = TerminalState::new(64, 2);
 
@@ -4845,6 +5035,28 @@ mod tests {
     }
 
     #[test]
+    fn osc_4_palette_set_query_and_reset() {
+        let mut terminal = TerminalState::new(8, 2);
+
+        terminal.process_input(b"\x1b]4;1;#112233;2;rgb:4455/6677/8899\x1b\\");
+        assert_eq!(terminal.dynamic_palette[1], Some((0x11, 0x22, 0x33)));
+        assert_eq!(terminal.dynamic_palette[2], Some((0x44, 0x66, 0x88)));
+
+        terminal.process_input(b"\x1b]4;1;?;2;?\x1b\\");
+        assert_eq!(
+            String::from_utf8(terminal.get_output()).unwrap(),
+            "\x1b]4;1;rgb:1111/2222/3333\x1b\\\x1b]4;2;rgb:4444/6666/8888\x1b\\"
+        );
+
+        terminal.process_input(b"\x1b]104;1\x1b\\");
+        assert_eq!(terminal.dynamic_palette[1], None);
+        assert_eq!(terminal.dynamic_palette[2], Some((0x44, 0x66, 0x88)));
+
+        terminal.process_input(b"\x1b]104\x1b\\");
+        assert_eq!(terminal.dynamic_palette[2], None);
+    }
+
+    #[test]
     fn decrqm_reports_5522_support() {
         let mut terminal = TerminalState::new(8, 2);
 
@@ -4854,6 +5066,35 @@ mod tests {
             String::from_utf8(terminal.get_output()).unwrap(),
             "\x1b[?5522;2$y"
         );
+    }
+
+    #[test]
+    fn decrqm_reports_common_vte_private_modes() {
+        let mut terminal = TerminalState::new(8, 2);
+
+        terminal.process_input(b"\x1b[?1;7;25;66;1004;1006;2004;2026;2031$p");
+        assert_eq!(
+            String::from_utf8(terminal.get_output()).unwrap(),
+            "\x1b[?1;2$y\x1b[?7;1$y\x1b[?25;1$y\x1b[?66;2$y\x1b[?1004;2$y\x1b[?1006;2$y\x1b[?2004;2$y\x1b[?2026;2$y\x1b[?2031;2$y"
+        );
+
+        terminal.process_input(b"\x1b[?1h\x1b=\x1b[?1004h\x1b[?1006h\x1b[?2004h\x1b[?2031h");
+        terminal.process_input(b"\x1b[?1;66;1004;1006;2004;2031$p");
+        assert_eq!(
+            String::from_utf8(terminal.get_output()).unwrap(),
+            "\x1b[?1;1$y\x1b[?66;1$y\x1b[?1004;1$y\x1b[?1006;1$y\x1b[?2004;1$y\x1b[?2031;1$y"
+        );
+    }
+
+    #[test]
+    fn deckpam_and_deckpnm_toggle_application_keypad() {
+        let mut terminal = TerminalState::new(8, 2);
+
+        terminal.process_input(b"\x1b=");
+        assert!(terminal.is_application_keypad());
+
+        terminal.process_input(b"\x1b>");
+        assert!(!terminal.is_application_keypad());
     }
 
     #[test]

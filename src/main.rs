@@ -611,11 +611,13 @@ impl Jterm {
             self.cols = cols;
             self.rows = rows;
         }
+        let (pixel_w, pixel_h) = self.grid_pixel_size(cols, rows);
         for sess in &mut self.sessions {
             sess.terminal
                 .set_max_scrollback(self.config.scrollback_lines);
             sess.terminal
                 .set_disable_alt_screen(self.config.disable_alt_screen);
+            sess.terminal.set_viewport_pixel_size(pixel_w, pixel_h);
             if resized {
                 sess.terminal.on_resize(cols, rows);
                 let _ = sess.pty.resize(cols, rows);
@@ -960,9 +962,17 @@ impl Jterm {
         }
     }
 
+    fn grid_pixel_size(&self, cols: usize, rows: usize) -> (u32, u32) {
+        let width = (cols as f32 * self.metrics.cell_w).round().max(0.0) as u32;
+        let height = (rows as f32 * self.metrics.cell_h).round().max(0.0) as u32;
+        (width, height)
+    }
+
     /// Resize one session's terminal + PTY (no-op when already that size).
     fn resize_session(&mut self, index: usize, cols: usize, rows: usize) {
+        let (pixel_w, pixel_h) = self.grid_pixel_size(cols, rows);
         if let Some(sess) = self.sessions.get_mut(index) {
+            sess.terminal.set_viewport_pixel_size(pixel_w, pixel_h);
             if sess.terminal.get_dimensions() != (cols, rows) {
                 sess.terminal.on_resize(cols, rows);
                 let _ = sess.pty.resize(cols, rows);
@@ -1944,6 +1954,7 @@ impl Jterm {
                         modify_other_keys: sess.terminal.xterm_modify_other_keys(),
                         format_other_keys: sess.terminal.xterm_format_other_keys(),
                         report_all_keys: sess.terminal.is_report_all_keys_enabled(),
+                        application_keypad: sess.terminal.is_application_keypad(),
                     };
                     if let Some(bytes) =
                         encode_key(&key, modifiers, text.as_deref(), app_cursor, enh)
@@ -2016,7 +2027,9 @@ impl Jterm {
                 if cols != self.cols || rows != self.rows {
                     self.cols = cols;
                     self.rows = rows;
+                    let (pixel_w, pixel_h) = self.grid_pixel_size(cols, rows);
                     for sess in &mut self.sessions {
+                        sess.terminal.set_viewport_pixel_size(pixel_w, pixel_h);
                         sess.terminal.on_resize(cols, rows);
                         let _ = sess.pty.resize(cols, rows);
                         sess.refresh();
@@ -3092,6 +3105,7 @@ impl Jterm {
         ))
         .search(search_matches, current)
         .links(links)
+        .dynamic_palette(&sess.terminal.dynamic_palette)
         .images(images)
         .preedit(if focused && !sess.terminal.preedit_text.is_empty() {
             Some((
@@ -4294,6 +4308,7 @@ struct KeyboardEnhancements {
     modify_other_keys: u16,
     format_other_keys: u16,
     report_all_keys: bool,
+    application_keypad: bool,
 }
 
 /// Translate an iced key press into the bytes to send to the PTY.
@@ -4338,7 +4353,13 @@ fn encode_key(
     match key {
         Key::Named(named) => {
             let bytes = match named {
-                Named::Enter => vec![b'\r'],
+                Named::Enter => {
+                    if enh.application_keypad {
+                        ss3("M")
+                    } else {
+                        vec![b'\r']
+                    }
+                }
                 Named::Backspace => vec![0x7f],
                 Named::Tab => {
                     if mods.shift() {
@@ -4517,5 +4538,35 @@ fn xterm_modify_other_keys_encode(
         Some(format!("\x1b[{};{}u", codepoint, modifier_value).into_bytes())
     } else {
         Some(format!("\x1b[27;{};{}~", modifier_value, codepoint).into_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::keyboard::key::Named;
+
+    #[test]
+    fn enter_honors_application_keypad_mode() {
+        let plain = encode_key(
+            &keyboard::Key::Named(Named::Enter),
+            keyboard::Modifiers::default(),
+            None,
+            false,
+            KeyboardEnhancements::default(),
+        );
+        assert_eq!(plain.as_deref(), Some(&b"\r"[..]));
+
+        let keypad = encode_key(
+            &keyboard::Key::Named(Named::Enter),
+            keyboard::Modifiers::default(),
+            None,
+            false,
+            KeyboardEnhancements {
+                application_keypad: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(keypad.as_deref(), Some(&b"\x1bOM"[..]));
     }
 }

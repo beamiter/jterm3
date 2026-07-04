@@ -38,8 +38,39 @@ mod unix_pty {
             .map(|p| p.to_string_lossy().to_string())
     }
 
+    fn shell_from_passwd() -> Option<String> {
+        let uid = unsafe { libc::getuid() };
+        let mut pwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        let mut buf = vec![0u8; 16384];
+        let rc = unsafe {
+            libc::getpwuid_r(
+                uid,
+                pwd.as_mut_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc != 0 || result.is_null() {
+            return None;
+        }
+        let pwd = unsafe { pwd.assume_init() };
+        if pwd.pw_shell.is_null() {
+            return None;
+        }
+        let shell = unsafe { std::ffi::CStr::from_ptr(pwd.pw_shell) }
+            .to_string_lossy()
+            .to_string();
+        if is_executable(Path::new(&shell)) {
+            Some(shell)
+        } else {
+            None
+        }
+    }
+
     fn choose_shell(configured_shell: Option<&str>) -> String {
-        // Priority 1: explicit config / env var (needed when PATH is stripped by launchers like wofi)
+        // Priority 1: explicit config (needed when PATH is stripped by launchers like wofi)
         if let Some(path) = configured_shell {
             if is_executable(Path::new(path)) {
                 return path.to_string();
@@ -50,9 +81,16 @@ mod unix_pty {
             );
         }
 
-        // Priority 2: rsh (preferred shell with advanced features)
-        if let Some(rsh_path) = find_executable_in_path("rsh") {
-            return rsh_path;
+        // Priority 2: the user's login shell, matching VTE terminals such as
+        // GNOME Terminal and Terminator. `$SHELL` is usually already absolute;
+        // passwd is the fallback when launchers sanitize the environment.
+        if let Some(shell) = std::env::var_os("SHELL").and_then(|s| s.into_string().ok()) {
+            if is_executable(Path::new(&shell)) {
+                return shell;
+            }
+        }
+        if let Some(shell) = shell_from_passwd() {
+            return shell;
         }
 
         // Priority 3: bash (fallback)

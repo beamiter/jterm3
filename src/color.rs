@@ -1,4 +1,4 @@
-use crate::terminal::Color;
+use crate::terminal::{Color, DynamicColorPalette};
 use crate::theme::Theme;
 use iced::Color as IColor;
 
@@ -27,16 +27,30 @@ fn ansi_index(color: Color) -> Option<usize> {
 
 /// Resolve a foreground color using the theme palette, with VTE4-compatible
 /// bold-brightening and dim attenuation.
+#[allow(dead_code)]
 pub fn resolve_fg(color: Color, theme: &Theme, bold: bool, dim: bool) -> IColor {
+    resolve_fg_with_palette(color, theme, None, bold, dim)
+}
+
+pub fn resolve_fg_with_palette(
+    color: Color,
+    theme: &Theme,
+    palette: Option<&DynamicColorPalette>,
+    bold: bool,
+    dim: bool,
+) -> IColor {
     let base = match color {
         Color::Default => theme.terminal_foreground(),
-        Color::Indexed(idx) => color_256(idx, theme),
+        Color::Indexed(idx) => color_256(idx, theme, palette),
         Color::Rgb(r, g, b) => IColor::from_rgb8(r, g, b),
         _ => {
             let idx = ansi_index(color).unwrap();
             // VTE4: bold + standard color (0-7) promotes to bright variant (8-15)
             let idx = if bold && idx < 8 { idx + 8 } else { idx };
-            theme.ansi_color(idx)
+            palette
+                .and_then(|p| p[idx])
+                .map(|(r, g, b)| IColor::from_rgb8(r, g, b))
+                .unwrap_or_else(|| theme.ansi_color(idx))
         }
     };
     if dim {
@@ -52,20 +66,35 @@ pub fn resolve_fg(color: Color, theme: &Theme, bold: bool, dim: bool) -> IColor 
 }
 
 /// Resolve a background color using the theme palette.
+#[allow(dead_code)]
 pub fn resolve_bg(color: Color, theme: &Theme) -> IColor {
+    resolve_bg_with_palette(color, theme, None)
+}
+
+pub fn resolve_bg_with_palette(
+    color: Color,
+    theme: &Theme,
+    palette: Option<&DynamicColorPalette>,
+) -> IColor {
     match color {
         Color::Default => theme.terminal_background(),
-        Color::Indexed(idx) => color_256(idx, theme),
+        Color::Indexed(idx) => color_256(idx, theme, palette),
         Color::Rgb(r, g, b) => IColor::from_rgb8(r, g, b),
         _ => {
             let idx = ansi_index(color).unwrap();
-            theme.ansi_color(idx)
+            palette
+                .and_then(|p| p[idx])
+                .map(|(r, g, b)| IColor::from_rgb8(r, g, b))
+                .unwrap_or_else(|| theme.ansi_color(idx))
         }
     }
 }
 
 /// 256-color palette resolution using theme colors for indices 0-15.
-pub fn color_256(idx: u8, theme: &Theme) -> IColor {
+pub fn color_256(idx: u8, theme: &Theme, palette: Option<&DynamicColorPalette>) -> IColor {
+    if let Some((r, g, b)) = palette.and_then(|p| p[idx as usize]) {
+        return IColor::from_rgb8(r, g, b);
+    }
     match idx {
         0..=15 => theme.ansi_color(idx as usize),
         16..=231 => {

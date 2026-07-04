@@ -1,6 +1,6 @@
-use crate::color::{resolve_bg, resolve_fg};
+use crate::color::{resolve_bg_with_palette, resolve_fg_with_palette};
 use crate::search::SearchMatch;
-use crate::terminal::{TerminalCell, UnderlineStyle};
+use crate::terminal::{DynamicColorPalette, TerminalCell, UnderlineStyle};
 use crate::theme::Theme;
 
 use std::time::Instant;
@@ -133,6 +133,7 @@ pub struct TermWidget<'a, Message> {
     cursor_visible: bool,
     focused: bool,
     theme: &'a Theme,
+    dynamic_palette: Option<&'a DynamicColorPalette>,
     metrics: Metrics,
     mono: iced::Font,
     cjk_mono: Option<iced::Font>,
@@ -186,6 +187,7 @@ impl<'a, Message> TermWidget<'a, Message> {
             cursor_visible,
             focused,
             theme,
+            dynamic_palette: None,
             metrics,
             mono,
             cjk_mono,
@@ -229,6 +231,11 @@ impl<'a, Message> TermWidget<'a, Message> {
     /// Supply detected links to color, underline, and make clickable.
     pub fn links(mut self, links: &'a [crate::link::Link]) -> Self {
         self.links = links;
+        self
+    }
+
+    pub fn dynamic_palette(mut self, palette: &'a DynamicColorPalette) -> Self {
+        self.dynamic_palette = Some(palette);
         self
     }
 
@@ -616,10 +623,12 @@ where
                 if cell.flags.wide_continuation() {
                     continue;
                 }
-                let mut bg = resolve_bg(cell.background, self.theme);
-                let mut fg = resolve_fg(
+                let mut bg =
+                    resolve_bg_with_palette(cell.background, self.theme, self.dynamic_palette);
+                let mut fg = resolve_fg_with_palette(
                     cell.foreground,
                     self.theme,
+                    self.dynamic_palette,
                     cell.flags.bold(),
                     cell.flags.dim(),
                 );
@@ -745,14 +754,16 @@ where
                 let is_wide = cell.flags.wide();
                 let span = if is_wide { 2.0 } else { 1.0 };
                 let x = ox + col_idx as f32 * cw;
-                let mut fg = resolve_fg(
+                let mut fg = resolve_fg_with_palette(
                     cell.foreground,
                     self.theme,
+                    self.dynamic_palette,
                     cell.flags.bold(),
                     cell.flags.dim(),
                 );
                 if cell.flags.inverse() {
-                    fg = resolve_bg(cell.background, self.theme);
+                    fg =
+                        resolve_bg_with_palette(cell.background, self.theme, self.dynamic_palette);
                 }
                 let selected = sel_range.is_some_and(|(sc, ec)| col_idx >= sc && col_idx <= ec);
                 if selected {
