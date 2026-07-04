@@ -344,9 +344,16 @@ fn should_use_symbol_fallback_font(ch: char) -> bool {
     matches!(
         ch as u32,
         0x2190..=0x21FF
+            | 0x2200..=0x22FF
             | 0x2300..=0x23FF
             | 0x2500..=0x259F
             | 0x25A0..=0x25FF
+            | 0x2600..=0x26FF
+            | 0x2700..=0x27BF
+            | 0x27C0..=0x27FF
+            | 0x2800..=0x28FF
+            | 0x2900..=0x2AFF
+            | 0x2B00..=0x2BFF
     )
 }
 
@@ -404,7 +411,13 @@ mod tests {
     fn terminal_symbols_use_fallback_font() {
         assert!(should_use_symbol_fallback_font('⌃'));
         assert!(should_use_symbol_fallback_font('⌅'));
+        assert!(should_use_symbol_fallback_font('⋮'));
         assert!(should_use_symbol_fallback_font('─'));
+        assert!(should_use_symbol_fallback_font('☰'));
+        assert!(should_use_symbol_fallback_font('✓'));
+        assert!(should_use_symbol_fallback_font('⟂'));
+        assert!(should_use_symbol_fallback_font('⮕'));
+        assert!(should_use_symbol_fallback_font('⣿'));
         assert!(!should_use_symbol_fallback_font('中'));
         assert!(!should_use_symbol_fallback_font('A'));
     }
@@ -425,6 +438,18 @@ mod tests {
 
         assert_eq!(
             terminal_glyph_font('⌃', primary, Some(cjk), Some(symbol)),
+            symbol
+        );
+        assert_eq!(
+            terminal_glyph_font('⋮', primary, Some(cjk), Some(symbol)),
+            symbol
+        );
+        assert_eq!(
+            terminal_glyph_font('✓', primary, Some(cjk), Some(symbol)),
+            symbol
+        );
+        assert_eq!(
+            terminal_glyph_font('⣿', primary, Some(cjk), Some(symbol)),
             symbol
         );
         assert_eq!(

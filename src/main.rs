@@ -416,6 +416,9 @@ struct Jterm {
     blink_on: bool,
     win_size: Size,
     config_mtime: Option<std::time::SystemTime>,
+    /// Font-size changes are live-applied immediately and persisted on the next
+    /// config tick so restart restores the latest zoom level.
+    config_dirty: bool,
     link_detector: link::LinkDetector,
     links: Vec<link::Link>,
     /// `(active, grid_version, scroll_offset)` the cached `links` were computed for.
@@ -544,6 +547,7 @@ impl Jterm {
             blink_on: true,
             win_size,
             config_mtime,
+            config_dirty: false,
             link_detector: link::LinkDetector::new(link::LinkDetectionConfig::default()),
             links: Vec::new(),
             links_cache_key: None,
@@ -638,6 +642,7 @@ impl Jterm {
             return;
         }
         self.config.font_size = next;
+        self.config_dirty = true;
         self.apply_config();
     }
 
@@ -647,7 +652,23 @@ impl Jterm {
             return;
         }
         self.config.font_size = next;
+        self.config_dirty = true;
         self.apply_config();
+    }
+
+    fn persist_live_config(&mut self) {
+        if !self.config_dirty {
+            return;
+        }
+        match self.config.save() {
+            Ok(()) => {
+                self.config_mtime = Config::config_mtime();
+                self.config_dirty = false;
+            }
+            Err(e) => {
+                eprintln!("[Config] Live save failed: {}", e);
+            }
+        }
     }
 
     /// Whether the left dock is shown. Follows the manual `sidebar_open` toggle
@@ -2207,6 +2228,7 @@ impl Jterm {
             }
             Message::SetFontSize(v) => {
                 self.config.font_size = Config::clamp_font_size(v);
+                self.config_dirty = true;
                 self.apply_config();
             }
             Message::SetLineSpacing(v) => {
@@ -2330,15 +2352,18 @@ impl Jterm {
                     Err(e) => self.push_toast(format!("Save failed: {}", e), ToastKind::Warning),
                 }
                 self.config_mtime = Config::config_mtime();
+                self.config_dirty = false;
             }
             Message::ConfigReset => {
                 self.config = Config::default();
                 self.apply_config();
                 let _ = self.config.save();
                 self.config_mtime = Config::config_mtime();
+                self.config_dirty = false;
                 self.push_toast("Config reset to defaults", ToastKind::Info);
             }
             Message::ConfigTick => {
+                self.persist_live_config();
                 // Skip while editing so live (unsaved) edits aren't reverted.
                 if !self.config_panel_open {
                     let m = Config::config_mtime();
@@ -2348,6 +2373,7 @@ impl Jterm {
                             if let Ok(content) = std::fs::read_to_string(&path) {
                                 if let Ok(c) = toml::from_str::<Config>(&content) {
                                     self.config = c;
+                                    self.config_dirty = false;
                                     self.apply_config();
                                 }
                             }
