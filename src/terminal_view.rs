@@ -49,6 +49,7 @@ pub enum MouseInput {
         col: usize,
         row: usize,
         up: bool,
+        ctrl: bool,
         /// Number of whole lines this event scrolls (≥1).
         lines: usize,
     },
@@ -146,6 +147,7 @@ pub struct TermWidget<'a, Message> {
     current_match: Option<(usize, usize)>,
     shift: bool,
     alt: bool,
+    ctrl: bool,
     on_mouse: Option<Box<dyn Fn(MouseInput) -> Message + 'a>>,
     /// Detected clickable links in visible-grid coordinates (line = grid row).
     links: &'a [crate::link::Link],
@@ -194,6 +196,7 @@ impl<'a, Message> TermWidget<'a, Message> {
             current_match: None,
             shift: false,
             alt: false,
+            ctrl: false,
             on_mouse: None,
             links: &[],
             images: Vec::new(),
@@ -297,9 +300,10 @@ impl<'a, Message> TermWidget<'a, Message> {
     /// Supply the keyboard modifier state tracked by the application, used to
     /// distinguish selection (shift) and block-selection (alt) from app mouse
     /// reporting.
-    pub fn modifiers(mut self, shift: bool, alt: bool) -> Self {
+    pub fn modifiers(mut self, shift: bool, alt: bool, ctrl: bool) -> Self {
         self.shift = shift;
         self.alt = alt;
+        self.ctrl = ctrl;
         self
     }
 
@@ -552,6 +556,7 @@ where
                     col,
                     row,
                     up: whole > 0.0,
+                    ctrl: self.ctrl,
                     lines: whole.abs() as usize,
                 }));
                 shell.capture_event();

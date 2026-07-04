@@ -621,6 +621,24 @@ impl Jterm {
         self.relayout();
     }
 
+    fn adjust_font_size(&mut self, delta: f32) {
+        let next = Config::clamp_font_size(self.config.font_size + delta);
+        if (next - self.config.font_size).abs() < f32::EPSILON {
+            return;
+        }
+        self.config.font_size = next;
+        self.apply_config();
+    }
+
+    fn reset_font_size(&mut self) {
+        let next = Config::clamp_font_size(14.0);
+        if (next - self.config.font_size).abs() < f32::EPSILON {
+            return;
+        }
+        self.config.font_size = next;
+        self.apply_config();
+    }
+
     /// Whether the left dock is shown. Follows the manual `sidebar_open` toggle
     /// in both tab-position modes, so the dock can always be collapsed.
     fn dock_open(&self) -> bool {
@@ -1201,18 +1219,15 @@ impl Jterm {
                 Task::none()
             }
             C::FontZoomIn => {
-                self.config.font_size = Config::clamp_font_size(self.config.font_size + 1.0);
-                self.apply_config();
+                self.adjust_font_size(1.0);
                 Task::none()
             }
             C::FontZoomOut => {
-                self.config.font_size = Config::clamp_font_size(self.config.font_size - 1.0);
-                self.apply_config();
+                self.adjust_font_size(-1.0);
                 Task::none()
             }
             C::FontZoomReset => {
-                self.config.font_size = Config::clamp_font_size(14.0);
-                self.apply_config();
+                self.reset_font_size();
                 Task::none()
             }
         };
@@ -1435,8 +1450,14 @@ impl Jterm {
                 col,
                 row,
                 up,
+                ctrl,
                 lines,
             } => {
+                if ctrl {
+                    let delta = if up { 1.0 } else { -1.0 } * lines.max(1) as f32;
+                    self.adjust_font_size(delta);
+                    return Task::none();
+                }
                 if report_to_app {
                     let code = if up { 64 } else { 65 };
                     // One wheel report per line so apps see the full magnitude.
@@ -3036,7 +3057,11 @@ impl Jterm {
             sess.terminal.scroll_offset,
             sess.terminal.scrollback_len(),
         )
-        .modifiers(self.modifiers.shift(), self.modifiers.alt())
+        .modifiers(
+            self.modifiers.shift(),
+            self.modifiers.alt(),
+            self.modifiers.control(),
+        )
         .scrollbar_always(matches!(
             self.config.scrollbar_visibility,
             config::ScrollbarVisibility::Always
