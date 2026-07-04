@@ -5,6 +5,7 @@ use std::os::unix::io::RawFd;
 const TERM_PROGRAM_NAME: &str = "jterm3";
 const TERM_PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
 const VTE_VERSION: &str = "7802";
+const DEFAULT_SHELL_NAME: &str = "rsh";
 
 // 声明全局环境变量指针
 extern "C" {
@@ -81,7 +82,14 @@ mod unix_pty {
             );
         }
 
-        // Priority 2: the user's login shell, matching VTE terminals such as
+        // Priority 2: rsh is jterm3's preferred shell. It gets a session id
+        // argv below when one is available, while still letting users override
+        // it through config.shell.
+        if let Some(rsh_path) = find_executable_in_path(DEFAULT_SHELL_NAME) {
+            return rsh_path;
+        }
+
+        // Priority 3: the user's login shell, matching VTE terminals such as
         // GNOME Terminal and Terminator. `$SHELL` is usually already absolute;
         // passwd is the fallback when launchers sanitize the environment.
         if let Some(shell) = std::env::var_os("SHELL").and_then(|s| s.into_string().ok()) {
@@ -93,12 +101,12 @@ mod unix_pty {
             return shell;
         }
 
-        // Priority 3: bash (fallback)
+        // Priority 4: bash (fallback)
         if let Some(bash_path) = find_executable_in_path("bash") {
             return bash_path;
         }
 
-        // Priority 4: sh (last resort)
+        // Priority 5: sh (last resort)
         "sh".to_string()
     }
 
