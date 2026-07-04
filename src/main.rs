@@ -197,6 +197,7 @@ enum Message {
     SetScrollSpeed(u32),
     SetFontFamily(String),
     SetScrollbarAlways(bool),
+    SetDisableAltScreen(bool),
     ThemeEditOpen,
     ThemeEditClose,
     ThemeEditName(String),
@@ -278,6 +279,7 @@ impl Session {
         let master_fd = pty.master_fd();
         let mut terminal = TerminalState::new(cols, rows);
         terminal.set_max_scrollback(config.scrollback_lines);
+        terminal.set_disable_alt_screen(config.disable_alt_screen);
         let grid = terminal.get_visible_cells();
         let cursor = terminal.get_cursor_pos();
         let cursor_visible = terminal.is_cursor_visible();
@@ -612,6 +614,8 @@ impl Jterm {
         for sess in &mut self.sessions {
             sess.terminal
                 .set_max_scrollback(self.config.scrollback_lines);
+            sess.terminal
+                .set_disable_alt_screen(self.config.disable_alt_screen);
             if resized {
                 sess.terminal.on_resize(cols, rows);
                 let _ = sess.pty.resize(cols, rows);
@@ -2213,6 +2217,10 @@ impl Jterm {
                     config::ScrollbarVisibility::Auto
                 };
             }
+            Message::SetDisableAltScreen(disable) => {
+                self.config.disable_alt_screen = disable;
+                self.apply_config();
+            }
             Message::ThemeEditOpen => {
                 // Seed the editor from the current theme; suggest a fresh name so
                 // saving doesn't silently overwrite a builtin.
@@ -2969,6 +2977,21 @@ impl Jterm {
             .unwrap_or((self.cols, self.rows));
         let grid = format!("{}×{}", grid_cols, grid_rows);
         let pos = format!("{}:{}", cur_row + 1, cur_col + 1);
+        let scroll = sess
+            .map(|s| {
+                let prefix = if s.terminal.is_alt_buffer_active() {
+                    "alt "
+                } else {
+                    ""
+                };
+                format!(
+                    "{}{}/{}",
+                    prefix,
+                    s.terminal.scroll_offset,
+                    s.terminal.scrollback_len()
+                )
+            })
+            .unwrap_or_else(|| "0/0".to_string());
 
         let dim = self.c_text_dim();
         let dim_style = move |_t: &iced::Theme| text::Style { color: Some(dim) };
@@ -2976,6 +2999,7 @@ impl Jterm {
         let mut right = row![
             text(grid).size(11).style(dim_style),
             text(pos).size(11).style(dim_style),
+            text(scroll).size(11).style(dim_style),
         ]
         .spacing(14)
         .align_y(iced::Alignment::Center);
@@ -3608,6 +3632,16 @@ impl Jterm {
         .spacing(10)
         .align_y(iced::Alignment::Center);
 
+        let alt_screen_row = row![
+            text("Alt Screen").size(13).width(Length::Fixed(120.0)),
+            checkbox(self.config.disable_alt_screen)
+                .label("Disable")
+                .text_size(13)
+                .on_toggle(Message::SetDisableAltScreen),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+
         let tab_position_row = row![
             text("Tabs").size(13).width(Length::Fixed(120.0)),
             checkbox(self.config.tab_position == config::TabPosition::Side)
@@ -3648,6 +3682,7 @@ impl Jterm {
                 scrollback,
                 scroll_speed,
                 scrollbar_row,
+                alt_screen_row,
                 tab_position_row,
                 buttons,
                 footer,

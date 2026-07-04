@@ -930,6 +930,7 @@ pub struct TerminalState {
     pub scroll_offset: usize,
     max_scrollback: usize,
     use_alt_buffer: bool,
+    disable_alt_screen: bool,
 
     pub cursor_row: usize,
     pub cursor_col: usize,
@@ -1013,6 +1014,7 @@ pub struct TerminalState {
     // Synchronized output (mode 2026): suppress rendering until mode is cleared
     pub sync_output_active: bool,
     sync_output_start: Option<std::time::Instant>,
+    last_archived_screen_snapshot: Vec<String>,
 
     // OSC 52 clipboard set requests (selection_param, decoded_text)
     pub pending_osc52_clipboard_set: Option<String>,
@@ -1117,6 +1119,7 @@ impl TerminalState {
             scroll_offset: 0,
             max_scrollback: 10000,
             use_alt_buffer: false,
+            disable_alt_screen: false,
             cursor_row: 0,
             cursor_col: 0,
             saved_cursor_row: 0,
@@ -1165,6 +1168,7 @@ impl TerminalState {
             osc8_hyperlinks: Vec::new(),
             sync_output_active: false,
             sync_output_start: None,
+            last_archived_screen_snapshot: Vec::new(),
             pending_osc52_clipboard_set: None,
             pending_osc52_clipboard_query: false,
             command_zones: VecDeque::new(),
@@ -1684,8 +1688,61 @@ impl TerminalState {
         }
     }
 
+    fn line_is_blank(&self, row: usize) -> bool {
+        let blank = self.create_blank_cell();
+        self.grid[row].iter().all(|cell| {
+            cell.character == blank.character
+                && cell.foreground == blank.foreground
+                && cell.background == blank.background
+                && cell.flags == blank.flags
+        })
+    }
+
+    fn archive_visible_screen_to_scrollback(&mut self) {
+        self.archive_visible_screen_to_scrollback_with_options(false, false);
+    }
+
+    fn archive_visible_screen_to_scrollback_with_options(
+        &mut self,
+        allow_alt_buffer: bool,
+        dedupe_snapshot: bool,
+    ) {
+        if (self.use_alt_buffer && !allow_alt_buffer) || self.grid.rows() == 0 {
+            return;
+        }
+
+        let first = (0..self.grid.rows()).find(|&row| !self.line_is_blank(row));
+        let last = (0..self.grid.rows()).rfind(|&row| !self.line_is_blank(row));
+        let (Some(first), Some(last)) = (first, last) else {
+            return;
+        };
+
+        if dedupe_snapshot {
+            let snapshot: Vec<String> = (first..=last)
+                .map(|row| self.grid[row].iter().map(|cell| cell.character).collect())
+                .collect();
+            if snapshot == self.last_archived_screen_snapshot {
+                return;
+            }
+            self.last_archived_screen_snapshot = snapshot;
+        }
+
+        for row in first..=last {
+            let line = ScrollbackLine::compress(&self.grid[row], self.grid.row_wrapped[row]);
+            self.push_scrollback_compressed_with_options(line, allow_alt_buffer);
+        }
+    }
+
     fn push_scrollback_compressed(&mut self, line: ScrollbackLine) {
-        if self.use_alt_buffer {
+        self.push_scrollback_compressed_with_options(line, false);
+    }
+
+    fn push_scrollback_compressed_with_options(
+        &mut self,
+        line: ScrollbackLine,
+        allow_alt_buffer: bool,
+    ) {
+        if self.use_alt_buffer && !allow_alt_buffer {
             return;
         }
         if self.scrollback.len() >= self.max_scrollback {
@@ -1729,14 +1786,16 @@ impl TerminalState {
 
         // Compress the removed line directly from the grid slice before mutating,
         // avoiding a per-line Vec allocation from get_row.
-        let scrollback_line = if is_full_screen_region && !self.use_alt_buffer {
-            Some(ScrollbackLine::compress(
-                &self.grid[top],
-                self.grid.row_wrapped[top],
-            ))
-        } else {
-            None
-        };
+        let allow_alt_scrollback = self.use_alt_buffer && self.sync_output_active;
+        let scrollback_line =
+            if is_full_screen_region && (!self.use_alt_buffer || allow_alt_scrollback) {
+                Some(ScrollbackLine::compress(
+                    &self.grid[top],
+                    self.grid.row_wrapped[top],
+                ))
+            } else {
+                None
+            };
 
         let src_start = (top + 1) * cols;
         let src_end = (bottom + 1) * cols;
@@ -1751,7 +1810,7 @@ impl TerminalState {
         self.mark_rows_dirty(top, bottom);
 
         if let Some(line) = scrollback_line {
-            self.push_scrollback_compressed(line);
+            self.push_scrollback_compressed_with_options(line, allow_alt_scrollback);
         }
     }
 
@@ -2853,8 +2912,14 @@ impl TerminalState {
             }
             'r' => {
                 // Set scroll region (DECSTBM)
-                let top = params.first().copied().unwrap_or(1) as usize;
-                let bottom = params.get(1).copied().unwrap_or(self.grid.rows() as u16) as usize;
+                let top = match params.first().copied().unwrap_or(1) {
+                    0 => 1,
+                    v => v as usize,
+                };
+                let bottom = match params.get(1).copied().unwrap_or(self.grid.rows() as u16) {
+                    0 => self.grid.rows(),
+                    v => v as usize,
+                };
 
                 // Convert from 1-indexed to 0-indexed, and clamp to valid range
                 self.scroll_region_top = top
@@ -3209,6 +3274,7 @@ impl TerminalState {
 
     /// Erase the whole screen WITHOUT moving the cursor (ED / CSI 2 J).
     fn clear_screen_no_home(&mut self) {
+        self.archive_visible_screen_to_scrollback();
         let bg_color = self.current_bg;
         for row in self.grid.iter_mut() {
             for cell in row.iter_mut() {
@@ -3266,6 +3332,9 @@ impl TerminalState {
                 self.modes.insert(1048);
             }
             47 | 1047 | 1049 => {
+                if self.disable_alt_screen {
+                    return;
+                }
                 // Alternate screen buffer (47/1047 = swap only, 1049 also saves
                 // the main-screen cursor). We treat all three as a buffer swap.
                 if !self.use_alt_buffer {
@@ -3359,6 +3428,9 @@ impl TerminalState {
                 self.modes.remove(&1048);
             }
             47 | 1047 | 1049 => {
+                if self.disable_alt_screen {
+                    return;
+                }
                 // Restore main screen buffer
                 if self.use_alt_buffer {
                     // Save alt buffer state (cursor position)
@@ -3404,6 +3476,8 @@ impl TerminalState {
             }
             2026 => {
                 // End synchronized output: force full render
+                let allow_alt_scrollback = self.use_alt_buffer;
+                self.archive_visible_screen_to_scrollback_with_options(allow_alt_scrollback, true);
                 self.modes.remove(&2026);
                 self.sync_output_active = false;
                 self.sync_output_start = None;
@@ -3432,9 +3506,10 @@ impl TerminalState {
     }
 
     /// Set the absolute scrollback offset (0 = live view at bottom), clamped.
-    /// No-op while the alternate screen buffer is active.
+    /// In alternate screen, this is allowed only when a synchronized full-screen
+    /// app has produced local history snapshots.
     pub fn set_scroll_offset(&mut self, offset: usize) {
-        if self.use_alt_buffer {
+        if self.use_alt_buffer && self.scrollback.is_empty() {
             return;
         }
         self.scroll_offset = offset.min(self.scrollback.len());
@@ -3448,6 +3523,10 @@ impl TerminalState {
         }
 
         self.scroll_offset = self.scroll_offset.min(self.scrollback.len());
+    }
+
+    pub fn set_disable_alt_screen(&mut self, disable_alt_screen: bool) {
+        self.disable_alt_screen = disable_alt_screen;
     }
 
     pub fn is_cursor_visible(&self) -> bool {
@@ -4051,8 +4130,10 @@ impl TerminalState {
     }
 
     pub fn scroll(&mut self, lines: isize) {
-        // Don't scroll scrollback when in alternate screen buffer (less, vim, git log, etc.)
-        if self.use_alt_buffer {
+        // Don't scroll ordinary alternate-screen apps (less, vim, git log, etc.).
+        // Synchronized TUIs such as Codex may archive snapshots into local
+        // scrollback, in which case wheel/scrollbar navigation should work.
+        if self.use_alt_buffer && self.scrollback.is_empty() {
             return;
         }
 
@@ -4271,6 +4352,81 @@ mod tests {
 
         assert_eq!(terminal.scroll_region_top, 0);
         assert_eq!(terminal.scroll_region_bottom, 5);
+    }
+
+    #[test]
+    fn decstbm_zero_bottom_defaults_to_full_screen() {
+        let mut terminal = TerminalState::new(4, 4);
+
+        terminal.process_input(b"\x1b[1;0r");
+
+        assert_eq!(terminal.scroll_region_top, 0);
+        assert_eq!(terminal.scroll_region_bottom, 3);
+    }
+
+    #[test]
+    fn codex_resume_style_output_populates_scrollback() {
+        let mut terminal = TerminalState::new(8, 3);
+
+        terminal.process_input(b"\x1b[?2026h\x1b[1;0r\x1b[1;1H");
+        terminal.process_input(b"line-1\r\nline-2\r\nline-3\r\nline-4\r\nline-5\r\n");
+        terminal.process_input(b"\x1b[?2026l");
+
+        assert!(
+            terminal.scrollback_len() >= 3,
+            "expected resumed TUI output to enter scrollback"
+        );
+
+        terminal.scroll(2);
+        let visible = terminal.get_visible_cells();
+        let text: String = visible[0]
+            .iter()
+            .map(|cell| cell.character)
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+
+        assert!(
+            text.starts_with("line-"),
+            "expected scrollback viewport to show historical output, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn synchronized_alt_screen_snapshots_can_be_scrolled() {
+        let mut terminal = TerminalState::new(12, 3);
+
+        terminal.process_input(b"\x1b[?1049h");
+        assert!(terminal.is_alt_buffer_active());
+
+        terminal.process_input(b"\x1b[?2026h\x1b[1;1H");
+        terminal.process_input(b"first page\r\nalpha\r\nomega");
+        terminal.process_input(b"\x1b[?2026l");
+        terminal.process_input(b"\x1b[?2026h\x1b[1;1H");
+        terminal.process_input(b"second page\r\nbeta\r\ndone ");
+        terminal.process_input(b"\x1b[?2026l");
+
+        assert!(
+            terminal.scrollback_len() >= 6,
+            "expected synchronized alt-screen snapshots in scrollback"
+        );
+
+        terminal.scroll(3);
+        assert!(terminal.scroll_offset > 0);
+        let visible = terminal.get_visible_cells();
+        let text = visible
+            .iter()
+            .flat_map(|row| {
+                row.iter()
+                    .map(|cell| cell.character)
+                    .chain(std::iter::once('\n'))
+            })
+            .collect::<String>();
+
+        assert!(
+            text.contains("first page") || text.contains("second page"),
+            "expected archived synchronized screen content, got {text:?}"
+        );
     }
 
     #[test]
@@ -4675,6 +4831,51 @@ mod tests {
         );
         assert_eq!(terminal.scroll_region_top, 0);
         assert_eq!(terminal.scroll_region_bottom, 3);
+    }
+
+    #[test]
+    fn erase_display_archives_visible_primary_screen_into_scrollback() {
+        let mut terminal = TerminalState::new(8, 3);
+        terminal.process_input(b"one\r\ntwo\r\nthree");
+
+        terminal.process_input(b"\x1b[2J");
+
+        assert_eq!(terminal.scrollback.len(), 3);
+        assert_eq!(terminal.scrollback[0].decompress()[0].character, 'o');
+        assert_eq!(terminal.scrollback[1].decompress()[0].character, 't');
+        assert_eq!(terminal.scrollback[2].decompress()[0].character, 't');
+        assert!(terminal
+            .grid
+            .iter()
+            .flatten()
+            .all(|cell| cell.character == ' '));
+    }
+
+    #[test]
+    fn entering_alt_buffer_does_not_archive_primary_screen() {
+        let mut terminal = TerminalState::new(4, 3);
+        terminal.process_input(b"main");
+
+        terminal.process_input(b"\x1b[?1049h");
+
+        assert!(terminal.scrollback.is_empty());
+        assert!(terminal.is_alt_buffer_active());
+    }
+
+    #[test]
+    fn disable_alt_screen_ignores_alt_buffer_switch_sequences() {
+        let mut terminal = TerminalState::new(4, 3);
+        terminal.set_disable_alt_screen(true);
+        terminal.process_input(b"main");
+
+        terminal.process_input(b"\x1b[?1049h");
+        terminal.process_input(b"\x1b[2;2HXY");
+        terminal.process_input(b"\x1b[?1049l");
+
+        assert!(!terminal.is_alt_buffer_active());
+        assert_eq!(terminal.grid[0][0].character, 'm');
+        assert_eq!(terminal.grid[1][1].character, 'X');
+        assert_eq!(terminal.grid[1][2].character, 'Y');
     }
 
     #[test]

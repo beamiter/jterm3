@@ -136,6 +136,9 @@ pub struct Config {
     pub scroll_speed: u32,
 
     #[serde(default)]
+    pub disable_alt_screen: bool,
+
+    #[serde(default)]
     pub ui_scale: Option<f32>,
 
     #[serde(default = "default_subpixel_rendering")]
@@ -301,6 +304,7 @@ impl Default for Config {
             gpu_rendering: default_gpu_rendering(),
             app_renderer: AppRendererType::default(),
             scroll_speed: default_scroll_speed(),
+            disable_alt_screen: false,
             subpixel_rendering: default_subpixel_rendering(),
             ui_scale: None,
             shell: None,
