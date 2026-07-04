@@ -163,6 +163,7 @@ enum Message {
     Focus(bool),
     NewSession,
     CloseTab(usize),
+    WindowClose,
     TabHover(Option<usize>),
     /// User pressed the mouse over tab `usize` — start tracking a potential drag.
     TabDragStart(usize),
@@ -404,6 +405,7 @@ struct Jterm {
     modifiers: keyboard::Modifiers,
     mono: iced::Font,
     cjk_mono: Option<iced::Font>,
+    symbol_mono: Option<iced::Font>,
     search: search::SearchState,
     palette: command_palette::PaletteState,
     keybindings: keybindings::KeyBindings,
@@ -502,6 +504,7 @@ impl Jterm {
 
         let mono = resolve_mono_font(&config.font_family);
         let cjk_mono = resolve_optional_font(Config::cjk_monospace_font_family());
+        let symbol_mono = resolve_optional_font(Config::symbol_monospace_font_family());
 
         // Restore prior tabs (their cwds + active index) when enabled and we are
         // the first instance; otherwise start with a single default session.
@@ -531,6 +534,7 @@ impl Jterm {
             modifiers: keyboard::Modifiers::default(),
             mono,
             cjk_mono,
+            symbol_mono,
             search: search::SearchState::new(),
             palette: command_palette::PaletteState::new(),
             keybindings: load_keybindings(),
@@ -598,6 +602,7 @@ impl Jterm {
         self.theme = Theme::get_theme(&self.config.theme).unwrap_or_default();
         self.mono = resolve_mono_font(&self.config.font_family);
         self.cjk_mono = resolve_optional_font(Config::cjk_monospace_font_family());
+        self.symbol_mono = resolve_optional_font(Config::symbol_monospace_font_family());
         self.metrics = Metrics::new(
             self.config.font_size,
             self.config.line_spacing,
@@ -1101,9 +1106,8 @@ impl Jterm {
                 self.new_session();
                 Task::none()
             }
-            C::SessionClose | C::WindowClose => {
-                return Some(self.request_close_session(self.active))
-            }
+            C::SessionClose => return Some(self.request_close_session(self.active)),
+            C::WindowClose => return Some(iced::exit()),
             C::SessionNext => {
                 self.next_session();
                 Task::none()
@@ -1411,7 +1415,7 @@ impl Jterm {
                 if report_to_app {
                     if let Some(report) = sess.terminal.get_mouse_report(btn_code(button), col, row)
                     {
-                        sess.write_pty(report.as_bytes());
+                        sess.write_pty(&report);
                     }
                     return Task::none();
                 }
@@ -1437,7 +1441,7 @@ impl Jterm {
                 if report_to_app {
                     if sess.terminal.is_mouse_motion_enabled() {
                         if let Some(report) = sess.terminal.get_mouse_report(32, col, row) {
-                            sess.write_pty(report.as_bytes());
+                            sess.write_pty(&report);
                         }
                     }
                     return Task::none();
@@ -1450,7 +1454,7 @@ impl Jterm {
                         sess.terminal
                             .get_mouse_release_report(btn_code(button), col, row)
                     {
-                        sess.write_pty(report.as_bytes());
+                        sess.write_pty(&report);
                     }
                     return Task::none();
                 }
@@ -1477,7 +1481,7 @@ impl Jterm {
                     // One wheel report per line so apps see the full magnitude.
                     for _ in 0..lines.max(1) {
                         if let Some(report) = sess.terminal.get_mouse_report(code, col, row) {
-                            sess.write_pty(report.as_bytes());
+                            sess.write_pty(&report);
                         }
                     }
                     return Task::none();
@@ -2058,6 +2062,7 @@ impl Jterm {
             }
             Message::NewSession => self.new_session(),
             Message::CloseTab(i) => return self.request_close_session(i),
+            Message::WindowClose => return iced::exit(),
             Message::TabHover(i) => self.hovered_tab = i,
             Message::TabDragStart(i) => {
                 if i < self.sessions.len() {
@@ -2673,11 +2678,7 @@ impl Jterm {
                     .padding([3, 8])
                     .style(self.ghost_btn_style()),
             );
-            return container(tabs)
-                .width(Length::Fill)
-                .height(Length::Fixed(TAB_BAR_H))
-                .style(self.chrome_bar_style())
-                .into();
+            return self.top_bar_with_close(tabs.into());
         }
         // Dock the tab strip into the left sidebar (vertical tab list).
         tabs = tabs.push(
@@ -2744,7 +2745,18 @@ impl Jterm {
                 scrollable::Scrollbar::new().width(0).scroller_width(0),
             ))
             .width(Length::Fill);
-        container(scroller)
+        self.top_bar_with_close(scroller.into())
+    }
+
+    fn top_bar_with_close<'a>(&'a self, content: Element<'a, Message>) -> Element<'a, Message> {
+        let close = button(text("×").size(14))
+            .on_press(Message::WindowClose)
+            .padding([3, 9])
+            .style(self.close_btn_style());
+        let bar = row![container(content).width(Length::Fill), close]
+            .align_y(iced::Alignment::Center)
+            .width(Length::Fill);
+        container(bar)
             .width(Length::Fill)
             .height(Length::Fixed(TAB_BAR_H))
             .style(self.chrome_bar_style())
@@ -3085,11 +3097,13 @@ impl Jterm {
             &sess.grid,
             sess.cursor,
             sess.cursor_visible,
+            sess.terminal.cursor_shape,
             focused,
             &self.theme,
             self.metrics,
             self.mono,
             self.cjk_mono,
+            self.symbol_mono,
             selection,
             sess.terminal.scroll_offset,
             sess.terminal.scrollback_len(),

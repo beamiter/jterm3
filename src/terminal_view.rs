@@ -1,6 +1,6 @@
 use crate::color::{resolve_bg_with_palette, resolve_fg_with_palette};
 use crate::search::SearchMatch;
-use crate::terminal::{DynamicColorPalette, TerminalCell, UnderlineStyle};
+use crate::terminal::{CursorShape, DynamicColorPalette, TerminalCell, UnderlineStyle};
 use crate::theme::Theme;
 
 use std::time::Instant;
@@ -131,12 +131,14 @@ pub struct TermWidget<'a, Message> {
     grid: &'a [Vec<TerminalCell>],
     cursor: (usize, usize),
     cursor_visible: bool,
+    cursor_shape: CursorShape,
     focused: bool,
     theme: &'a Theme,
     dynamic_palette: Option<&'a DynamicColorPalette>,
     metrics: Metrics,
     mono: iced::Font,
     cjk_mono: Option<iced::Font>,
+    symbol_mono: Option<iced::Font>,
     /// Per visible row: the inclusive (start_col, end_col) span to highlight,
     /// or `None` for rows with no selection. `end_col` may exceed the row width.
     selection: Vec<Option<(usize, usize)>>,
@@ -172,11 +174,13 @@ impl<'a, Message> TermWidget<'a, Message> {
         grid: &'a [Vec<TerminalCell>],
         cursor: (usize, usize),
         cursor_visible: bool,
+        cursor_shape: CursorShape,
         focused: bool,
         theme: &'a Theme,
         metrics: Metrics,
         mono: iced::Font,
         cjk_mono: Option<iced::Font>,
+        symbol_mono: Option<iced::Font>,
         selection: Vec<Option<(usize, usize)>>,
         scroll_offset: usize,
         scrollback_len: usize,
@@ -185,12 +189,14 @@ impl<'a, Message> TermWidget<'a, Message> {
             grid,
             cursor,
             cursor_visible,
+            cursor_shape,
             focused,
             theme,
             dynamic_palette: None,
             metrics,
             mono,
             cjk_mono,
+            symbol_mono,
             selection,
             scroll_offset,
             scrollback_len,
@@ -334,7 +340,17 @@ impl<'a, Message> TermWidget<'a, Message> {
     }
 }
 
-fn should_use_cjk_font(ch: char) -> bool {
+fn should_use_symbol_fallback_font(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x2190..=0x21FF
+            | 0x2300..=0x23FF
+            | 0x2500..=0x259F
+            | 0x25A0..=0x25FF
+    )
+}
+
+fn should_use_cjk_fallback_font(ch: char) -> bool {
     matches!(
         ch as u32,
         0x2E80..=0x2EFF
@@ -354,12 +370,71 @@ fn should_use_cjk_font(ch: char) -> bool {
     )
 }
 
+fn terminal_glyph_font(
+    ch: char,
+    primary: iced::Font,
+    cjk: Option<iced::Font>,
+    symbol: Option<iced::Font>,
+) -> iced::Font {
+    if should_use_symbol_fallback_font(ch) {
+        symbol.unwrap_or(iced::Font::MONOSPACE)
+    } else if should_use_cjk_fallback_font(ch) {
+        cjk.unwrap_or(primary)
+    } else {
+        primary
+    }
+}
+
 fn solid_quad(bounds: Rectangle) -> Quad {
     Quad {
         bounds,
         border: Border::default(),
         shadow: Shadow::default(),
         snap: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        should_use_cjk_fallback_font, should_use_symbol_fallback_font, terminal_glyph_font,
+    };
+
+    #[test]
+    fn terminal_symbols_use_fallback_font() {
+        assert!(should_use_symbol_fallback_font('⌃'));
+        assert!(should_use_symbol_fallback_font('⌅'));
+        assert!(should_use_symbol_fallback_font('─'));
+        assert!(!should_use_symbol_fallback_font('中'));
+        assert!(!should_use_symbol_fallback_font('A'));
+    }
+
+    #[test]
+    fn cjk_uses_cjk_fallback_font() {
+        assert!(should_use_cjk_fallback_font('中'));
+        assert!(should_use_cjk_fallback_font('あ'));
+        assert!(!should_use_cjk_fallback_font('⌃'));
+        assert!(!should_use_cjk_fallback_font('A'));
+    }
+
+    #[test]
+    fn symbol_font_is_preferred_for_terminal_symbols() {
+        let primary = iced::Font::with_name("Primary");
+        let cjk = iced::Font::with_name("Cjk");
+        let symbol = iced::Font::with_name("Symbol");
+
+        assert_eq!(
+            terminal_glyph_font('⌃', primary, Some(cjk), Some(symbol)),
+            symbol
+        );
+        assert_eq!(
+            terminal_glyph_font('中', primary, Some(cjk), Some(symbol)),
+            cjk
+        );
+        assert_eq!(
+            terminal_glyph_font('A', primary, Some(cjk), Some(symbol)),
+            primary
+        );
     }
 }
 
@@ -770,10 +845,8 @@ where
                 }
                 let glyph_font = if cell.flags.italic() {
                     italic_font
-                } else if should_use_cjk_font(glyph) {
-                    self.cjk_mono.unwrap_or(font)
                 } else {
-                    font
+                    terminal_glyph_font(glyph, font, self.cjk_mono, self.symbol_mono)
                 };
                 // Blink: during the off phase, blinking cells show no glyph.
                 let blink_hidden = cell.flags.blink() && !self.blink_on;
@@ -907,49 +980,65 @@ where
             } else {
                 cw
             };
-            if self.focused {
-                renderer.fill_quad(
-                    solid_quad(Rectangle {
+            let shape_bounds = match self.cursor_shape {
+                CursorShape::Block => Rectangle {
+                    x,
+                    y,
+                    width: cursor_w,
+                    height: ch,
+                },
+                CursorShape::Underline => {
+                    let h = (ch * 0.12).clamp(1.0, 3.0);
+                    Rectangle {
                         x,
-                        y,
+                        y: y + ch - h,
                         width: cursor_w,
-                        height: ch,
-                    }),
-                    Background::Color(cur),
-                );
-                if let Some(cell) = cursor_cell {
-                    let glyph = cell.character;
-                    if glyph != ' ' && glyph != '\0' {
-                        renderer.fill_text(
-                            Text {
-                                content: glyph.to_string(),
-                                bounds: Size::new(cursor_w, ch),
-                                size: Pixels(self.metrics.font_size),
-                                line_height: text::LineHeight::Absolute(Pixels(ch)),
-                                font: if should_use_cjk_font(glyph) {
-                                    self.cjk_mono.unwrap_or(self.mono)
-                                } else {
-                                    self.mono
-                                },
-                                align_x: text::Alignment::Center,
-                                align_y: iced::alignment::Vertical::Center,
-                                shaping: text::Shaping::Basic,
-                                wrapping: text::Wrapping::None,
-                            },
-                            Point::new(x + cursor_w / 2.0, y + ch / 2.0),
-                            default_bg,
-                            clip,
-                        );
+                        height: h,
                     }
                 }
-            } else {
-                let cursor_border = Quad {
-                    bounds: Rectangle {
+                CursorShape::Beam => {
+                    let w = (cw * 0.12).clamp(1.0, 3.0);
+                    Rectangle {
                         x,
                         y,
-                        width: cursor_w,
+                        width: w,
                         height: ch,
-                    },
+                    }
+                }
+            };
+            if self.focused {
+                renderer.fill_quad(solid_quad(shape_bounds), Background::Color(cur));
+                if self.cursor_shape == CursorShape::Block {
+                    if let Some(cell) = cursor_cell {
+                        let glyph = cell.character;
+                        if glyph != ' ' && glyph != '\0' {
+                            renderer.fill_text(
+                                Text {
+                                    content: glyph.to_string(),
+                                    bounds: Size::new(cursor_w, ch),
+                                    size: Pixels(self.metrics.font_size),
+                                    line_height: text::LineHeight::Absolute(Pixels(ch)),
+                                    font: terminal_glyph_font(
+                                        glyph,
+                                        self.mono,
+                                        self.cjk_mono,
+                                        self.symbol_mono,
+                                    ),
+                                    align_x: text::Alignment::Center,
+                                    align_y: iced::alignment::Vertical::Center,
+                                    shaping: text::Shaping::Basic,
+                                    wrapping: text::Wrapping::None,
+                                },
+                                Point::new(x + cursor_w / 2.0, y + ch / 2.0),
+                                default_bg,
+                                clip,
+                            );
+                        }
+                    }
+                }
+            } else if self.cursor_shape == CursorShape::Block {
+                let cursor_border = Quad {
+                    bounds: shape_bounds,
                     border: Border {
                         color: cur,
                         width: 1.0,
@@ -959,6 +1048,8 @@ where
                     snap: true,
                 };
                 renderer.fill_quad(cursor_border, Background::Color(Color::TRANSPARENT));
+            } else {
+                renderer.fill_quad(solid_quad(shape_bounds), Background::Color(cur));
             }
         }
 

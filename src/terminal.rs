@@ -265,12 +265,12 @@ pub enum Color {
     Default,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CursorShape {
     #[default]
-    Block, // 0 or 1 - block cursor (default)
-    Underline, // 2 - underline cursor
-    Beam,      // 3 - beam/vertical line cursor
+    Block,
+    Underline,
+    Beam,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -959,6 +959,8 @@ pub struct TerminalState {
     current_bg: Color,
     current_flags: StyleFlags,
     pub window_title: String,
+    icon_title: String,
+    title_stack: Vec<(Option<String>, Option<String>)>,
 
     // Global background color set by vim (CSI ... m)
     pub global_bg: Color,
@@ -1145,6 +1147,8 @@ impl TerminalState {
             current_bg: Color::Default,
             current_flags: StyleFlags::default(),
             window_title: String::new(),
+            icon_title: String::new(),
+            title_stack: Vec::new(),
             global_bg: Color::Default,
             utf8_buf: [0; 4],
             utf8_len: 0,
@@ -1289,6 +1293,15 @@ impl TerminalState {
                 "12" => self.dynamic_cursor_color = Some(rgb),
                 _ => {}
             }
+        }
+    }
+
+    fn reset_osc_color(&mut self, command: &str) {
+        match command {
+            "110" => self.dynamic_fg = None,
+            "111" => self.dynamic_bg = None,
+            "112" => self.dynamic_cursor_color = None,
+            _ => {}
         }
     }
 
@@ -1524,12 +1537,54 @@ impl TerminalState {
         self.output_buffer.extend_from_slice(response.as_bytes());
     }
 
-    fn sanitized_title(&self) -> String {
-        self.window_title
+    fn sanitized_title(title: &str) -> String {
+        title
             .chars()
             .filter(|&ch| ch != '\x1b' && ch != '\x07')
             .take(1024)
             .collect()
+    }
+
+    fn save_titles(&mut self, target: u16) {
+        if self.title_stack.len() >= 16 {
+            self.title_stack.remove(0);
+        }
+        match target {
+            1 => self.title_stack.push((Some(self.icon_title.clone()), None)),
+            2 => self
+                .title_stack
+                .push((None, Some(self.window_title.clone()))),
+            _ => self.title_stack.push((
+                Some(self.icon_title.clone()),
+                Some(self.window_title.clone()),
+            )),
+        }
+    }
+
+    fn restore_titles(&mut self, target: u16) {
+        let Some((icon_title, window_title)) = self.title_stack.pop() else {
+            return;
+        };
+        match target {
+            1 => {
+                if let Some(icon_title) = icon_title {
+                    self.icon_title = icon_title;
+                }
+            }
+            2 => {
+                if let Some(window_title) = window_title {
+                    self.window_title = window_title;
+                }
+            }
+            _ => {
+                if let Some(icon_title) = icon_title {
+                    self.icon_title = icon_title;
+                }
+                if let Some(window_title) = window_title {
+                    self.window_title = window_title;
+                }
+            }
+        }
     }
 
     fn handle_window_ops(&mut self, params: &[u16]) {
@@ -1563,13 +1618,18 @@ impl TerminalState {
             }
             // Report icon label / window title.
             20 => {
-                let response = format!("\x1b]L{}\x1b\\", self.sanitized_title());
+                let response = format!("\x1b]L{}\x1b\\", Self::sanitized_title(&self.icon_title));
                 self.output_buffer.extend_from_slice(response.as_bytes());
             }
             21 => {
-                let response = format!("\x1b]l{}\x1b\\", self.sanitized_title());
+                let response = format!("\x1b]l{}\x1b\\", Self::sanitized_title(&self.window_title));
                 self.output_buffer.extend_from_slice(response.as_bytes());
             }
+            // Save/restore icon/window title. Parameter 0 means both; 1 icon;
+            // 2 window, matching xterm/VTE title stack behavior closely enough
+            // for shells that temporarily annotate the title.
+            22 => self.save_titles(params.get(1).copied().unwrap_or(0)),
+            23 => self.restore_titles(params.get(1).copied().unwrap_or(0)),
             _ => {}
         }
     }
@@ -1581,10 +1641,30 @@ impl TerminalState {
     fn wrap_to_next_line(&mut self) {
         self.grid.row_wrapped[self.cursor_row] = true;
         self.cursor_col = 0;
+        self.index();
+    }
+
+    /// IND / LF: move down one row, scrolling the active region at the bottom.
+    fn index(&mut self) {
         if self.cursor_row == self.scroll_region_bottom {
             self.scroll_region_up(self.scroll_region_top, self.scroll_region_bottom);
         } else if self.cursor_row + 1 < self.grid.rows() {
             self.cursor_row += 1;
+        }
+    }
+
+    /// NEL: carriage return plus IND.
+    fn next_line(&mut self) {
+        self.cursor_col = 0;
+        self.index();
+    }
+
+    /// RI: move up one row, scrolling the active region down at the top.
+    fn reverse_index(&mut self) {
+        if self.cursor_row == self.scroll_region_top {
+            self.scroll_region_down(self.scroll_region_top, self.scroll_region_bottom);
+        } else if self.cursor_row > 0 {
+            self.cursor_row -= 1;
         }
     }
 
@@ -2215,13 +2295,7 @@ impl TerminalState {
                 }
                 b'\n' => {
                     // Linefeed - move cursor down or scroll the region.
-                    // Only scroll when exactly on the region's bottom row; when the
-                    // cursor is below the region just move down (don't scroll).
-                    if self.cursor_row == self.scroll_region_bottom {
-                        self.scroll_region_up(self.scroll_region_top, self.scroll_region_bottom);
-                    } else if self.cursor_row + 1 < self.grid.rows() {
-                        self.cursor_row += 1;
-                    }
+                    self.index();
                     i += 1;
                 }
                 b'\r' => {
@@ -2267,15 +2341,17 @@ impl TerminalState {
                         }
                         b'E' => {
                             // NEL - Next Line (linefeed + carriage return)
-                            self.cursor_col = 0;
-                            if self.cursor_row == self.scroll_region_bottom {
-                                self.scroll_region_up(
-                                    self.scroll_region_top,
-                                    self.scroll_region_bottom,
-                                );
-                            } else if self.cursor_row + 1 < self.grid.rows() {
-                                self.cursor_row += 1;
-                            }
+                            self.next_line();
+                            i += 2;
+                        }
+                        b'D' => {
+                            // IND - Index (linefeed without carriage return)
+                            self.index();
+                            i += 2;
+                        }
+                        b'M' => {
+                            // RI - Reverse Index
+                            self.reverse_index();
                             i += 2;
                         }
                         b'H' => {
@@ -2340,7 +2416,15 @@ impl TerminalState {
                                     let (command, value) =
                                         payload.split_once(';').unwrap_or((payload, ""));
                                     if !command.is_empty() {
-                                        if command == "0" || command == "2" {
+                                        if command == "0" {
+                                            self.icon_title.clear();
+                                            self.icon_title.push_str(value);
+                                            self.window_title.clear();
+                                            self.window_title.push_str(value);
+                                        } else if command == "1" {
+                                            self.icon_title.clear();
+                                            self.icon_title.push_str(value);
+                                        } else if command == "2" {
                                             self.window_title.clear();
                                             self.window_title.push_str(value);
                                         } else if command == "8" {
@@ -2372,12 +2456,17 @@ impl TerminalState {
                                             || command == "12"
                                         {
                                             self.handle_osc_color(command, value);
+                                        } else if command == "110"
+                                            || command == "111"
+                                            || command == "112"
+                                        {
+                                            self.reset_osc_color(command);
                                         } else if command == "104" {
                                             self.reset_osc_palette(value);
                                         } else if command == "9" {
                                             // Desktop notification (iTerm2/ConEmu)
                                             if self.pending_notifications.len() < 8 {
-                                                let title = "jterm2".to_string();
+                                                let title = "jterm3".to_string();
                                                 let body = value.chars().take(256).collect();
                                                 self.pending_notifications.push((title, body));
                                             }
@@ -2509,33 +2598,6 @@ impl TerminalState {
                             }
 
                             i += 3;
-                        }
-                        b'M' => {
-                            i += 2;
-
-                            if self.cursor_row > self.scroll_region_top {
-                                self.cursor_row -= 1;
-                            } else if self.scroll_region_top < self.grid.rows()
-                                && self.scroll_region_bottom < self.grid.rows()
-                                && self.scroll_region_top <= self.scroll_region_bottom
-                            {
-                                self.scroll_region_down(
-                                    self.scroll_region_top,
-                                    self.scroll_region_bottom,
-                                );
-                            }
-                        }
-                        b'D' => {
-                            i += 2;
-
-                            if self.cursor_row < self.scroll_region_bottom {
-                                self.cursor_row += 1;
-                            } else {
-                                self.scroll_region_up(
-                                    self.scroll_region_top,
-                                    self.scroll_region_bottom,
-                                );
-                            }
                         }
                         b'[' => {
                             i += 2;
@@ -3214,9 +3276,9 @@ impl TerminalState {
                 if private_prefix.is_none() && intermediates == [b' '] {
                     let shape = params.first().copied().unwrap_or(0) as u8;
                     self.cursor_shape = match shape {
-                        0 | 1 => CursorShape::Block,
-                        2 => CursorShape::Underline,
-                        3 => CursorShape::Beam,
+                        0..=2 => CursorShape::Block,
+                        3 | 4 => CursorShape::Underline,
+                        5 | 6 => CursorShape::Beam,
                         _ => CursorShape::Block,
                     };
                 }
@@ -3770,7 +3832,43 @@ impl TerminalState {
         self.scroll_offset = 0;
     }
 
-    pub fn get_mouse_report(&self, button: u8, col: usize, row: usize) -> Option<String> {
+    fn push_utf8_mouse_coord(output: &mut Vec<u8>, value: usize) {
+        let codepoint = 32 + value.saturating_add(1).min(2015) as u32;
+        if let Some(ch) = char::from_u32(codepoint) {
+            let mut buf = [0u8; 4];
+            output.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+
+    fn x10_mouse_report(button: u8, col: usize, row: usize) -> Vec<u8> {
+        let mut output = Vec::with_capacity(6);
+        output.extend_from_slice(b"\x1b[M");
+        output.push(32 + button);
+        output.push(32 + (col.saturating_add(1).min(223) as u8));
+        output.push(32 + (row.saturating_add(1).min(223) as u8));
+        output
+    }
+
+    fn utf8_mouse_report(button: u8, col: usize, row: usize) -> Vec<u8> {
+        let mut output = Vec::with_capacity(12);
+        output.extend_from_slice(b"\x1b[M");
+        output.push(32 + button);
+        Self::push_utf8_mouse_coord(&mut output, col);
+        Self::push_utf8_mouse_coord(&mut output, row);
+        output
+    }
+
+    fn urxvt_mouse_report(button: u8, col: usize, row: usize) -> Vec<u8> {
+        format!(
+            "\x1b[{};{};{}M",
+            32 + button,
+            col.saturating_add(1),
+            row.saturating_add(1)
+        )
+        .into_bytes()
+    }
+
+    pub fn get_mouse_report(&self, button: u8, col: usize, row: usize) -> Option<Vec<u8>> {
         // Check if any mouse reporting mode is enabled
         if !self.modes.contains(&1000) && !self.modes.contains(&1002) && !self.modes.contains(&1003)
         {
@@ -3778,7 +3876,9 @@ impl TerminalState {
         }
 
         // SGR format (mode 1006) is preferred: CSI < button ; col ; row M/m
-        // Standard format (mode 1000/1002): CSI M button col row (3 bytes)
+        // urxvt format (mode 1015): CSI button ; col ; row M
+        // UTF-8 format (mode 1005): CSI M button col row, with UTF-8 coords
+        // Standard format (mode 1000/1002): CSI M button col row (raw bytes)
 
         if self.modes.contains(&1006) {
             // SGR format: CSI < button ; x ; y M (button press) or m (button release)
@@ -3787,23 +3887,17 @@ impl TerminalState {
             // applies to the legacy X10 byte form is not needed here.
             let x = col as u32 + 1;
             let y = row as u32 + 1;
-            Some(format!("\x1b[<{};{};{}M", button, x, y))
+            Some(format!("\x1b[<{};{};{}M", button, x, y).into_bytes())
+        } else if self.modes.contains(&1015) {
+            Some(Self::urxvt_mouse_report(button, col, row))
+        } else if self.modes.contains(&1005) {
+            Some(Self::utf8_mouse_report(button, col, row))
         } else {
-            // Standard xterm format: CSI M button col row (raw bytes)
-            // Col and row are offset by 32 (space character)
-            let button_byte = 32 + button;
-            // Clamp the usize coordinate BEFORE the u8 cast: casting first would
-            // wrap columns/rows > 255 (the grid can be up to 1024 wide).
-            let col_byte = 32 + (col.saturating_add(1).min(223) as u8);
-            let row_byte = 32 + (row.saturating_add(1).min(223) as u8);
-            Some(format!(
-                "\x1b[M{}{}{}",
-                button_byte as char, col_byte as char, row_byte as char
-            ))
+            Some(Self::x10_mouse_report(button, col, row))
         }
     }
 
-    pub fn get_mouse_release_report(&self, button: u8, col: usize, row: usize) -> Option<String> {
+    pub fn get_mouse_release_report(&self, button: u8, col: usize, row: usize) -> Option<Vec<u8>> {
         if !self.modes.contains(&1000) && !self.modes.contains(&1002) && !self.modes.contains(&1003)
         {
             return None;
@@ -3813,16 +3907,13 @@ impl TerminalState {
             // SGR format: lowercase 'm' for release
             let x = col as u32 + 1;
             let y = row as u32 + 1;
-            Some(format!("\x1b[<{};{};{}m", button, x, y))
+            Some(format!("\x1b[<{};{};{}m", button, x, y).into_bytes())
+        } else if self.modes.contains(&1015) {
+            Some(Self::urxvt_mouse_report(3, col, row))
+        } else if self.modes.contains(&1005) {
+            Some(Self::utf8_mouse_report(3, col, row))
         } else {
-            // Standard xterm: release is button 3
-            let button_byte = 32 + 3u8;
-            let col_byte = 32 + (col.saturating_add(1).min(223) as u8);
-            let row_byte = 32 + (row.saturating_add(1).min(223) as u8);
-            Some(format!(
-                "\x1b[M{}{}{}",
-                button_byte as char, col_byte as char, row_byte as char
-            ))
+            Some(Self::x10_mouse_report(3, col, row))
         }
     }
 
@@ -4575,7 +4666,7 @@ impl TerminalState {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClipboardReadKind, Color, TerminalState};
+    use super::{ClipboardReadKind, Color, CursorShape, TerminalState};
 
     #[test]
     fn resize_preserves_full_screen_scroll_region() {
@@ -4878,6 +4969,24 @@ mod tests {
     }
 
     #[test]
+    fn decscusr_uses_xterm_vte_cursor_shape_mapping() {
+        let mut terminal = TerminalState::new(8, 2);
+
+        terminal.process_input(b"\x1b[2 q");
+        assert_eq!(terminal.cursor_shape, CursorShape::Block);
+
+        terminal.process_input(b"\x1b[3 q");
+        assert_eq!(terminal.cursor_shape, CursorShape::Underline);
+        terminal.process_input(b"\x1b[4 q");
+        assert_eq!(terminal.cursor_shape, CursorShape::Underline);
+
+        terminal.process_input(b"\x1b[5 q");
+        assert_eq!(terminal.cursor_shape, CursorShape::Beam);
+        terminal.process_input(b"\x1b[6 q");
+        assert_eq!(terminal.cursor_shape, CursorShape::Beam);
+    }
+
+    #[test]
     fn private_csi_u_sequence_does_not_restore_cursor_or_leak() {
         let mut terminal = TerminalState::new(8, 2);
 
@@ -4944,6 +5053,34 @@ mod tests {
         assert_eq!(
             String::from_utf8(terminal.get_output()).unwrap(),
             "\x1b[1t\x1b[3;0;0t\x1b[4;384;640t\x1b[8;24;80t\x1b[9;24;80t\x1b]Ldemo\x1b\\\x1b]ldemo\x1b\\"
+        );
+    }
+
+    #[test]
+    fn osc_icon_and_window_titles_are_tracked_separately() {
+        let mut terminal = TerminalState::new(80, 24);
+
+        terminal.process_input(b"\x1b]1;icon\x1b\\\x1b]2;window\x1b\\");
+        terminal.process_input(b"\x1b[20t\x1b[21t");
+
+        assert_eq!(
+            String::from_utf8(terminal.get_output()).unwrap(),
+            "\x1b]Licon\x1b\\\x1b]lwindow\x1b\\"
+        );
+    }
+
+    #[test]
+    fn xtwinops_save_and_restore_titles() {
+        let mut terminal = TerminalState::new(80, 24);
+
+        terminal.process_input(b"\x1b]0;base\x1b\\");
+        terminal.process_input(b"\x1b[22;0t");
+        terminal.process_input(b"\x1b]1;temp-icon\x1b\\\x1b]2;temp-window\x1b\\");
+        terminal.process_input(b"\x1b[23;0t\x1b[20t\x1b[21t");
+
+        assert_eq!(
+            String::from_utf8(terminal.get_output()).unwrap(),
+            "\x1b]Lbase\x1b\\\x1b]lbase\x1b\\"
         );
     }
 
@@ -5072,6 +5209,21 @@ mod tests {
     }
 
     #[test]
+    fn osc_110_111_112_reset_dynamic_colors() {
+        let mut terminal = TerminalState::new(8, 2);
+
+        terminal.process_input(b"\x1b]10;#112233\x1b\\\x1b]11;#445566\x1b\\\x1b]12;#778899\x1b\\");
+        assert_eq!(terminal.dynamic_fg, Some((0x11, 0x22, 0x33)));
+        assert_eq!(terminal.dynamic_bg, Some((0x44, 0x55, 0x66)));
+        assert_eq!(terminal.dynamic_cursor_color, Some((0x77, 0x88, 0x99)));
+
+        terminal.process_input(b"\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\");
+        assert_eq!(terminal.dynamic_fg, None);
+        assert_eq!(terminal.dynamic_bg, None);
+        assert_eq!(terminal.dynamic_cursor_color, None);
+    }
+
+    #[test]
     fn decrqm_reports_5522_support() {
         let mut terminal = TerminalState::new(8, 2);
 
@@ -5141,6 +5293,41 @@ mod tests {
         terminal.process_input(b"\n");
         let after = terminal.get_visible_cells();
         assert_eq!(after[0][0].character, 'A');
+    }
+
+    #[test]
+    fn ind_preserves_column_and_scrolls_like_vte() {
+        let mut terminal = TerminalState::new(4, 2);
+        terminal.grid.get_mut(0, 0).character = 'A';
+        terminal.grid.get_mut(1, 0).character = 'B';
+        terminal.cursor_row = 1;
+        terminal.cursor_col = 2;
+
+        terminal.process_input(b"\x1bD");
+
+        assert_eq!(terminal.cursor_row, 1);
+        assert_eq!(terminal.cursor_col, 2);
+        assert_eq!(terminal.scrollback.len(), 1);
+        assert_eq!(terminal.scrollback[0].decompress()[0].character, 'A');
+        assert_eq!(terminal.grid[0][0].character, 'B');
+    }
+
+    #[test]
+    fn ri_scrolls_region_down_at_top_margin() {
+        let mut terminal = TerminalState::new(4, 4);
+        terminal.process_input(b"\x1b[2;3r");
+        terminal.grid.get_mut(1, 0).character = 'B';
+        terminal.grid.get_mut(2, 0).character = 'C';
+        terminal.cursor_row = 1;
+        terminal.cursor_col = 2;
+
+        terminal.process_input(b"\x1bM");
+
+        assert_eq!(terminal.cursor_row, 1);
+        assert_eq!(terminal.cursor_col, 2);
+        assert_eq!(terminal.grid[1][0].character, ' ');
+        assert_eq!(terminal.grid[2][0].character, 'B');
+        assert_eq!(terminal.grid[3][0].character, ' ');
     }
 
     #[test]
@@ -5233,9 +5420,45 @@ mod tests {
 
         let report = terminal.get_mouse_report(0, 299, 10).unwrap();
         // 1-indexed: column 300, row 11. Pre-fix this would have been 256.
-        assert_eq!(report, "\x1b[<0;300;11M");
+        assert_eq!(report, b"\x1b[<0;300;11M");
 
         let release = terminal.get_mouse_release_report(0, 299, 10).unwrap();
-        assert_eq!(release, "\x1b[<0;300;11m");
+        assert_eq!(release, b"\x1b[<0;300;11m");
+    }
+
+    #[test]
+    fn x10_mouse_report_uses_raw_bytes() {
+        let mut terminal = TerminalState::new(120, 50);
+        terminal.process_input(b"\x1b[?1000h");
+
+        let report = terminal.get_mouse_report(0, 100, 10).unwrap();
+        assert_eq!(report, vec![0x1b, b'[', b'M', 32, 133, 43]);
+
+        let release = terminal.get_mouse_release_report(0, 100, 10).unwrap();
+        assert_eq!(release, vec![0x1b, b'[', b'M', 35, 133, 43]);
+    }
+
+    #[test]
+    fn utf8_mouse_report_encodes_coordinates_as_utf8() {
+        let mut terminal = TerminalState::new(400, 50);
+        terminal.process_input(b"\x1b[?1000h\x1b[?1005h");
+
+        let report = terminal.get_mouse_report(0, 299, 10).unwrap();
+        assert_eq!(report, b"\x1b[M \xc5\x8c+");
+
+        let release = terminal.get_mouse_release_report(0, 299, 10).unwrap();
+        assert_eq!(release, b"\x1b[M#\xc5\x8c+");
+    }
+
+    #[test]
+    fn urxvt_mouse_report_uses_decimal_csi_format() {
+        let mut terminal = TerminalState::new(400, 50);
+        terminal.process_input(b"\x1b[?1000h\x1b[?1015h");
+
+        let report = terminal.get_mouse_report(0, 299, 10).unwrap();
+        assert_eq!(report, b"\x1b[32;300;11M");
+
+        let release = terminal.get_mouse_release_report(0, 299, 10).unwrap();
+        assert_eq!(release, b"\x1b[35;300;11M");
     }
 }

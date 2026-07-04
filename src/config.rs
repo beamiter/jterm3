@@ -31,6 +31,11 @@ static CJK_MONOSPACE_FONT: Lazy<Option<String>> = Lazy::new(|| {
     detect_font_by_match(&["monospace:lang=zh-cn"])
 });
 
+static SYMBOL_MONOSPACE_FONT: Lazy<Option<String>> = Lazy::new(|| {
+    eprintln!("[Config] Resolving terminal symbol fallback font...");
+    detect_font_by_match(&["monospace:charset=2303"])
+});
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
@@ -412,6 +417,10 @@ impl Config {
 
     pub fn cjk_monospace_font_family() -> Option<&'static str> {
         CJK_MONOSPACE_FONT.as_deref()
+    }
+
+    pub fn symbol_monospace_font_family() -> Option<&'static str> {
+        SYMBOL_MONOSPACE_FONT.as_deref()
     }
 }
 
