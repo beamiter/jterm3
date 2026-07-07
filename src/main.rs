@@ -1912,6 +1912,7 @@ impl Jterm {
             Message::Key(event) => {
                 if let keyboard::Event::KeyPressed {
                     key,
+                    location,
                     modifiers,
                     text,
                     ..
@@ -1982,7 +1983,7 @@ impl Jterm {
                         application_keypad: sess.terminal.is_application_keypad(),
                     };
                     if let Some(bytes) =
-                        encode_key(&key, modifiers, text.as_deref(), app_cursor, enh)
+                        encode_key(&key, location, modifiers, text.as_deref(), app_cursor, enh)
                     {
                         sess.terminal.scroll_to_bottom();
                         sess.write_pty(&bytes);
@@ -4354,6 +4355,7 @@ struct KeyboardEnhancements {
 /// Translate an iced key press into the bytes to send to the PTY.
 fn encode_key(
     key: &keyboard::Key,
+    location: keyboard::Location,
     mods: keyboard::Modifiers,
     text: Option<&str>,
     app_cursor: bool,
@@ -4394,7 +4396,7 @@ fn encode_key(
         Key::Named(named) => {
             let bytes = match named {
                 Named::Enter => {
-                    if enh.application_keypad {
+                    if enh.application_keypad && location == keyboard::Location::Numpad {
                         ss3("M")
                     } else {
                         vec![b'\r']
@@ -4587,9 +4589,10 @@ mod tests {
     use iced::keyboard::key::Named;
 
     #[test]
-    fn enter_honors_application_keypad_mode() {
+    fn enter_honors_key_location_in_application_keypad_mode() {
         let plain = encode_key(
             &keyboard::Key::Named(Named::Enter),
+            keyboard::Location::Standard,
             keyboard::Modifiers::default(),
             None,
             false,
@@ -4597,8 +4600,9 @@ mod tests {
         );
         assert_eq!(plain.as_deref(), Some(&b"\r"[..]));
 
-        let keypad = encode_key(
+        let standard_in_keypad_mode = encode_key(
             &keyboard::Key::Named(Named::Enter),
+            keyboard::Location::Standard,
             keyboard::Modifiers::default(),
             None,
             false,
@@ -4607,6 +4611,19 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(keypad.as_deref(), Some(&b"\x1bOM"[..]));
+        assert_eq!(standard_in_keypad_mode.as_deref(), Some(&b"\r"[..]));
+
+        let numpad_in_keypad_mode = encode_key(
+            &keyboard::Key::Named(Named::Enter),
+            keyboard::Location::Numpad,
+            keyboard::Modifiers::default(),
+            None,
+            false,
+            KeyboardEnhancements {
+                application_keypad: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(numpad_in_keypad_mode.as_deref(), Some(&b"\x1bOM"[..]));
     }
 }
