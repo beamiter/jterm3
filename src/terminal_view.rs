@@ -386,11 +386,17 @@ fn terminal_glyph_font(
     primary: iced::Font,
     cjk: Option<iced::Font>,
     symbol: Option<iced::Font>,
+    italic: bool,
 ) -> iced::Font {
     if should_use_symbol_fallback_font(ch) {
         symbol.unwrap_or(iced::Font::MONOSPACE)
     } else if should_use_cjk_fallback_font(ch) {
         cjk.unwrap_or(primary)
+    } else if italic {
+        iced::Font {
+            style: iced::font::Style::Italic,
+            ..primary
+        }
     } else {
         primary
     }
@@ -441,28 +447,52 @@ mod tests {
         let symbol = iced::Font::with_name("Symbol");
 
         assert_eq!(
-            terminal_glyph_font('⌃', primary, Some(cjk), Some(symbol)),
+            terminal_glyph_font('⌃', primary, Some(cjk), Some(symbol), false),
             symbol
         );
         assert_eq!(
-            terminal_glyph_font('⋮', primary, Some(cjk), Some(symbol)),
+            terminal_glyph_font('⋮', primary, Some(cjk), Some(symbol), false),
             symbol
         );
         assert_eq!(
-            terminal_glyph_font('✓', primary, Some(cjk), Some(symbol)),
+            terminal_glyph_font('✓', primary, Some(cjk), Some(symbol), false),
             symbol
         );
         assert_eq!(
-            terminal_glyph_font('⣿', primary, Some(cjk), Some(symbol)),
+            terminal_glyph_font('⣿', primary, Some(cjk), Some(symbol), false),
             symbol
         );
         assert_eq!(
-            terminal_glyph_font('中', primary, Some(cjk), Some(symbol)),
+            terminal_glyph_font('中', primary, Some(cjk), Some(symbol), false),
             cjk
         );
         assert_eq!(
-            terminal_glyph_font('A', primary, Some(cjk), Some(symbol)),
+            terminal_glyph_font('A', primary, Some(cjk), Some(symbol), false),
             primary
+        );
+    }
+
+    #[test]
+    fn italic_style_does_not_override_fallback_fonts() {
+        let primary = iced::Font::with_name("Primary");
+        let cjk = iced::Font::with_name("Cjk");
+        let symbol = iced::Font::with_name("Symbol");
+        let italic_primary = iced::Font {
+            style: iced::font::Style::Italic,
+            ..primary
+        };
+
+        assert_eq!(
+            terminal_glyph_font('中', primary, Some(cjk), Some(symbol), true),
+            cjk
+        );
+        assert_eq!(
+            terminal_glyph_font('⌃', primary, Some(cjk), Some(symbol), true),
+            symbol
+        );
+        assert_eq!(
+            terminal_glyph_font('A', primary, Some(cjk), Some(symbol), true),
+            italic_primary
         );
     }
 }
@@ -808,10 +838,6 @@ where
             // starts at an exact cell origin — drift from approximate cell widths
             // can never accumulate across a break.
             let font = self.mono;
-            let italic_font = iced::Font {
-                style: iced::font::Style::Italic,
-                ..self.mono
-            };
             let font_size = self.metrics.font_size;
             // Cells covered by the active selection draw their glyphs in the
             // selection foreground color so text stays legible over the overlay.
@@ -872,11 +898,13 @@ where
                 if selected {
                     fg = self.theme.selection_fg_color();
                 }
-                let glyph_font = if cell.flags.italic() {
-                    italic_font
-                } else {
-                    terminal_glyph_font(glyph, font, self.cjk_mono, self.symbol_mono)
-                };
+                let glyph_font = terminal_glyph_font(
+                    glyph,
+                    font,
+                    self.cjk_mono,
+                    self.symbol_mono,
+                    cell.flags.italic(),
+                );
                 // Blink: during the off phase, blinking cells show no glyph.
                 let blink_hidden = cell.flags.blink() && !self.blink_on;
 
@@ -1050,6 +1078,7 @@ where
                                         self.mono,
                                         self.cjk_mono,
                                         self.symbol_mono,
+                                        cell.flags.italic(),
                                     ),
                                     align_x: text::Alignment::Center,
                                     align_y: iced::alignment::Vertical::Center,
