@@ -79,6 +79,10 @@ pub const SCROLLBAR_WIDTH: f32 = 10.0;
 /// Minimum thumb height so it stays grabbable with deep scrollback.
 const SCROLLBAR_MIN_THUMB: f32 = 24.0;
 
+fn hovered_link_color() -> Color {
+    Color::from_rgb8(100, 200, 255)
+}
+
 /// Per-widget interaction state retained across frames.
 #[derive(Default)]
 struct State {
@@ -876,7 +880,7 @@ where
                 // Blink: during the off phase, blinking cells show no glyph.
                 let blink_hidden = cell.flags.blink() && !self.blink_on;
 
-                // Clickable links render blue (brighter when hovered) + underlined.
+                // Clickable links keep their terminal color unless hovered.
                 let row_links: &[&crate::link::Link] =
                     links_by_row.get(row_idx).map(Vec::as_slice).unwrap_or(&[]);
                 let is_link = row_links
@@ -886,11 +890,9 @@ where
                     let is_hovered = hovered.is_some_and(|h| {
                         h.line == row_idx && col_idx >= h.col_start && col_idx < h.col_end
                     });
-                    fg = if is_hovered {
-                        Color::from_rgb8(100, 200, 255)
-                    } else {
-                        Color::from_rgb8(50, 150, 255)
-                    };
+                    if is_hovered {
+                        fg = hovered_link_color();
+                    }
                 }
 
                 let printable = glyph != ' ' && glyph != '\0' && !blink_hidden;
