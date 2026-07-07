@@ -925,6 +925,7 @@ struct SavedCursor {
     g1: Charset,
     active: Charset,
     origin_mode: bool,
+    pending_wrap: bool,
 }
 
 pub struct TerminalState {
@@ -951,6 +952,9 @@ pub struct TerminalState {
     tab_stops: Vec<bool>,
     // Last printed character, for REP (CSI b).
     last_printed_char: Option<char>,
+    // DEC Last Column Flag: writing in the final column defers autowrap until
+    // the next printable character. VTE preserves this through DECSC/DECRC.
+    pending_wrap: bool,
     alt_cursor_row: usize,
     alt_cursor_col: usize,
     pub cursor_shape: CursorShape,
@@ -1140,6 +1144,7 @@ impl TerminalState {
             saved_cursor: None,
             tab_stops: Self::default_tab_stops(cols),
             last_printed_char: None,
+            pending_wrap: false,
             alt_cursor_row: 0,
             alt_cursor_col: 0,
             cursor_shape: CursorShape::default(),
@@ -1690,10 +1695,14 @@ impl TerminalState {
     /// Merge a zero-width combining mark into the preceding base cell when the
     /// pair has a single precomposed form (NFC); otherwise drop it.
     fn combine_with_previous(&mut self, mark: char) {
-        if self.cursor_col == 0 {
+        if self.cursor_col == 0 && !self.pending_wrap {
             return;
         }
-        let mut base_col = self.cursor_col - 1;
+        let mut base_col = if self.pending_wrap {
+            self.cursor_col
+        } else {
+            self.cursor_col - 1
+        };
         if base_col > 0
             && self
                 .grid
@@ -1756,6 +1765,7 @@ impl TerminalState {
             g1: self.g1_charset,
             active: self.active_charset,
             origin_mode: self.modes.contains(&6),
+            pending_wrap: self.pending_wrap,
         });
     }
 
@@ -1774,15 +1784,18 @@ impl TerminalState {
             } else {
                 self.modes.remove(&6);
             }
+            self.pending_wrap = s.pending_wrap;
         } else {
             self.cursor_row = 0;
             self.cursor_col = 0;
+            self.pending_wrap = false;
         }
     }
 
     /// Place the cursor for CUP/HVP (CSI H / f). Honors DECOM origin mode: when set,
     /// the row is relative to the scroll region and clamped within it.
     fn place_cursor(&mut self, row_1based: usize, col_1based: usize) {
+        self.pending_wrap = false;
         let row0 = row_1based.saturating_sub(1);
         let col0 = col_1based.saturating_sub(1);
         if self.modes.contains(&6) {
@@ -1795,6 +1808,7 @@ impl TerminalState {
 
     /// VPA (CSI d): move to an absolute row, honoring origin mode, keeping the column.
     fn set_cursor_row_abs(&mut self, row_1based: usize) {
+        self.pending_wrap = false;
         let row0 = row_1based.saturating_sub(1);
         if self.modes.contains(&6) {
             self.cursor_row = (self.scroll_region_top + row0).min(self.scroll_region_bottom);
@@ -1813,11 +1827,19 @@ impl TerminalState {
 
         let cols = self.grid.row_len();
         let blank_cell = self.create_blank_cell();
+        let autowrap = self.modes.contains(&7);
+
+        if self.pending_wrap {
+            self.pending_wrap = false;
+            if autowrap {
+                self.wrap_to_next_line();
+            }
+        }
 
         // If character doesn't fit at end of line, handle based on autowrap mode
         if self.cursor_col + width > cols {
             // Only wrap to next line if autowrap mode (mode 7) is enabled
-            if self.modes.contains(&7) {
+            if autowrap {
                 self.wrap_to_next_line();
             } else {
                 // Autowrap disabled: clamp cursor to last column instead of wrapping
@@ -1866,6 +1888,12 @@ impl TerminalState {
 
         self.cursor_col += width;
         self.last_printed_char = Some(ch);
+        if self.cursor_col >= cols {
+            self.cursor_col = cols.saturating_sub(width);
+            if autowrap {
+                self.pending_wrap = true;
+            }
+        }
         // Mark the row as dirty after writing character
         self.dirty_region.mark_row(self.cursor_row);
         self.mark_row_dirty(self.cursor_row);
@@ -1880,6 +1908,13 @@ impl TerminalState {
         }
 
         while pos < bytes.len() {
+            if self.pending_wrap {
+                self.pending_wrap = false;
+                if autowrap {
+                    self.wrap_to_next_line();
+                }
+            }
+
             let remaining = cols - self.cursor_col;
             let chunk_len = (bytes.len() - pos).min(remaining);
 
@@ -1905,13 +1940,10 @@ impl TerminalState {
             self.dirty_region.mark_row(self.cursor_row);
             self.mark_row_dirty(self.cursor_row);
 
-            // Handle wrap if there's more data
-            if pos < bytes.len() && self.cursor_col >= cols {
+            if self.cursor_col >= cols {
+                self.cursor_col = cols - 1;
                 if autowrap {
-                    self.wrap_to_next_line();
-                } else {
-                    self.cursor_col = cols - 1;
-                    break;
+                    self.pending_wrap = true;
                 }
             }
         }
@@ -2066,13 +2098,17 @@ impl TerminalState {
         }
 
         let cols = self.grid.row_len();
-        let is_full_screen_region = top == 0 && bottom + 1 == self.grid.rows();
+        // VTE saves lines scrolled off the top margin into scrollback whenever
+        // the scrolling region starts at the first screen row. The bottom margin
+        // may be above the last row so TUIs can keep prompts/status lines fixed
+        // while the history area scrolls.
+        let scrolls_off_screen_top = top == 0;
 
         // Compress the removed line directly from the grid slice before mutating,
         // avoiding a per-line Vec allocation from get_row.
         let allow_alt_scrollback = self.use_alt_buffer && self.sync_output_active;
         let scrollback_line =
-            if is_full_screen_region && (!self.use_alt_buffer || allow_alt_scrollback) {
+            if scrolls_off_screen_top && (!self.use_alt_buffer || allow_alt_scrollback) {
                 Some(ScrollbackLine::compress(
                     &self.grid[top],
                     self.grid.row_wrapped[top],
@@ -2218,6 +2254,12 @@ impl TerminalState {
         if self.sync_output_active {
             if let Some(start) = self.sync_output_start {
                 if start.elapsed() > std::time::Duration::from_secs(1) {
+                    if self.use_alt_buffer {
+                        self.archive_visible_screen_to_scrollback_with_options(true, true);
+                    } else {
+                        self.last_synced_primary_screen_snapshot =
+                            self.visible_screen_snapshot().unwrap_or_default();
+                    }
                     self.sync_output_active = false;
                     self.sync_output_start = None;
                     self.modes.remove(&2026);
@@ -2284,6 +2326,7 @@ impl TerminalState {
                 b'\x08' => {
                     // Backspace (0x08) - just move cursor left.
                     // Shell handles actual deletion and sends back updated display.
+                    self.pending_wrap = false;
                     if self.cursor_col > 0 {
                         self.cursor_col -= 1;
                     }
@@ -2295,10 +2338,12 @@ impl TerminalState {
                 }
                 b'\n' => {
                     // Linefeed - move cursor down or scroll the region.
+                    self.pending_wrap = false;
                     self.index();
                     i += 1;
                 }
                 b'\r' => {
+                    self.pending_wrap = false;
                     self.cursor_col = 0;
                     i += 1;
                 }
@@ -2316,6 +2361,7 @@ impl TerminalState {
                 }
                 b'\t' => {
                     // Tab - advance to the next tab stop.
+                    self.pending_wrap = false;
                     self.cursor_col = self.next_tab_stop(self.cursor_col);
                     i += 1;
                 }
@@ -2341,16 +2387,19 @@ impl TerminalState {
                         }
                         b'E' => {
                             // NEL - Next Line (linefeed + carriage return)
+                            self.pending_wrap = false;
                             self.next_line();
                             i += 2;
                         }
                         b'D' => {
                             // IND - Index (linefeed without carriage return)
+                            self.pending_wrap = false;
                             self.index();
                             i += 2;
                         }
                         b'M' => {
                             // RI - Reverse Index
+                            self.pending_wrap = false;
                             self.reverse_index();
                             i += 2;
                         }
@@ -2786,6 +2835,13 @@ impl TerminalState {
         private_prefix: Option<u8>,
         intermediates: &[u8],
     ) {
+        if matches!(
+            cmd,
+            'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'H' | 'I' | 'Z' | 'f' | 'd' | '`'
+        ) {
+            self.pending_wrap = false;
+        }
+
         match cmd {
             'A' => {
                 // CUU - cursor up. Stops at the top margin (or row 0 if the
@@ -3211,6 +3267,7 @@ impl TerminalState {
                 // Move cursor to home position when setting scroll region
                 self.cursor_row = 0;
                 self.cursor_col = 0;
+                self.pending_wrap = false;
             }
             '@' => {
                 // ICH - Insert Character(s)
@@ -3477,6 +3534,7 @@ impl TerminalState {
         }
         self.cursor_row = 0;
         self.cursor_col = 0;
+        self.pending_wrap = false;
         self.dirty_region.mark_all(self.grid.rows());
         self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
     }
@@ -3501,9 +3559,12 @@ impl TerminalState {
         self.modes.insert(25); // cursor visible
         self.modes.insert(7); // autowrap on
         self.scroll_offset = 0;
+        self.pending_wrap = false;
         // xterm RIS also discards saved lines and resets cursor style, dynamic
         // colors, keyboard-protocol state, selection, and any open hyperlink.
         self.scrollback.clear();
+        self.last_archived_screen_snapshot.clear();
+        self.last_synced_primary_screen_snapshot.clear();
         self.cursor_shape = CursorShape::default();
         self.dynamic_fg = None;
         self.dynamic_bg = None;
@@ -3538,12 +3599,14 @@ impl TerminalState {
         self.modes.remove(&4);
         self.modes.insert(25);
         self.modes.insert(7);
+        self.pending_wrap = false;
     }
 
     fn clear_screen(&mut self) {
         self.clear_screen_no_home();
         self.cursor_row = 0;
         self.cursor_col = 0;
+        self.pending_wrap = false;
     }
 
     /// Erase the whole screen WITHOUT moving the cursor (ED / CSI 2 J).
@@ -3733,6 +3796,7 @@ impl TerminalState {
                     );
                     self.use_alt_buffer = false;
                     self.modes.remove(&mode);
+                    self.pending_wrap = false;
 
                     // See the matching set_mode arm: clear selection because its
                     // anchors point into the alt buffer, and reset DECSTBM so the
@@ -4598,6 +4662,7 @@ impl TerminalState {
         self.scroll_offset = 0;
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
+        self.pending_wrap = false;
         self.saved_cursor_row = self.saved_cursor_row.min(rows.saturating_sub(1));
         self.saved_cursor_col = self.saved_cursor_col.min(cols.saturating_sub(1));
         self.alt_cursor_row = self.alt_cursor_row.min(rows.saturating_sub(1));
@@ -4717,6 +4782,38 @@ mod tests {
     }
 
     #[test]
+    fn codex_synchronized_main_screen_history_reaches_above_last_page() {
+        let mut terminal = TerminalState::new(16, 5);
+
+        terminal.process_input(b"\x1b[?2026h\x1b[1;0r\x1b[1;1H");
+        for i in 0..14 {
+            terminal.process_input(format!("\x1b[;m\x1b[Kitem-{i:02}\r\n").as_bytes());
+        }
+        terminal.process_input(b"\x1b[r\x1b[1;1H\x1b[?2026l");
+
+        assert!(
+            terminal.scrollback_len() > terminal.grid.rows(),
+            "expected main-screen synchronized output to retain more than one page"
+        );
+
+        terminal.set_scroll_offset(terminal.scrollback_len());
+        let visible = terminal.get_visible_cells();
+        let text = visible
+            .iter()
+            .flat_map(|row| {
+                row.iter()
+                    .map(|cell| cell.character)
+                    .chain(std::iter::once('\n'))
+            })
+            .collect::<String>();
+
+        assert!(
+            text.contains("item-00"),
+            "expected earliest synchronized output to remain reachable, got {text:?}"
+        );
+    }
+
+    #[test]
     fn synchronized_primary_screen_redraws_do_not_fill_scrollback() {
         let mut terminal = TerminalState::new(24, 4);
 
@@ -4732,6 +4829,37 @@ mod tests {
             0,
             "primary-screen synchronized redraws should not be recorded as history"
         );
+    }
+
+    #[test]
+    fn top_margin_scroll_region_pushes_scrolled_lines_to_scrollback() {
+        let mut terminal = TerminalState::new(24, 6);
+
+        terminal.process_input(b"\x1b[1;4r\x1b[1;1H");
+        terminal.process_input(b"hist-1\r\nhist-2\r\nhist-3\r\nhist-4\r\nhist-5\r\n");
+        terminal.process_input(b"\x1b[r\x1b[5;1Hprompt\r\nstatus");
+
+        let history: Vec<String> = terminal
+            .scrollback
+            .iter()
+            .map(|line| {
+                line.decompress()
+                    .iter()
+                    .map(|cell| cell.character)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+
+        assert_eq!(
+            history,
+            ["hist-1", "hist-2"],
+            "expected lines scrolled off a top-anchored region to remain scrollable"
+        );
+
+        assert_eq!(terminal.grid[4][0].character, 'p');
+        assert_eq!(terminal.grid[5][0].character, 's');
     }
 
     #[test]
@@ -5394,6 +5522,63 @@ mod tests {
 
         assert!(terminal.scrollback.is_empty());
         assert!(terminal.is_alt_buffer_active());
+    }
+
+    #[test]
+    fn printable_at_last_column_defers_autowrap_until_next_printable() {
+        let mut terminal = TerminalState::new(4, 3);
+
+        terminal.process_input(b"abcd");
+
+        assert_eq!(terminal.cursor_row, 0);
+        assert_eq!(terminal.cursor_col, 3);
+        assert!(terminal.pending_wrap);
+        assert!(terminal.scrollback.is_empty());
+
+        terminal.process_input(b"X");
+
+        assert_eq!(terminal.cursor_row, 1);
+        assert_eq!(terminal.cursor_col, 1);
+        assert_eq!(terminal.grid[1][0].character, 'X');
+        assert!(terminal.grid.row_wrapped[0]);
+    }
+
+    #[test]
+    fn autowrap_disabled_overwrites_last_column() {
+        let mut terminal = TerminalState::new(3, 3);
+
+        terminal.process_input(b"\x1b[?7l");
+        terminal.process_input(b"abcd");
+
+        assert_eq!(terminal.cursor_row, 0);
+        assert_eq!(terminal.cursor_col, 2);
+        assert!(!terminal.pending_wrap);
+        assert_eq!(terminal.grid[0][0].character, 'a');
+        assert_eq!(terminal.grid[0][1].character, 'b');
+        assert_eq!(terminal.grid[0][2].character, 'd');
+    }
+
+    #[test]
+    fn decrc_restores_pending_wrap_state() {
+        let mut terminal = TerminalState::new(6, 3);
+
+        terminal.process_input(b"P>");
+        terminal.process_input(b"\x1b7");
+        assert!(!terminal.pending_wrap);
+
+        terminal.process_input(b"\x1b[6GR");
+        assert_eq!(terminal.cursor_col, 5);
+        assert!(terminal.pending_wrap);
+
+        terminal.process_input(b"\x1b8");
+        assert_eq!(terminal.cursor_row, 0);
+        assert_eq!(terminal.cursor_col, 2);
+        assert!(!terminal.pending_wrap);
+
+        terminal.process_input(b"x");
+        assert_eq!(terminal.cursor_row, 0);
+        assert_eq!(terminal.cursor_col, 3);
+        assert_eq!(terminal.grid[0][2].character, 'x');
     }
 
     #[test]
