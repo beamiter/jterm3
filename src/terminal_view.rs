@@ -143,6 +143,8 @@ pub struct TermWidget<'a, Message> {
     mono: iced::Font,
     cjk_mono: Option<iced::Font>,
     symbol_mono: Option<iced::Font>,
+    math_symbol: Option<iced::Font>,
+    nerd_symbol: Option<iced::Font>,
     /// Per visible row: the inclusive (start_col, end_col) span to highlight,
     /// or `None` for rows with no selection. `end_col` may exceed the row width.
     selection: Vec<Option<(usize, usize)>>,
@@ -185,6 +187,8 @@ impl<'a, Message> TermWidget<'a, Message> {
         mono: iced::Font,
         cjk_mono: Option<iced::Font>,
         symbol_mono: Option<iced::Font>,
+        math_symbol: Option<iced::Font>,
+        nerd_symbol: Option<iced::Font>,
         selection: Vec<Option<(usize, usize)>>,
         scroll_offset: usize,
         scrollback_len: usize,
@@ -201,6 +205,8 @@ impl<'a, Message> TermWidget<'a, Message> {
             mono,
             cjk_mono,
             symbol_mono,
+            math_symbol,
+            nerd_symbol,
             selection,
             scroll_offset,
             scrollback_len,
@@ -361,6 +367,14 @@ fn should_use_symbol_fallback_font(ch: char) -> bool {
     )
 }
 
+fn should_use_math_symbol_fallback_font(ch: char) -> bool {
+    matches!(ch as u32, 0x1D400..=0x1D7FF)
+}
+
+fn should_use_nerd_symbol_fallback_font(ch: char) -> bool {
+    matches!(ch as u32, 0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD)
+}
+
 fn should_use_cjk_fallback_font(ch: char) -> bool {
     matches!(
         ch as u32,
@@ -386,9 +400,15 @@ fn terminal_glyph_font(
     primary: iced::Font,
     cjk: Option<iced::Font>,
     symbol: Option<iced::Font>,
+    math_symbol: Option<iced::Font>,
+    nerd_symbol: Option<iced::Font>,
     italic: bool,
 ) -> iced::Font {
-    if should_use_symbol_fallback_font(ch) {
+    if should_use_nerd_symbol_fallback_font(ch) {
+        nerd_symbol.unwrap_or_else(|| symbol.unwrap_or(iced::Font::MONOSPACE))
+    } else if should_use_math_symbol_fallback_font(ch) {
+        math_symbol.unwrap_or_else(|| symbol.unwrap_or(iced::Font::MONOSPACE))
+    } else if should_use_symbol_fallback_font(ch) {
         symbol.unwrap_or(iced::Font::MONOSPACE)
     } else if should_use_cjk_fallback_font(ch) {
         cjk.unwrap_or(primary)
@@ -414,7 +434,8 @@ fn solid_quad(bounds: Rectangle) -> Quad {
 #[cfg(test)]
 mod tests {
     use super::{
-        should_use_cjk_fallback_font, should_use_symbol_fallback_font, terminal_glyph_font,
+        should_use_cjk_fallback_font, should_use_math_symbol_fallback_font,
+        should_use_nerd_symbol_fallback_font, should_use_symbol_fallback_font, terminal_glyph_font,
     };
 
     #[test]
@@ -428,8 +449,27 @@ mod tests {
         assert!(should_use_symbol_fallback_font('⟂'));
         assert!(should_use_symbol_fallback_font('⮕'));
         assert!(should_use_symbol_fallback_font('⣿'));
+        assert!(!should_use_symbol_fallback_font('𝟏'));
         assert!(!should_use_symbol_fallback_font('中'));
         assert!(!should_use_symbol_fallback_font('A'));
+    }
+
+    #[test]
+    fn math_alphanumeric_symbols_use_math_fallback_font() {
+        assert!(should_use_math_symbol_fallback_font('𝟏'));
+        assert!(should_use_math_symbol_fallback_font('𝟘'));
+        assert!(should_use_math_symbol_fallback_font('𝐀'));
+        assert!(!should_use_math_symbol_fallback_font('1'));
+        assert!(!should_use_math_symbol_fallback_font('中'));
+    }
+
+    #[test]
+    fn private_use_symbols_use_nerd_fallback_font() {
+        assert!(should_use_nerd_symbol_fallback_font('\u{e0b0}'));
+        assert!(should_use_nerd_symbol_fallback_font('\u{f0131}'));
+        assert!(!should_use_nerd_symbol_fallback_font('𝟏'));
+        assert!(!should_use_nerd_symbol_fallback_font('中'));
+        assert!(!should_use_nerd_symbol_fallback_font('A'));
     }
 
     #[test]
@@ -445,31 +485,28 @@ mod tests {
         let primary = iced::Font::with_name("Primary");
         let cjk = iced::Font::with_name("Cjk");
         let symbol = iced::Font::with_name("Symbol");
+        let math = iced::Font::with_name("Math");
+        let nerd = iced::Font::with_name("Nerd");
+        let font_for = |ch, italic| {
+            terminal_glyph_font(
+                ch,
+                primary,
+                Some(cjk),
+                Some(symbol),
+                Some(math),
+                Some(nerd),
+                italic,
+            )
+        };
 
-        assert_eq!(
-            terminal_glyph_font('⌃', primary, Some(cjk), Some(symbol), false),
-            symbol
-        );
-        assert_eq!(
-            terminal_glyph_font('⋮', primary, Some(cjk), Some(symbol), false),
-            symbol
-        );
-        assert_eq!(
-            terminal_glyph_font('✓', primary, Some(cjk), Some(symbol), false),
-            symbol
-        );
-        assert_eq!(
-            terminal_glyph_font('⣿', primary, Some(cjk), Some(symbol), false),
-            symbol
-        );
-        assert_eq!(
-            terminal_glyph_font('中', primary, Some(cjk), Some(symbol), false),
-            cjk
-        );
-        assert_eq!(
-            terminal_glyph_font('A', primary, Some(cjk), Some(symbol), false),
-            primary
-        );
+        assert_eq!(font_for('⌃', false), symbol);
+        assert_eq!(font_for('⋮', false), symbol);
+        assert_eq!(font_for('✓', false), symbol);
+        assert_eq!(font_for('⣿', false), symbol);
+        assert_eq!(font_for('\u{e0b0}', false), nerd);
+        assert_eq!(font_for('𝟏', false), math);
+        assert_eq!(font_for('中', false), cjk);
+        assert_eq!(font_for('A', false), primary);
     }
 
     #[test]
@@ -477,23 +514,29 @@ mod tests {
         let primary = iced::Font::with_name("Primary");
         let cjk = iced::Font::with_name("Cjk");
         let symbol = iced::Font::with_name("Symbol");
+        let math = iced::Font::with_name("Math");
+        let nerd = iced::Font::with_name("Nerd");
         let italic_primary = iced::Font {
             style: iced::font::Style::Italic,
             ..primary
         };
+        let font_for = |ch, italic| {
+            terminal_glyph_font(
+                ch,
+                primary,
+                Some(cjk),
+                Some(symbol),
+                Some(math),
+                Some(nerd),
+                italic,
+            )
+        };
 
-        assert_eq!(
-            terminal_glyph_font('中', primary, Some(cjk), Some(symbol), true),
-            cjk
-        );
-        assert_eq!(
-            terminal_glyph_font('⌃', primary, Some(cjk), Some(symbol), true),
-            symbol
-        );
-        assert_eq!(
-            terminal_glyph_font('A', primary, Some(cjk), Some(symbol), true),
-            italic_primary
-        );
+        assert_eq!(font_for('中', true), cjk);
+        assert_eq!(font_for('⌃', true), symbol);
+        assert_eq!(font_for('𝟏', true), math);
+        assert_eq!(font_for('\u{e0b0}', true), nerd);
+        assert_eq!(font_for('A', true), italic_primary);
     }
 }
 
@@ -903,6 +946,8 @@ where
                     font,
                     self.cjk_mono,
                     self.symbol_mono,
+                    self.math_symbol,
+                    self.nerd_symbol,
                     cell.flags.italic(),
                 );
                 // Blink: during the off phase, blinking cells show no glyph.
@@ -1078,6 +1123,8 @@ where
                                         self.mono,
                                         self.cjk_mono,
                                         self.symbol_mono,
+                                        self.math_symbol,
+                                        self.nerd_symbol,
                                         cell.flags.italic(),
                                     ),
                                     align_x: text::Alignment::Center,

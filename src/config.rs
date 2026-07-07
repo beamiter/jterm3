@@ -15,6 +15,20 @@ const NERD_FONT_CANDIDATES: &[&str] = &[
     "FiraCode Nerd Font",
 ];
 
+const NERD_FONT_FALLBACK_CANDIDATES: &[&str] = &[
+    "SauceCodePro Nerd Font Mono",
+    "JetBrainsMono Nerd Font Mono",
+    "JetBrains Mono Nerd Font",
+    "JetBrainsMono Nerd Font",
+    "SauceCodePro Nerd Font",
+    "Monokoi Nerd Font Mono",
+    "Monokoi Nerd Font",
+    "FiraCode Nerd Font",
+];
+
+const MATH_SYMBOL_FONT_CANDIDATES: &[&str] =
+    &["Noto Sans Math", "Noto Sans Symbols2", "OpenSymbol"];
+
 // 延迟加载的字体列表缓存（避免启动时阻塞）
 static AVAILABLE_FONTS: Lazy<Vec<String>> = Lazy::new(|| {
     eprintln!("[Config] Scanning system fonts (one-time)...");
@@ -34,6 +48,17 @@ static CJK_MONOSPACE_FONT: Lazy<Option<String>> = Lazy::new(|| {
 static SYMBOL_MONOSPACE_FONT: Lazy<Option<String>> = Lazy::new(|| {
     eprintln!("[Config] Resolving terminal symbol fallback font...");
     detect_font_by_match(&["monospace:charset=2303"])
+});
+
+static MATH_SYMBOL_FONT: Lazy<Option<String>> = Lazy::new(|| {
+    eprintln!("[Config] Resolving math symbol fallback font...");
+    detect_preferred_font(MATH_SYMBOL_FONT_CANDIDATES)
+        .or_else(|| detect_font_by_match(&["monospace:charset=1D7CF"]))
+});
+
+static NERD_SYMBOL_FONT: Lazy<Option<String>> = Lazy::new(|| {
+    eprintln!("[Config] Resolving Nerd Font symbol fallback...");
+    detect_preferred_font(NERD_FONT_FALLBACK_CANDIDATES)
 });
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -213,6 +238,28 @@ fn detect_font_by_match(args: &[&str]) -> Option<String> {
                 .filter(|f| !f.is_empty())
         })
         .map(ToOwned::to_owned)
+}
+
+fn detect_preferred_font(candidates: &[&str]) -> Option<String> {
+    for candidate in candidates {
+        let output = Command::new("fc-match")
+            .arg("-f")
+            .arg("%{family}\n")
+            .arg(candidate)
+            .output()
+            .ok()?;
+        let stdout = String::from_utf8(output.stdout).ok()?;
+        let line = stdout.lines().next()?.trim();
+        let line_lower = line.to_lowercase();
+        if line_lower
+            .split(',')
+            .map(str::trim)
+            .any(|family| family == candidate.to_lowercase())
+        {
+            return line.split(',').next().map(str::trim).map(ToOwned::to_owned);
+        }
+    }
+    None
 }
 
 fn detect_available_fonts() -> &'static Vec<String> {
@@ -421,6 +468,14 @@ impl Config {
 
     pub fn symbol_monospace_font_family() -> Option<&'static str> {
         SYMBOL_MONOSPACE_FONT.as_deref()
+    }
+
+    pub fn math_symbol_font_family() -> Option<&'static str> {
+        MATH_SYMBOL_FONT.as_deref()
+    }
+
+    pub fn nerd_symbol_font_family() -> Option<&'static str> {
+        NERD_SYMBOL_FONT.as_deref()
     }
 }
 

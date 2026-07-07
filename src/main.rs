@@ -406,6 +406,8 @@ struct Jterm {
     mono: iced::Font,
     cjk_mono: Option<iced::Font>,
     symbol_mono: Option<iced::Font>,
+    math_symbol: Option<iced::Font>,
+    nerd_symbol: Option<iced::Font>,
     search: search::SearchState,
     palette: command_palette::PaletteState,
     keybindings: keybindings::KeyBindings,
@@ -508,6 +510,8 @@ impl Jterm {
         let mono = resolve_mono_font(&config.font_family);
         let cjk_mono = resolve_optional_font(Config::cjk_monospace_font_family());
         let symbol_mono = resolve_optional_font(Config::symbol_monospace_font_family());
+        let math_symbol = resolve_optional_font(Config::math_symbol_font_family());
+        let nerd_symbol = resolve_optional_font(Config::nerd_symbol_font_family());
 
         // Restore prior tabs (their cwds + active index) when enabled and we are
         // the first instance; otherwise start with a single default session.
@@ -538,6 +542,8 @@ impl Jterm {
             mono,
             cjk_mono,
             symbol_mono,
+            math_symbol,
+            nerd_symbol,
             search: search::SearchState::new(),
             palette: command_palette::PaletteState::new(),
             keybindings: load_keybindings(),
@@ -607,6 +613,8 @@ impl Jterm {
         self.mono = resolve_mono_font(&self.config.font_family);
         self.cjk_mono = resolve_optional_font(Config::cjk_monospace_font_family());
         self.symbol_mono = resolve_optional_font(Config::symbol_monospace_font_family());
+        self.math_symbol = resolve_optional_font(Config::math_symbol_font_family());
+        self.nerd_symbol = resolve_optional_font(Config::nerd_symbol_font_family());
         self.metrics = Metrics::new(
             self.config.font_size,
             self.config.line_spacing,
@@ -3131,6 +3139,8 @@ impl Jterm {
             self.mono,
             self.cjk_mono,
             self.symbol_mono,
+            self.math_symbol,
+            self.nerd_symbol,
             selection,
             sess.terminal.scroll_offset,
             sess.terminal.scrollback_len(),
