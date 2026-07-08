@@ -6,6 +6,12 @@ const TERM_PROGRAM_NAME: &str = "jterm3";
 const TERM_PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
 const VTE_VERSION: &str = "7802";
 const DEFAULT_SHELL_NAME: &str = "rsh";
+const DEFAULT_LS_COLORS: &str = concat!(
+    "rs=0:di=01;34:ln=01;36:mh=00:pi=40;33:so=01;35:",
+    "do=01;35:bd=40;33;01:cd=40;33;01:or=40;31;01:",
+    "mi=00:su=37;41:sg=30;43:ca=30;41:tw=30;42:",
+    "ow=34;42:st=37;44:ex=01;32"
+);
 
 // 声明全局环境变量指针
 extern "C" {
@@ -266,8 +272,9 @@ mod unix_pty {
                 argv_ptrs.push(std::ptr::null());
 
                 // Build a custom envp: copy the current environment, override our
-                // keys, and add LESS=FR only if the user hasn't set it. Doing this
-                // here means the child never calls setenv (which mallocs).
+                // keys, and add terminal compatibility defaults only if the user
+                // hasn't set them. Doing this here means the child never calls
+                // setenv (which mallocs).
                 let mut env_cstrings: Vec<CString> = Vec::new();
                 {
                     let overridden: [&str; 5] = [
@@ -278,6 +285,8 @@ mod unix_pty {
                         "VTE_VERSION",
                     ];
                     let mut has_less = false;
+                    let mut has_ls_colors = false;
+                    let mut has_clicolor = false;
                     let mut p = environ;
                     while !(*p).is_null() {
                         let bytes = std::ffi::CStr::from_ptr(*p).to_bytes();
@@ -287,6 +296,12 @@ mod unix_pty {
                         };
                         if key == b"LESS" {
                             has_less = true;
+                        }
+                        if key == b"LS_COLORS" {
+                            has_ls_colors = true;
+                        }
+                        if key == b"CLICOLOR" {
+                            has_clicolor = true;
                         }
                         if !overridden.iter().any(|k| k.as_bytes() == key) {
                             if let Ok(c) = CString::new(bytes) {
@@ -310,6 +325,17 @@ mod unix_pty {
                     // the user hasn't configured LESS themselves.
                     if !has_less {
                         env_cstrings.push(CString::new("LESS=FR").unwrap());
+                    }
+                    // Match mainstream terminal defaults for color-capable file
+                    // listings. GNU `ls --color` reads LS_COLORS for file type and
+                    // permission classes; BSD/macOS `ls -G` keys off CLICOLOR.
+                    if !has_ls_colors {
+                        env_cstrings.push(
+                            CString::new(format!("LS_COLORS={}", DEFAULT_LS_COLORS)).unwrap(),
+                        );
+                    }
+                    if !has_clicolor {
+                        env_cstrings.push(CString::new("CLICOLOR=1").unwrap());
                     }
                 }
                 let mut envp: Vec<*const libc::c_char> =
