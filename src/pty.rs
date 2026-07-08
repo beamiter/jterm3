@@ -84,6 +84,15 @@ mod unix_pty {
         quoted
     }
 
+    fn build_rsh_exec_command(shell_path: &str, session_id: Option<&str>) -> String {
+        let mut exec_cmd = format!("exec {}", shell_single_quote(shell_path));
+        if let Some(sid) = session_id {
+            exec_cmd.push_str(" --session ");
+            exec_cmd.push_str(&shell_single_quote(sid));
+        }
+        exec_cmd
+    }
+
     fn choose_shell(configured_shell: Option<&str>) -> String {
         // Priority 1: explicit config (needed when PATH is stripped by launchers like wofi)
         if let Some(path) = configured_shell {
@@ -228,11 +237,7 @@ mod unix_pty {
                 let (exec_cstr, argv_cstrings): (CString, Vec<CString>) =
                     if shell_name == "rsh" && bash_path.is_some() {
                         let bash_path = bash_path.unwrap();
-                        let mut exec_cmd = format!("exec {}", shell_single_quote(&shell_path));
-                        if let Some(sid) = session_id {
-                            exec_cmd.push_str(" --session ");
-                            exec_cmd.push_str(&shell_single_quote(sid));
-                        }
+                        let exec_cmd = build_rsh_exec_command(&shell_path, session_id);
                         (
                             cstr_or_bail!(bash_path, "bash path contains NUL"),
                             vec![
