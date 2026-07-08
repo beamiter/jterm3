@@ -39,6 +39,7 @@ pub enum MouseInput {
     Drag {
         col: usize,
         row: usize,
+        count: u32,
     },
     Release {
         col: usize,
@@ -678,7 +679,11 @@ where
                     return;
                 }
                 let (col, row) = self.cell_at(pos, bounds);
-                shell.publish(on_mouse(MouseInput::Drag { col, row }));
+                shell.publish(on_mouse(MouseInput::Drag {
+                    col,
+                    row,
+                    count: state.click_count,
+                }));
             }
             Event::Mouse(mouse::Event::ButtonReleased(btn)) => {
                 // Only the pane that owns the interaction (was dragging) or has

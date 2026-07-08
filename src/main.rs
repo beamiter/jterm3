@@ -1466,7 +1466,7 @@ impl Jterm {
                     MouseButton::Right => {}
                 }
             }
-            MouseInput::Drag { col, row } => {
+            MouseInput::Drag { col, row, count } => {
                 if report_to_app {
                     if sess.terminal.is_mouse_motion_enabled() {
                         if let Some(report) = sess.terminal.get_mouse_report(32, col, row) {
@@ -1475,7 +1475,11 @@ impl Jterm {
                     }
                     return Task::none();
                 }
-                sess.terminal.update_selection((row, col));
+                match count {
+                    2 => sess.terminal.extend_word_selection_to(row, col),
+                    n if n >= 3 => sess.terminal.extend_line_selection_to(row),
+                    _ => sess.terminal.update_selection((row, col)),
+                }
             }
             MouseInput::Release { col, row, button } => {
                 if report_to_app {

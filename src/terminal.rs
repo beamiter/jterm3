@@ -4274,14 +4274,26 @@ impl TerminalState {
     /// Word boundaries are determined by character class: alphanumeric/underscore,
     /// whitespace, or punctuation/symbols.
     pub fn select_word_at(&mut self, row: usize, col: usize) {
+        let Some((abs_row, left, right)) = self.word_span_at(row, col) else {
+            return;
+        };
+
+        self.selection = Some(Selection {
+            anchor: (abs_row, left),
+            active: (abs_row, right),
+            mode: SelectionMode::Normal,
+        });
+    }
+
+    fn word_span_at(&mut self, row: usize, col: usize) -> Option<(usize, usize, usize)> {
         let visible = self.get_visible_cells();
         if row >= visible.len() {
-            return;
+            return None;
         }
         let line = &visible[row];
         let cols = line.len();
         if col >= cols {
-            return;
+            return None;
         }
 
         // Skip wide_continuation to find the real character
@@ -4292,12 +4304,7 @@ impl TerminalState {
 
         if let Some((left, right)) = Self::select_extended_token_span(line, start_col) {
             let abs_row = self.viewport_row_to_absolute(row);
-            self.selection = Some(Selection {
-                anchor: (abs_row, left),
-                active: (abs_row, right),
-                mode: SelectionMode::Normal,
-            });
-            return;
+            return Some((abs_row, left, right));
         }
 
         let ch = line[start_col].character;
@@ -4351,10 +4358,67 @@ impl TerminalState {
         }
 
         let abs_row = self.viewport_row_to_absolute(row);
-        self.selection = Some(Selection {
-            anchor: (abs_row, left),
-            active: (abs_row, right),
-            mode: SelectionMode::Normal,
+        Some((abs_row, left, right))
+    }
+
+    /// Extend an existing double-click selection using word boundaries.
+    pub fn extend_word_selection_to(&mut self, row: usize, col: usize) {
+        let Some((target_row, target_left, target_right)) = self.word_span_at(row, col) else {
+            return;
+        };
+        let Some(sel) = self.selection else {
+            self.selection = Some(Selection {
+                anchor: (target_row, target_left),
+                active: (target_row, target_right),
+                mode: SelectionMode::Normal,
+            });
+            return;
+        };
+
+        let (origin_start, origin_end) = if sel.anchor <= sel.active {
+            (sel.anchor, sel.active)
+        } else {
+            (sel.active, sel.anchor)
+        };
+        let target_start = (target_row, target_left);
+        let target_end = (target_row, target_right);
+
+        self.selection = Some(if target_start < origin_start {
+            Selection {
+                anchor: origin_end,
+                active: target_start,
+                mode: SelectionMode::Normal,
+            }
+        } else {
+            Selection {
+                anchor: origin_start,
+                active: target_end,
+                mode: SelectionMode::Normal,
+            }
+        });
+    }
+
+    /// Extend an existing triple-click selection to whole viewport rows.
+    pub fn extend_line_selection_to(&mut self, row: usize) {
+        let Some(sel) = self.selection else {
+            return;
+        };
+        let cols = self.grid.row_len();
+        let target_row = self.viewport_row_to_absolute(row);
+        let origin_row = sel.anchor.0;
+
+        self.selection = Some(if target_row < origin_row {
+            Selection {
+                anchor: (origin_row, cols.saturating_sub(1)),
+                active: (target_row, 0),
+                mode: SelectionMode::Normal,
+            }
+        } else {
+            Selection {
+                anchor: (origin_row, 0),
+                active: (target_row, cols.saturating_sub(1)),
+                mode: SelectionMode::Normal,
+            }
         });
     }
 
@@ -5248,6 +5312,36 @@ mod tests {
         assert_eq!(
             terminal.copy_selection().as_deref(),
             Some("https://example.com/path")
+        );
+    }
+
+    #[test]
+    fn double_click_drag_keeps_word_boundaries() {
+        let mut terminal = TerminalState::new(64, 2);
+
+        terminal.process_input(b"Cargo.lock  Cargo.toml  src  target");
+        terminal.select_word_at(0, 4);
+        terminal.extend_word_selection_to(0, 18);
+
+        assert_eq!(
+            terminal.copy_selection().as_deref(),
+            Some("Cargo.lock  Cargo.toml")
+        );
+    }
+
+    #[test]
+    fn triple_click_drag_on_same_row_keeps_full_line() {
+        let mut terminal = TerminalState::new(64, 2);
+
+        terminal.process_input(b"Cargo.lock  Cargo.toml  src  target");
+        terminal.start_selection((0, 0));
+        terminal.update_selection((0, 63));
+        terminal.extend_line_selection_to(0);
+
+        assert_eq!(terminal.row_selection_cols(0), Some((0, 63)));
+        assert_eq!(
+            terminal.copy_selection().as_deref().map(str::trim_end),
+            Some("Cargo.lock  Cargo.toml  src  target")
         );
     }
 
