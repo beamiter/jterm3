@@ -70,6 +70,20 @@ mod unix_pty {
         }
     }
 
+    pub(crate) fn shell_single_quote(s: &str) -> String {
+        let mut quoted = String::with_capacity(s.len() + 2);
+        quoted.push('\'');
+        for ch in s.chars() {
+            if ch == '\'' {
+                quoted.push_str("'\"'\"'");
+            } else {
+                quoted.push(ch);
+            }
+        }
+        quoted.push('\'');
+        quoted
+    }
+
     fn choose_shell(configured_shell: Option<&str>) -> String {
         // Priority 1: explicit config (needed when PATH is stripped by launchers like wofi)
         if let Some(path) = configured_shell {
@@ -205,19 +219,45 @@ mod unix_pty {
                 };
                 let session_flag = CString::new("--session").unwrap();
                 let session_id_cstr = session_id.and_then(|s| CString::new(s).ok());
+                let bash_path = if shell_name == "rsh" {
+                    find_executable_in_path("bash").filter(|p| is_executable(Path::new(p)))
+                } else {
+                    None
+                };
+
+                let (exec_cstr, argv_cstrings): (CString, Vec<CString>) =
+                    if shell_name == "rsh" && bash_path.is_some() {
+                        let bash_path = bash_path.unwrap();
+                        let mut exec_cmd = format!("exec {}", shell_single_quote(&shell_path));
+                        if let Some(sid) = session_id {
+                            exec_cmd.push_str(" --session ");
+                            exec_cmd.push_str(&shell_single_quote(sid));
+                        }
+                        (
+                            cstr_or_bail!(bash_path, "bash path contains NUL"),
+                            vec![
+                                CString::new("bash").unwrap(),
+                                CString::new("-ic").unwrap(),
+                                cstr_or_bail!(exec_cmd, "bash wrapper command contains NUL"),
+                            ],
+                        )
+                    } else {
+                        let mut argv = vec![dash_shell_cstr.clone()];
+                        if let Some(ref arg) = login_arg {
+                            argv.push(arg.clone());
+                        }
+                        if shell_name == "rsh" {
+                            if let Some(ref sid) = session_id_cstr {
+                                argv.push(session_flag.clone());
+                                argv.push(sid.clone());
+                            }
+                        }
+                        (shell_cstr.clone(), argv)
+                    };
 
                 // argv pointers borrow the CStrings above; both outlive the fork.
-                let mut argv_ptrs: Vec<*const libc::c_char> = Vec::new();
-                argv_ptrs.push(dash_shell_cstr.as_ptr());
-                if let Some(ref arg) = login_arg {
-                    argv_ptrs.push(arg.as_ptr());
-                }
-                if shell_name == "rsh" {
-                    if let Some(ref sid) = session_id_cstr {
-                        argv_ptrs.push(session_flag.as_ptr());
-                        argv_ptrs.push(sid.as_ptr());
-                    }
-                }
+                let mut argv_ptrs: Vec<*const libc::c_char> =
+                    argv_cstrings.iter().map(|arg| arg.as_ptr()).collect();
                 argv_ptrs.push(std::ptr::null());
 
                 // Build a custom envp: copy the current environment, override our
@@ -321,7 +361,7 @@ mod unix_pty {
                     }
 
                     // 执行 shell，使用 fork 前构造好的 argv 与 envp。
-                    libc::execve(shell_cstr.as_ptr(), argv_ptrs.as_ptr(), envp.as_ptr());
+                    libc::execve(exec_cstr.as_ptr(), argv_ptrs.as_ptr(), envp.as_ptr());
 
                     // execve 仅在出错时返回。
                     libc::perror(b"execve failed\0".as_ptr() as *const i8);
@@ -691,3 +731,15 @@ pub use unix_pty::{Pty, ReaderPoll};
 
 #[cfg(windows)]
 pub use windows_pty::Pty;
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn shell_single_quote_escapes_embedded_quotes() {
+        assert_eq!(
+            super::unix_pty::shell_single_quote("/tmp/it's"),
+            "'/tmp/it'\"'\"'s'"
+        );
+    }
+}
