@@ -948,6 +948,15 @@ pub struct TerminalState {
     saved_cursor_col: usize,
     // DECSC/DECRC (and CSI s/u) saved full cursor state.
     saved_cursor: Option<SavedCursor>,
+    // Full primary-screen drawing state saved across alt-buffer swaps so
+    // fullscreen app colors do not leak into hidden main-buffer resizes.
+    saved_primary_screen_state: Option<SavedCursor>,
+    saved_primary_global_bg: Color,
+    saved_primary_cursor_shape: CursorShape,
+    saved_primary_dynamic_fg: Option<(u8, u8, u8)>,
+    saved_primary_dynamic_bg: Option<(u8, u8, u8)>,
+    saved_primary_dynamic_cursor_color: Option<(u8, u8, u8)>,
+    saved_primary_dynamic_palette: DynamicColorPalette,
     // Per-column horizontal tab stops (HTS/TBC); index = column.
     tab_stops: Vec<bool>,
     // Last printed character, for REP (CSI b).
@@ -1142,6 +1151,13 @@ impl TerminalState {
             saved_cursor_row: 0,
             saved_cursor_col: 0,
             saved_cursor: None,
+            saved_primary_screen_state: None,
+            saved_primary_global_bg: Color::Default,
+            saved_primary_cursor_shape: CursorShape::default(),
+            saved_primary_dynamic_fg: None,
+            saved_primary_dynamic_bg: None,
+            saved_primary_dynamic_cursor_color: None,
+            saved_primary_dynamic_palette: [None; 256],
             tab_stops: Self::default_tab_stops(cols),
             last_printed_char: None,
             pending_wrap: false,
@@ -1769,6 +1785,21 @@ impl TerminalState {
         });
     }
 
+    fn snapshot_cursor_state(&self) -> SavedCursor {
+        SavedCursor {
+            row: self.cursor_row,
+            col: self.cursor_col,
+            fg: self.current_fg,
+            bg: self.current_bg,
+            flags: self.current_flags,
+            g0: self.g0_charset,
+            g1: self.g1_charset,
+            active: self.active_charset,
+            origin_mode: self.modes.contains(&6),
+            pending_wrap: self.pending_wrap,
+        }
+    }
+
     fn restore_cursor(&mut self) {
         if let Some(s) = self.saved_cursor {
             self.cursor_row = s.row.min(self.grid.rows().saturating_sub(1));
@@ -1950,10 +1981,14 @@ impl TerminalState {
     }
 
     fn create_blank_cell(&self) -> TerminalCell {
+        self.blank_cell_with_bg(self.current_bg)
+    }
+
+    fn blank_cell_with_bg(&self, bg: Color) -> TerminalCell {
         TerminalCell {
             character: ' ',
             foreground: Color::Default,
-            background: self.current_bg, // Preserve current background color
+            background: bg,
             flags: StyleFlags::default(),
         }
     }
@@ -3686,6 +3721,13 @@ impl TerminalState {
                     // Save main buffer state (cursor position)
                     self.saved_cursor_row = self.cursor_row;
                     self.saved_cursor_col = self.cursor_col;
+                    self.saved_primary_screen_state = Some(self.snapshot_cursor_state());
+                    self.saved_primary_global_bg = self.global_bg;
+                    self.saved_primary_cursor_shape = self.cursor_shape;
+                    self.saved_primary_dynamic_fg = self.dynamic_fg;
+                    self.saved_primary_dynamic_bg = self.dynamic_bg;
+                    self.saved_primary_dynamic_cursor_color = self.dynamic_cursor_color;
+                    self.saved_primary_dynamic_palette = self.dynamic_palette;
 
                     // Reset scroll offset so we don't show scrollback in alt buffer
                     self.scroll_offset = 0;
@@ -3805,11 +3847,39 @@ impl TerminalState {
                     self.scroll_region_top = 0;
                     self.scroll_region_bottom = self.grid.rows().saturating_sub(1);
 
-                    // Reset SGR attributes to prevent alternate screen colors from bleeding through
-                    self.current_fg = Color::Default;
-                    self.current_bg = Color::Default;
-                    self.global_bg = Color::Default;
-                    self.current_flags = StyleFlags::default();
+                    // Restore the hidden primary screen's drawing state so any
+                    // resize that happened while a fullscreen app was active
+                    // does not leave the main buffer tinted with alt colors.
+                    if let Some(saved) = self.saved_primary_screen_state.take() {
+                        self.current_fg = saved.fg;
+                        self.current_bg = saved.bg;
+                        self.current_flags = saved.flags;
+                        self.g0_charset = saved.g0;
+                        self.g1_charset = saved.g1;
+                        self.active_charset = saved.active;
+                        if saved.origin_mode {
+                            self.modes.insert(6);
+                        } else {
+                            self.modes.remove(&6);
+                        }
+                        self.pending_wrap = saved.pending_wrap;
+                    } else {
+                        self.current_fg = Color::Default;
+                        self.current_bg = Color::Default;
+                        self.current_flags = StyleFlags::default();
+                        self.modes.remove(&6);
+                    }
+                    self.global_bg = self.saved_primary_global_bg;
+                    self.saved_primary_global_bg = Color::Default;
+                    self.cursor_shape = self.saved_primary_cursor_shape;
+                    self.dynamic_fg = self.saved_primary_dynamic_fg;
+                    self.dynamic_bg = self.saved_primary_dynamic_bg;
+                    self.dynamic_cursor_color = self.saved_primary_dynamic_cursor_color;
+                    self.dynamic_palette = self.saved_primary_dynamic_palette;
+                    self.saved_primary_dynamic_fg = None;
+                    self.saved_primary_dynamic_bg = None;
+                    self.saved_primary_dynamic_cursor_color = None;
+                    self.saved_primary_dynamic_palette = [None; 256];
 
                     // Mark all rows dirty after grid swap to force full re-render
                     // Increment by rows+1 to trigger grid_version_jumped in ui.rs
@@ -4677,7 +4747,16 @@ impl TerminalState {
         let had_full_screen_region = old_rows == 0
             || (self.scroll_region_top == 0 && self.scroll_region_bottom + 1 >= old_rows);
 
-        let blank_cell = self.create_blank_cell();
+        let active_blank_cell = self.create_blank_cell();
+        let primary_blank_bg = if self.use_alt_buffer {
+            self.saved_primary_screen_state
+                .map(|state| state.bg)
+                .unwrap_or(Color::Default)
+        } else {
+            self.current_bg
+        };
+        let primary_blank_cell = self.blank_cell_with_bg(primary_blank_bg);
+        let alt_blank_cell = active_blank_cell.clone();
 
         // When the row count shrinks on the primary screen, mirror a real
         // terminal: push the oldest on-screen lines into scrollback and shift the
@@ -4704,8 +4783,13 @@ impl TerminalState {
             }
         }
 
-        self.grid.resize(rows, cols, blank_cell.clone());
-        self.alt_grid.resize(rows, cols, blank_cell.clone());
+        if self.use_alt_buffer {
+            self.grid.resize(rows, cols, alt_blank_cell);
+            self.alt_grid.resize(rows, cols, primary_blank_cell);
+        } else {
+            self.grid.resize(rows, cols, active_blank_cell.clone());
+            self.alt_grid.resize(rows, cols, active_blank_cell);
+        }
 
         // CRITICAL: Sync row_versions size with grid size to prevent dirty mark loss
         // When grid grows, we need to extend row_versions; when it shrinks, truncate it
@@ -5587,6 +5671,45 @@ mod tests {
         );
         assert_eq!(terminal.scroll_region_top, 0);
         assert_eq!(terminal.scroll_region_bottom, 3);
+    }
+
+    #[test]
+    fn resizing_hidden_primary_screen_does_not_inherit_alt_background() {
+        let mut terminal = TerminalState::new(4, 2);
+        terminal.process_input(b"main");
+
+        terminal.process_input(b"\x1b[?1049h");
+        terminal.process_input(b"\x1b[44m");
+        assert_eq!(terminal.current_bg, Color::Blue);
+
+        terminal.on_resize(6, 2);
+        terminal.process_input(b"\x1b[?1049l");
+
+        assert_eq!(terminal.current_bg, Color::Default);
+        assert_eq!(terminal.global_bg, Color::Default);
+        assert_eq!(terminal.grid[0][4].background, Color::Default);
+        assert_eq!(terminal.grid[0][5].background, Color::Default);
+        assert_eq!(terminal.grid[1][0].background, Color::Default);
+    }
+
+    #[test]
+    fn alt_buffer_restores_primary_cursor_shape_and_dynamic_colors() {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.process_input(b"\x1b]10;#112233\x1b\\\x1b]11;#445566\x1b\\\x1b]12;#778899\x1b\\");
+        terminal.process_input(b"\x1b[3 q");
+        terminal.process_input(b"\x1b]4;1;#abcdef\x1b\\");
+
+        terminal.process_input(b"\x1b[?1049h");
+        terminal.process_input(b"\x1b]10;#010203\x1b\\\x1b]11;#040506\x1b\\\x1b]12;#070809\x1b\\");
+        terminal.process_input(b"\x1b[5 q");
+        terminal.process_input(b"\x1b]4;1;#102030\x1b\\");
+        terminal.process_input(b"\x1b[?1049l");
+
+        assert_eq!(terminal.cursor_shape, CursorShape::Underline);
+        assert_eq!(terminal.dynamic_fg, Some((0x11, 0x22, 0x33)));
+        assert_eq!(terminal.dynamic_bg, Some((0x44, 0x55, 0x66)));
+        assert_eq!(terminal.dynamic_cursor_color, Some((0x77, 0x88, 0x99)));
+        assert_eq!(terminal.dynamic_palette[1], Some((0xab, 0xcd, 0xef)));
     }
 
     #[test]
