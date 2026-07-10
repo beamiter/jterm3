@@ -685,6 +685,23 @@ impl Jterm {
         self.sidebar_open
     }
 
+    /// Toggle the left dock and refresh its file root when it becomes visible.
+    /// Keeping this in one place makes the toolbar, shortcut, and command
+    /// palette behave identically.
+    fn toggle_sidebar(&mut self) {
+        self.sidebar_open = !self.sidebar_open;
+        if self.sidebar_open {
+            if let Some(cwd) = self
+                .sessions
+                .get(self.active)
+                .and_then(|s| s.cwd_cache.clone().or_else(|| s.cwd()))
+            {
+                self.sidebar.set_current_dir(std::path::PathBuf::from(cwd));
+            }
+        }
+        self.apply_config();
+    }
+
     /// Terminal area height: window minus the tab bar and status bar. The top bar
     /// is always reserved (even in side-tab mode, where it hosts the dock toggle)
     /// so floating chrome never overlaps terminal content.
@@ -1265,6 +1282,10 @@ impl Jterm {
                 self.config_panel_open = !self.config_panel_open;
                 Task::none()
             }
+            C::SidebarToggle => {
+                self.toggle_sidebar();
+                Task::none()
+            }
             C::FontZoomIn => {
                 self.adjust_font_size(1.0);
                 Task::none()
@@ -1785,6 +1806,47 @@ impl Jterm {
                     Task::none()
                 }
             }
+            PaletteAction::SplitVertical => {
+                self.split(SplitMode::Vertical);
+                Task::none()
+            }
+            PaletteAction::SplitHorizontal => {
+                self.split(SplitMode::Horizontal);
+                Task::none()
+            }
+            PaletteAction::FocusNextPane => {
+                self.focus_next_pane();
+                Task::none()
+            }
+            PaletteAction::ClosePane => self.close_focused_pane(),
+            PaletteAction::ToggleSidebar => {
+                self.toggle_sidebar();
+                Task::none()
+            }
+            PaletteAction::OpenSettings => {
+                self.config_panel_open = true;
+                Task::none()
+            }
+            PaletteAction::QuickTabSwitch => {
+                self.tab_switcher = Some(TabSwitcherState::default());
+                iced::widget::operation::focus(TAB_SWITCHER_INPUT_ID.clone())
+            }
+            PaletteAction::OpenHelp => {
+                self.help_open = true;
+                Task::none()
+            }
+            PaletteAction::ZoomIn => {
+                self.adjust_font_size(1.0);
+                Task::none()
+            }
+            PaletteAction::ZoomOut => {
+                self.adjust_font_size(-1.0);
+                Task::none()
+            }
+            PaletteAction::ZoomReset => {
+                self.reset_font_size();
+                Task::none()
+            }
             PaletteAction::ScrollToTop => {
                 if let Some(sess) = self.sessions.get_mut(self.active) {
                     let len = sess.terminal.scrollback_len();
@@ -2147,17 +2209,7 @@ impl Jterm {
                 }
             }
             Message::ToggleSidebar => {
-                self.sidebar_open = !self.sidebar_open;
-                if self.sidebar_open {
-                    if let Some(cwd) = self
-                        .sessions
-                        .get(self.active)
-                        .and_then(|s| s.cwd_cache.clone().or_else(|| s.cwd()))
-                    {
-                        self.sidebar.set_current_dir(std::path::PathBuf::from(cwd));
-                    }
-                }
-                self.apply_config();
+                self.toggle_sidebar();
             }
             Message::SetSidebarPanel(panel) => {
                 self.sidebar_panel = panel;
@@ -3887,6 +3939,7 @@ impl Jterm {
             kb("Shift+End", "Scroll to bottom (live)"),
             kb("Ctrl+Shift+F", "Find"),
             section("Panels"),
+            kb("Ctrl+Shift+B", "Toggle tabs / files sidebar"),
             kb("Ctrl+Shift+P", "Command palette"),
             kb("Ctrl+Shift+O", "Settings"),
             kb("Ctrl+Shift+G", "Debug / diagnostics"),

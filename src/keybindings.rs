@@ -46,6 +46,7 @@ pub enum Command {
     ConfigOpen,
     ConfigClose,
     ConfigToggle,
+    SidebarToggle,
 
     // === 字体缩放 ===
     FontZoomIn,
@@ -83,6 +84,7 @@ impl std::fmt::Display for Command {
             Command::ConfigOpen => write!(f, "config:open"),
             Command::ConfigClose => write!(f, "config:close"),
             Command::ConfigToggle => write!(f, "config:toggle"),
+            Command::SidebarToggle => write!(f, "sidebar:toggle"),
             Command::FontZoomIn => write!(f, "font:zoom_in"),
             Command::FontZoomOut => write!(f, "font:zoom_out"),
             Command::FontZoomReset => write!(f, "font:zoom_reset"),
@@ -121,6 +123,7 @@ impl std::str::FromStr for Command {
             "config:open" => Ok(Command::ConfigOpen),
             "config:close" => Ok(Command::ConfigClose),
             "config:toggle" => Ok(Command::ConfigToggle),
+            "sidebar:toggle" => Ok(Command::SidebarToggle),
             "font:zoom_in" => Ok(Command::FontZoomIn),
             "font:zoom_out" => Ok(Command::FontZoomOut),
             "font:zoom_reset" => Ok(Command::FontZoomReset),
@@ -376,6 +379,9 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+shift+o".to_string(), "config:toggle".to_string());
+        bindings
+            .bindings
+            .insert("ctrl+shift+b".to_string(), "sidebar:toggle".to_string());
 
         // 终端操作
         bindings
@@ -478,6 +484,9 @@ mod tests {
 
         let cmd: Command = "session:jump:5".parse().unwrap();
         assert_eq!(cmd, Command::SessionJump(5));
+
+        let cmd: Command = "sidebar:toggle".parse().unwrap();
+        assert_eq!(cmd, Command::SidebarToggle);
     }
 
     #[test]
@@ -514,6 +523,10 @@ mod tests {
         assert_eq!(
             bindings.get_command("ctrl+shift+t"),
             Some(Command::SessionNew)
+        );
+        assert_eq!(
+            bindings.get_command("ctrl+shift+b"),
+            Some(Command::SidebarToggle)
         );
     }
 
