@@ -419,34 +419,6 @@ mod unix_pty {
             self.master
         }
 
-        pub fn wait_fd_readable(fd: RawFd, timeout_ms: i32) -> Result<bool> {
-            let mut poll_fd = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-
-            // SAFETY: poll_fd 是有效的栈上变量，libc::poll 接受可变指针和长度，
-            // 超时参数是合法的毫秒值。poll 调用是原子的，不会导致数据竞争。
-            let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
-            if ready < 0 {
-                Err(anyhow!(
-                    "Failed to poll PTY: {}",
-                    std::io::Error::last_os_error()
-                ))
-            } else if ready == 0 {
-                Ok(false)
-            } else if poll_fd.revents & libc::POLLNVAL != 0 {
-                // fd was closed (e.g. the session was dropped). Surface this as
-                // an error so the reader thread exits instead of busy-looping —
-                // poll() returns immediately on an invalid fd, which otherwise
-                // spins the CPU and leaks the thread forever.
-                Err(anyhow!("PTY fd is invalid (POLLNVAL)"))
-            } else {
-                Ok((poll_fd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0)
-            }
-        }
-
         /// Create a self-pipe used to wake the reader thread on shutdown.
         /// Returns (read_end, write_end). Closing the write end makes a `poll`
         /// on the read end report POLLHUP immediately.
@@ -551,30 +523,6 @@ mod unix_pty {
             }
         }
 
-        /// Single non-blocking read. `Ok(Some(n))` with n>0 means n bytes were
-        /// read; `Ok(Some(0))` means WouldBlock (no data right now); `Ok(None)`
-        /// means EOF — the child closed the PTY. Collapsing EOF and WouldBlock
-        /// into a bare `Ok(0)` would let a read loop busy-spin on a hung-up PTY.
-        pub fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>> {
-            // SAFETY: self.master 是有效的文件描述符，buf.as_mut_ptr() 指向有效的可变内存，
-            // buf.len() 是正确的缓冲区大小。read 不会超出边界。
-            unsafe {
-                let n = libc::read(self.master, buf.as_mut_ptr() as *mut _, buf.len());
-                if n > 0 {
-                    Ok(Some(n as usize))
-                } else if n == 0 {
-                    Ok(None) // EOF
-                } else {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::WouldBlock {
-                        Ok(Some(0))
-                    } else {
-                        Err(anyhow!("Failed to read from PTY: {}", err))
-                    }
-                }
-            }
-        }
-
         pub fn resize(&mut self, cols: usize, rows: usize) -> Result<()> {
             // SAFETY: win_size 是有效的栈上变量，符合 libc::winsize 的内存布局。
             // ioctl TIOCSWINSZ 调用是标准的 PTY 窗口大小设置操作。
@@ -614,8 +562,7 @@ mod unix_pty {
                     true
                 } else if result > 0 {
                     // The child changed state and we just reaped it — decode and
-                    // cache the real exit status here so it isn't lost (a later
-                    // wait_timeout would otherwise hit ECHILD and fabricate 0).
+                    // cache the real exit status here so it isn't lost.
                     let code = if libc::WIFEXITED(status) {
                         libc::WEXITSTATUS(status) as i32
                     } else if libc::WIFSIGNALED(status) {
@@ -630,42 +577,6 @@ mod unix_pty {
                     // Treat as dead so callers stop polling.
                     self.exit_code_cached = Some(0);
                     false
-                }
-            }
-        }
-
-        pub fn wait_timeout(&mut self, _timeout_ms: u64) -> Result<i32> {
-            // If we already have a cached exit code, return it directly
-            if let Some(code) = self.exit_code_cached {
-                return Ok(code);
-            }
-
-            // SAFETY: waitpid 阻塞等待子进程退出。status 是有效的栈变量，
-            // child_pid 是我们 fork 创建的有效进程 ID。
-            unsafe {
-                let mut status = 0;
-                let result = libc::waitpid(self.child_pid, &mut status, 0);
-
-                if result < 0 {
-                    // If waitpid fails with ECHILD, it means the process has already been waited on
-                    // In this case, return a default exit code of 0
-                    let err = std::io::Error::last_os_error();
-                    if err.raw_os_error() == Some(libc::ECHILD) {
-                        crate::debug_log!("[PTY] waitpid returned ECHILD, process already reaped");
-                        self.exit_code_cached = Some(0);
-                        return Ok(0);
-                    }
-                    Err(anyhow!("waitpid failed: {}", err))
-                } else {
-                    let exit_code = if libc::WIFEXITED(status) {
-                        libc::WEXITSTATUS(status) as i32
-                    } else if libc::WIFSIGNALED(status) {
-                        -(libc::WTERMSIG(status) as i32)
-                    } else {
-                        -1
-                    };
-                    self.exit_code_cached = Some(exit_code);
-                    Ok(exit_code)
                 }
             }
         }
@@ -735,20 +646,12 @@ mod windows_pty {
             Err(anyhow!("PTY not available"))
         }
 
-        pub fn read(&mut self, _buf: &mut [u8]) -> Result<Option<usize>> {
-            Err(anyhow!("PTY not available"))
-        }
-
         pub fn resize(&mut self, _cols: usize, _rows: usize) -> Result<()> {
             Err(anyhow!("PTY not available"))
         }
 
         pub fn is_alive(&self) -> bool {
             false
-        }
-
-        pub fn wait_timeout(&mut self, _timeout_ms: u64) -> Result<i32> {
-            Err(anyhow!("PTY not available"))
         }
 
         pub fn terminate(&mut self) -> Result<()> {

@@ -155,19 +155,6 @@ pub struct Modifiers {
     pub super_key: bool,
 }
 
-impl Modifiers {
-    pub fn is_none(&self) -> bool {
-        !self.ctrl && !self.shift && !self.alt && !self.super_key
-    }
-
-    pub fn count(&self) -> usize {
-        (self.ctrl as usize)
-            + (self.shift as usize)
-            + (self.alt as usize)
-            + (self.super_key as usize)
-    }
-}
-
 /// 快捷键（可配置）
 #[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -178,6 +165,7 @@ pub struct KeyBinding {
 }
 
 impl KeyBinding {
+    #[cfg(test)]
     pub fn new(key: &str, modifiers: Modifiers, command: Command) -> Self {
         Self {
             key: key.to_lowercase(),
@@ -187,6 +175,7 @@ impl KeyBinding {
     }
 
     /// 从快捷键字符串解析（格式：ctrl+shift+a, alt+F1 等）
+    #[cfg(test)]
     pub fn from_string(binding_str: &str, command: Command) -> Result<Self, String> {
         let binding_lower = binding_str.to_lowercase();
         let parts: Vec<&str> = binding_lower.split('+').collect();
@@ -267,6 +256,7 @@ impl KeyBinding {
     }
 
     /// 转换为快捷键字符串表示
+    #[cfg(test)]
     pub fn to_string(&self) -> String {
         let mut parts = Vec::new();
 
@@ -447,17 +437,6 @@ impl KeyBindings {
         }
 
         Ok(bindings)
-    }
-
-    /// 保存配置文件
-    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let path = Self::config_path()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let content = toml::to_string_pretty(self)?;
-        std::fs::write(path, content)?;
-        Ok(())
     }
 
     /// 获取配置文件路径

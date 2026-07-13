@@ -29,12 +29,6 @@ const NERD_FONT_FALLBACK_CANDIDATES: &[&str] = &[
 const MATH_SYMBOL_FONT_CANDIDATES: &[&str] =
     &["Noto Sans Math", "Noto Sans Symbols2", "OpenSymbol"];
 
-// 延迟加载的字体列表缓存（避免启动时阻塞）
-static AVAILABLE_FONTS: Lazy<Vec<String>> = Lazy::new(|| {
-    eprintln!("[Config] Scanning system fonts (one-time)...");
-    detect_fonts_by_query(&[":"])
-});
-
 static MONOSPACE_FONTS: Lazy<Vec<String>> = Lazy::new(|| {
     eprintln!("[Config] Scanning monospace fonts (one-time)...");
     detect_fonts_by_query(&[":spacing=100"])
@@ -262,10 +256,6 @@ fn detect_preferred_font(candidates: &[&str]) -> Option<String> {
     None
 }
 
-fn detect_available_fonts() -> &'static Vec<String> {
-    &AVAILABLE_FONTS
-}
-
 fn detect_monospace_fonts() -> &'static Vec<String> {
     &MONOSPACE_FONTS
 }
@@ -419,10 +409,6 @@ impl Config {
             .and_then(|m| m.modified().ok())
     }
 
-    pub fn get_font_family(&self) -> &str {
-        &self.font_family
-    }
-
     // 配置值约束方法
     #[allow(dead_code)]
     pub fn clamp_font_size(size: f32) -> f32 {
@@ -456,10 +442,6 @@ impl Config {
 
     pub fn get_monospace_fonts() -> &'static Vec<String> {
         detect_monospace_fonts()
-    }
-
-    pub fn get_all_fonts() -> &'static Vec<String> {
-        detect_available_fonts()
     }
 
     pub fn cjk_monospace_font_family() -> Option<&'static str> {

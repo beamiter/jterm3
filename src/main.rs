@@ -2455,6 +2455,8 @@ impl Jterm {
                 // tab labels reflect both. These are cheap /proc reads at 1.5s
                 // cadence and let inactive tabs still show "vim · src" etc.
                 for sess in self.sessions.iter_mut() {
+                    sess.terminal.check_sync_output_timeout();
+                    sess.refresh();
                     sess.cwd_cache = sess.cwd();
                     sess.fg_proc_cache = sess.fg_proc();
                 }

@@ -185,12 +185,6 @@ impl TerminalGrid {
         self.row_wrapped[self.rows - 1] = false;
     }
 
-    /// 用blank_cell填充末尾一行
-    pub fn fill_last_row(&mut self, cell: TerminalCell) {
-        let last_start = (self.rows - 1) * self.cols;
-        self.cells[last_start..].fill(cell);
-    }
-
     /// 是否为空
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -796,11 +790,6 @@ impl DirtyRegion {
     pub fn mark_all(&mut self, rows: usize) {
         self.rows.clear();
         self.rows.push((0, rows.saturating_sub(1)));
-    }
-
-    /// 清除脏标记
-    pub fn clear(&mut self) {
-        self.rows.clear();
     }
 }
 
@@ -2248,16 +2237,6 @@ impl TerminalState {
     fn mark_rows_dirty(&mut self, start: usize, end: usize) {
         for row in start..=end.min(self.row_versions.len().saturating_sub(1)) {
             self.row_versions[row] = self.grid_version;
-        }
-    }
-
-    /// P4：获取上次渲染后修改过的行索引
-    pub fn get_dirty_rows(&self, last_rendered_version: u64, out: &mut Vec<usize>) {
-        out.clear();
-        for (i, &v) in self.row_versions.iter().enumerate() {
-            if v > last_rendered_version {
-                out.push(i);
-            }
         }
     }
 
@@ -3915,10 +3894,6 @@ impl TerminalState {
         }
     }
 
-    pub fn max_scrollback(&self) -> usize {
-        self.max_scrollback
-    }
-
     /// Number of lines currently retained in scrollback (above the live grid).
     /// This is the maximum value `scroll_offset` may take.
     pub fn scrollback_len(&self) -> usize {
@@ -4076,10 +4051,6 @@ impl TerminalState {
         self.modes.contains(&66)
     }
 
-    pub fn is_paste_events_enabled(&self) -> bool {
-        self.modes.contains(&5522)
-    }
-
     pub fn keyboard_enhancement_flags(&self) -> u16 {
         self.keyboard_enhancement_flags
     }
@@ -4121,36 +4092,6 @@ impl TerminalState {
 
     pub fn take_clipboard_read_requests(&mut self) -> Vec<ClipboardReadRequest> {
         std::mem::take(&mut self.pending_clipboard_requests)
-    }
-
-    fn scroll_down(&mut self) {
-        if self.grid.rows() > 0 {
-            let bg_color = self.current_bg;
-            let blank_cell = TerminalCell {
-                character: ' ',
-                foreground: Color::Default,
-                background: bg_color,
-                flags: StyleFlags::default(),
-            };
-
-            // Compress first row directly from the grid slice before shifting,
-            // avoiding a per-line Vec allocation from get_row.
-            if !self.use_alt_buffer {
-                let line = ScrollbackLine::compress(&self.grid[0], self.grid.row_wrapped[0]);
-                self.grid.shift_rows_up();
-                self.grid.fill_last_row(blank_cell);
-                self.push_scrollback_compressed(line);
-            } else {
-                self.grid.shift_rows_up();
-                self.grid.fill_last_row(blank_cell);
-            }
-
-            self.dirty_region.mark_all(self.grid.rows());
-            let version = self.grid_version;
-            for v in self.row_versions.iter_mut() {
-                *v = version;
-            }
-        }
     }
 
     pub fn get_visible_cells(&mut self) -> std::sync::Arc<Vec<Vec<TerminalCell>>> {
