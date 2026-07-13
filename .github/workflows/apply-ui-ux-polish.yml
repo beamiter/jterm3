@@ -1,0 +1,555 @@
+name: Apply UI and UX polish
+
+on:
+  push:
+    branches:
+      - agent/ui-ux-polish
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: agent/ui-ux-polish
+          fetch-depth: 0
+
+      - name: Update terminal UI
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/main.rs")
+          src = path.read_text()
+
+          def replace_once(old: str, new: str, label: str) -> None:
+              global src
+              count = src.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one match, found {count}")
+              src = src.replace(old, new, 1)
+
+          replace_once(
+              """    SidebarToggleNode(std::path::PathBuf),
+    SidebarInsertPath(std::path::PathBuf),
+    DividerDragStart,
+""",
+              """    SidebarToggleNode(std::path::PathBuf),
+    SidebarInsertPath(std::path::PathBuf),
+    SidebarGoParent,
+    SidebarRefresh,
+    DividerDragStart,
+""",
+              "sidebar messages",
+          )
+
+          replace_once(
+              """    SearchToggleCase,
+    SearchInput(String),
+    PaletteInput(String),
+    PaletteExecute(usize),
+""",
+              """    SearchToggleCase,
+    SearchInput(String),
+    SearchPrevious,
+    SearchNext,
+    SearchClose,
+    PaletteInput(String),
+    PaletteClose,
+    PaletteExecute(usize),
+""",
+              "overlay messages",
+          )
+
+          replace_once(
+              """    fn panel_style(&self) -> impl Fn(&iced::Theme) -> container::Style {
+        let bg = self.c_panel();
+        let text = self.c_text();
+        move |_| container::Style {
+            text_color: Some(text),
+            background: Some(bg.into()),
+            ..Default::default()
+        }
+    }
+
+    fn divider_style(&self) -> impl Fn(&iced::Theme) -> container::Style {
+""",
+              """    fn panel_style(&self) -> impl Fn(&iced::Theme) -> container::Style {
+        let bg = self.c_panel();
+        let text = self.c_text();
+        move |_| container::Style {
+            text_color: Some(text),
+            background: Some(bg.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Theme-aware surface shared by search, palettes, settings, help and menus.
+    fn overlay_panel_style(&self) -> impl Fn(&iced::Theme) -> container::Style {
+        let bg = self.c_panel();
+        let text = self.c_text();
+        let border = self.c_border();
+        move |_| container::Style {
+            text_color: Some(text),
+            background: Some(Color { a: 0.98, ..bg }.into()),
+            border: iced::Border {
+                color: border,
+                width: 1.0,
+                radius: 10.0.into(),
+            },
+            ..Default::default()
+        }
+    }
+
+    fn divider_style(&self) -> impl Fn(&iced::Theme) -> container::Style {
+""",
+              "overlay style helper",
+          )
+
+          replace_once(
+              """            Message::SidebarToggleNode(path) => self.sidebar.toggle_node(&path),
+            Message::SidebarInsertPath(path) => {
+                // Type the (shell-quoted) path into the active terminal so the
+                // sidebar doubles as a path picker.
+                if let Some(sess) = self.sessions.get_mut(self.active) {
+                    let quoted = shell_quote(&path.to_string_lossy());
+                    sess.terminal.scroll_to_bottom();
+                    sess.write_pty(quoted.as_bytes());
+                    sess.refresh();
+                }
+            }
+            Message::SearchToggleRegex => {
+""",
+              """            Message::SidebarToggleNode(path) => self.sidebar.toggle_node(&path),
+            Message::SidebarInsertPath(path) => {
+                // Type the (shell-quoted) path into the active terminal so the
+                // sidebar doubles as a path picker.
+                if let Some(sess) = self.sessions.get_mut(self.active) {
+                    let quoted = shell_quote(&path.to_string_lossy());
+                    sess.terminal.scroll_to_bottom();
+                    sess.write_pty(quoted.as_bytes());
+                    sess.refresh();
+                }
+            }
+            Message::SidebarGoParent => {
+                if let Some(parent) = self.sidebar.current_dir.parent().map(|p| p.to_path_buf()) {
+                    self.sidebar.set_current_dir(parent);
+                }
+            }
+            Message::SidebarRefresh => self.sidebar.refresh(),
+            Message::SearchToggleRegex => {
+""",
+              "sidebar actions",
+          )
+
+          replace_once(
+              """            Message::SearchInput(value) => {
+                self.search.query = value;
+                self.search.history_nav_index = None;
+                self.recompute_search();
+            }
+            Message::PaletteInput(value) => {
+                self.palette.query = value;
+                self.palette.selected = 0;
+            }
+            Message::PaletteExecute(i) => {
+""",
+              """            Message::SearchInput(value) => {
+                self.search.query = value;
+                self.search.history_nav_index = None;
+                self.recompute_search();
+            }
+            Message::SearchPrevious => self.search.prev_match(),
+            Message::SearchNext => self.search.next_match(),
+            Message::SearchClose => self.search.close(),
+            Message::PaletteInput(value) => {
+                self.palette.query = value;
+                self.palette.selected = 0;
+            }
+            Message::PaletteClose => self.palette.close(),
+            Message::PaletteExecute(i) => {
+""",
+              "overlay actions",
+          )
+
+          replace_once(
+              """        let title = self
+            .sidebar
+            .current_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("/")
+            .to_string();
+        let mut rows: Vec<Element<'_, Message>> =
+            vec![container(text(title).size(12).font(iced::Font {
+                weight: iced::font::Weight::Bold,
+                ..iced::Font::DEFAULT
+            }))
+            .padding([4, 6])
+            .into()];
+""",
+              """        let title = self
+            .sidebar
+            .current_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("/")
+            .to_string();
+        let header = row![
+            button(text("↑").size(12))
+                .on_press(Message::SidebarGoParent)
+                .padding([2, 6])
+                .style(self.ghost_btn_style()),
+            text(title).size(12).font(iced::Font {
+                weight: iced::font::Weight::Bold,
+                ..iced::Font::DEFAULT
+            }),
+            Space::new().width(Length::Fill),
+            button(text("↻").size(12))
+                .on_press(Message::SidebarRefresh)
+                .padding([2, 6])
+                .style(self.ghost_btn_style()),
+        ]
+        .spacing(4)
+        .align_y(iced::Alignment::Center);
+        let mut rows: Vec<Element<'_, Message>> =
+            vec![container(header).padding([4, 6]).into()];
+""",
+              "sidebar file header",
+          )
+
+          search_old = '''    fn search_bar(&self) -> Element<'_, Message> {
+        let status = if let Some(err) = &self.search.error_message {
+            err.clone()
+        } else if !self.search.matches.is_empty() {
+            format!(
+                "{}/{}",
+                self.search.current_match_index + 1,
+                self.search.matches.len()
+            )
+        } else if !self.search.query.is_empty() {
+            "No matches".to_string()
+        } else {
+            String::new()
+        };
+
+        // Clickable mode toggles (also bound to Ctrl+R / Ctrl+I).
+        let regex_btn = button(text(".*").size(12))
+            .on_press(Message::SearchToggleRegex)
+            .padding([2, 6])
+            .style(if self.search.use_regex {
+                button::primary
+            } else {
+                button::secondary
+            });
+        let case_btn = button(text("Aa").size(12))
+            .on_press(Message::SearchToggleCase)
+            .padding([2, 6])
+            .style(if self.search.case_sensitive {
+                button::primary
+            } else {
+                button::secondary
+            });
+
+        let input = text_input("search…", &self.search.query)
+            .id(SEARCH_INPUT_ID.clone())
+            .on_input(Message::SearchInput)
+            .size(13)
+            .width(Length::Fixed(220.0));
+        let mut bar = row![text("Find:").size(13), input]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+        if !status.is_empty() {
+            bar = bar.push(text(status).size(13));
+        }
+        bar = bar.push(regex_btn).push(case_btn);
+        let inner = container(bar).padding([4, 10]).style(container::dark);
+        container(inner)
+            .align_right(Length::Fill)
+            .align_top(Length::Fill)
+            .padding(8)
+            .into()
+    }
+'''
+          search_new = '''    fn search_bar(&self) -> Element<'_, Message> {
+        let status = if let Some(err) = &self.search.error_message {
+            err.clone()
+        } else if !self.search.matches.is_empty() {
+            format!(
+                "{}/{}",
+                self.search.current_match_index + 1,
+                self.search.matches.len()
+            )
+        } else if !self.search.query.is_empty() {
+            "No matches".to_string()
+        } else {
+            String::new()
+        };
+
+        // Clickable mode toggles (also bound to Ctrl+R / Ctrl+I).
+        let regex_btn = button(text(".*").size(12))
+            .on_press(Message::SearchToggleRegex)
+            .padding([2, 6])
+            .style(if self.search.use_regex {
+                button::primary
+            } else {
+                button::secondary
+            });
+        let case_btn = button(text("Aa").size(12))
+            .on_press(Message::SearchToggleCase)
+            .padding([2, 6])
+            .style(if self.search.case_sensitive {
+                button::primary
+            } else {
+                button::secondary
+            });
+        let previous_btn = button(text("↑").size(12))
+            .on_press(Message::SearchPrevious)
+            .padding([2, 6])
+            .style(button::secondary);
+        let next_btn = button(text("↓").size(12))
+            .on_press(Message::SearchNext)
+            .padding([2, 6])
+            .style(button::secondary);
+        let close_btn = button(text("×").size(12))
+            .on_press(Message::SearchClose)
+            .padding([2, 6])
+            .style(self.close_btn_style());
+
+        let input_width = (self.win_size.width - 330.0).clamp(150.0, 360.0);
+        let input = text_input("search…", &self.search.query)
+            .id(SEARCH_INPUT_ID.clone())
+            .on_input(Message::SearchInput)
+            .size(13)
+            .width(Length::Fixed(input_width));
+        let bar = row![
+            text("Find:").size(13),
+            input,
+            regex_btn,
+            case_btn,
+            previous_btn,
+            next_btn,
+            close_btn,
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+        let mut footer_text = "Enter next · Shift+Enter previous · Esc close".to_string();
+        if !status.is_empty() {
+            footer_text = format!("{status}  ·  {footer_text}");
+        }
+        let footer = text(footer_text).size(10).style(text::secondary);
+        let inner = container(column![bar, footer].spacing(4))
+            .padding([6, 10])
+            .style(self.overlay_panel_style());
+        container(inner)
+            .align_right(Length::Fill)
+            .align_top(Length::Fill)
+            .padding(8)
+            .into()
+    }
+'''
+          replace_once(search_old, search_new, "search overlay")
+
+          palette_old = '''    fn command_palette(&self) -> Element<'_, Message> {
+        let query = text_input("Type to filter…", &self.palette.query)
+            .id(PALETTE_INPUT_ID.clone())
+            .on_input(Message::PaletteInput)
+            .size(14);
+        let query_line = row![text("›").size(16), query]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+
+        let mut list = column![].spacing(2);
+        let filtered = self.palette.filtered();
+        if filtered.is_empty() {
+            list = list.push(text("No commands").size(13).style(text::secondary));
+        } else {
+            for (pos, (idx, item)) in filtered.iter().enumerate() {
+                let mut info = row![
+                    text(item.name).size(14),
+                    text(item.description).size(11).style(text::secondary),
+                    Space::new().width(Length::Fill),
+                ]
+                .spacing(10)
+                .align_y(iced::Alignment::Center);
+                if !item.shortcut.is_empty() {
+                    info = info.push(text(item.shortcut).size(11).style(text::secondary));
+                }
+                let row_btn = button(info)
+                    .on_press(Message::PaletteExecute(*idx))
+                    .width(Length::Fill)
+                    .padding([4, 8])
+                    .style(if pos == self.palette.selected {
+                        button::primary
+                    } else {
+                        button::text
+                    });
+                list = list.push(row_btn);
+            }
+        }
+
+        let footer = text("↑↓ navigate · Enter run · Esc close")
+            .size(10)
+            .style(text::secondary);
+        let inner = container(
+            column![query_line, scrollable(list).height(Length::Shrink), footer].spacing(8),
+        )
+        .width(Length::Fixed(520.0))
+        .max_height(420.0)
+        .padding(12)
+        .style(container::dark);
+        container(inner)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into()
+    }
+'''
+          palette_new = '''    fn command_palette(&self) -> Element<'_, Message> {
+        let query = text_input("Type to filter…", &self.palette.query)
+            .id(PALETTE_INPUT_ID.clone())
+            .on_input(Message::PaletteInput)
+            .size(14);
+        let heading = row![
+            text("Command Palette").size(12).style(text::secondary),
+            Space::new().width(Length::Fill),
+            button(text("×").size(12))
+                .on_press(Message::PaletteClose)
+                .padding([2, 6])
+                .style(self.close_btn_style()),
+        ]
+        .align_y(iced::Alignment::Center);
+        let query_line = row![text("›").size(16), query]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+
+        let mut list = column![].spacing(2);
+        let filtered = self.palette.filtered();
+        if filtered.is_empty() {
+            list = list.push(text("No commands").size(13).style(text::secondary));
+        } else {
+            for (pos, (idx, item)) in filtered.iter().enumerate() {
+                let mut info = row![
+                    text(item.name).size(14),
+                    text(item.description).size(11).style(text::secondary),
+                    Space::new().width(Length::Fill),
+                ]
+                .spacing(10)
+                .align_y(iced::Alignment::Center);
+                if !item.shortcut.is_empty() {
+                    info = info.push(text(item.shortcut).size(11).style(text::secondary));
+                }
+                let row_btn = button(info)
+                    .on_press(Message::PaletteExecute(*idx))
+                    .width(Length::Fill)
+                    .padding([4, 8])
+                    .style(if pos == self.palette.selected {
+                        button::primary
+                    } else {
+                        button::text
+                    });
+                list = list.push(row_btn);
+            }
+        }
+
+        let footer = text("↑↓ navigate · Enter run · Esc close")
+            .size(10)
+            .style(text::secondary);
+        let panel_width = (self.win_size.width - 32.0).clamp(300.0, 680.0);
+        let panel_height = (self.win_size.height - 96.0).clamp(240.0, 520.0);
+        let inner = container(
+            column![
+                heading,
+                query_line,
+                scrollable(list).height(Length::Shrink),
+                footer
+            ]
+            .spacing(8),
+        )
+        .width(Length::Fixed(panel_width))
+        .max_height(panel_height)
+        .padding(12)
+        .style(self.overlay_panel_style());
+        container(inner)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .padding(16)
+            .into()
+    }
+'''
+          replace_once(palette_old, palette_new, "command palette")
+
+          replace_once(
+              """        let filtered = tab_switcher_filtered(&self.sessions, &state.query);
+
+        let query: Element<'_, Message> = text_input("Jump to tab…", &state.query)
+""",
+              """        let filtered = tab_switcher_filtered(&self.sessions, &state.query);
+        let panel_width = (self.win_size.width - 32.0).clamp(300.0, 560.0);
+        let panel_height = (self.win_size.height - 96.0).clamp(220.0, 520.0);
+
+        let query: Element<'_, Message> = text_input("Jump to tab…", &state.query)
+""",
+              "tab switcher dimensions",
+          )
+          replace_once(
+              """        let panel = container(body)
+            .width(Length::Fixed(420.0))
+            .max_height(420.0)
+            .padding(12)
+            .style(container::dark);
+""",
+              """        let panel = container(body)
+            .width(Length::Fixed(panel_width))
+            .max_height(panel_height)
+            .padding(12)
+            .style(self.overlay_panel_style());
+""",
+              "tab switcher panel",
+          )
+
+          replace_once(
+              """            let style_accent = accent;
+            let style = move |_t: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(Color {
+                    a: 0.96,
+                    ..Color::BLACK
+                })),
+                text_color: Some(Color::WHITE),
+""",
+              """            let style_accent = accent;
+            let toast_bg = self.c_panel();
+            let toast_text = self.c_text();
+            let style = move |_t: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(Color {
+                    a: 0.97,
+                    ..toast_bg
+                })),
+                text_color: Some(toast_text),
+""",
+              "toast colors",
+          )
+
+          # Make every remaining overlay respect the active custom/light theme.
+          src = src.replace(".style(container::dark)", ".style(self.overlay_panel_style())")
+
+          path.write_text(src)
+          PY
+
+          rm .github/workflows/apply-ui-ux-polish.yml
+          cargo fmt --all
+
+      - name: Commit generated changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/main.rs .github/workflows/apply-ui-ux-polish.yml
+          git commit -m "Polish terminal UI and overlay UX"
+          git push origin HEAD:agent/ui-ux-polish
