@@ -15,8 +15,9 @@ mod terminal;
 mod terminal_view;
 mod theme;
 
-use std::os::unix::io::RawFd;
-use std::sync::Arc;
+use std::hash::Hash;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::{Arc, Mutex};
 
 use config::Config;
 use iced::widget::{
@@ -40,6 +41,21 @@ const SIDEBAR_W_MIN: f32 = 120.0;
 const SIDEBAR_W_MAX: f32 = 500.0;
 /// Thickness of the divider drawn between split panes (also its drag hit area).
 const DIVIDER: f32 = 6.0;
+/// Guard against a corrupted or hostile session snapshot spawning unbounded PTYs.
+const MAX_RESTORED_SESSIONS: usize = 32;
+/// Bound pending user/protocol input while a child is not reading its PTY.
+const MAX_PTY_WRITE_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+/// Responses are retried separately so a full user-input queue cannot discard
+/// terminal protocol replies. The combined per-session backlog remains bounded.
+const MAX_PTY_RESPONSE_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+const BRACKETED_PASTE_FRAMING_BYTES: usize = 12;
+/// Byte caps alone do not cover allocator/Vec metadata for one-byte writes.
+const MAX_PTY_QUEUE_ENTRIES: usize = 4096;
+const PTY_QUEUE_COALESCE_BYTES: usize = 64 * 1024;
+/// Maximum queued input written during one UI update.
+const PTY_WRITE_DRAIN_BUDGET: usize = 256 * 1024;
+/// Never reflect an unexpectedly huge host clipboard through a terminal escape.
+const MAX_CLIPBOARD_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// Stable widget ids so the overlays' text inputs can be focused on open.
 static SEARCH_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
@@ -93,11 +109,6 @@ enum SplitMode {
     Horizontal,
 }
 
-/// Resolve the terminal font from the configured family name. iced resolves
-/// system-installed families by name (via cosmic-text); an empty name or a
-/// missing family falls back to the built-in monospace font. The name is leaked
-/// because `iced::Font::with_name` requires `&'static str`; family changes are
-/// rare so the leak is negligible.
 /// Linear blend between two colors (t=0 → a, t=1 → b); result is fully opaque.
 fn blend(a: Color, b: Color, t: f32) -> Color {
     Color {
@@ -113,7 +124,18 @@ fn resolve_mono_font(family: &str) -> iced::Font {
     if f.is_empty() {
         iced::Font::MONOSPACE
     } else {
-        iced::Font::with_name(Box::leak(f.to_string().into_boxed_str()))
+        // iced stores family names as `&'static str`. Intern each distinct name
+        // once so repeatedly applying settings does not leak another allocation.
+        static INTERNED_FONTS: once_cell::sync::Lazy<
+            Mutex<std::collections::HashMap<String, &'static str>>,
+        > = once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+        let mut names = INTERNED_FONTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let name = *names
+            .entry(f.to_string())
+            .or_insert_with(|| Box::leak(f.to_string().into_boxed_str()));
+        iced::Font::with_name(name)
     }
 }
 
@@ -126,25 +148,31 @@ fn main() -> iced::Result {
     let config = Config::load();
     let win = iced::window::Settings {
         size: Size::new(config.initial_width, config.initial_height),
+        // Route window-manager close requests through our foreground-job guard.
+        exit_on_close_request: false,
         ..Default::default()
     };
-    iced::application(Jterm::new, Jterm::update, Jterm::view)
-        .title(Jterm::title)
-        .subscription(Jterm::subscription)
-        .theme(Jterm::iced_theme)
-        // MSAA forces wgpu down the multisample path; on Intel/Mesa that triggers
-        // the "manual shader clears for srgb textures" path, which flashes the whole
-        // surface on heavy redraws (e.g. multi-line `ls` output). Glyph and quad
-        // rendering don't benefit from geometry MSAA, so disabling it is free here.
-        .antialiasing(false)
-        .window(win)
-        .run()
+    iced::application(
+        move || Jterm::new(config.clone()),
+        Jterm::update,
+        Jterm::view,
+    )
+    .title(Jterm::title)
+    .subscription(Jterm::subscription)
+    .theme(Jterm::iced_theme)
+    // MSAA forces wgpu down the multisample path; on Intel/Mesa that triggers
+    // the "manual shader clears for srgb textures" path, which flashes the whole
+    // surface on heavy redraws (e.g. multi-line `ls` output). Glyph and quad
+    // rendering don't benefit from geometry MSAA, so disabling it is free here.
+    .antialiasing(false)
+    .window(win)
+    .run()
 }
 
 #[derive(Debug, Clone)]
 enum Message {
-    PtyOutput(RawFd, Vec<u8>),
-    PtyExited(RawFd, i32),
+    PtyOutput(usize, RawFd, Vec<u8>),
+    PtyExited(usize, RawFd, i32),
     Key(keyboard::Event),
     /// An input-method (IME) composition event: open/close, pre-edit updates,
     /// and committed text.
@@ -152,23 +180,24 @@ enum Message {
     ModifiersChanged(keyboard::Modifiers),
     /// A mouse interaction within pane `usize` (index into `panes`).
     MousePane(usize, MouseInput),
-    Pasted(Option<String>),
+    /// Clipboard result scoped to the stable session that requested the paste.
+    Pasted(usize, Option<String>),
     /// System clipboard contents read in response to an OSC 52 query from the
     /// app running in the session identified by the file descriptor.
-    Osc52Query(RawFd, Option<String>),
+    Osc52Query(usize, RawFd, Option<String>),
     /// System clipboard contents read in response to an OSC 5522 MIME-data read
     /// request. Carries the requesting fd and the MIME type that was requested.
-    Osc5522Data(RawFd, String, Option<String>),
+    Osc5522Data(usize, RawFd, String, Option<String>),
     Resized(Size),
     Focus(bool),
     NewSession,
+    /// Close the tab with this stable session id.
     CloseTab(usize),
     WindowClose,
     TabHover(Option<usize>),
-    /// User pressed the mouse over tab `usize` — start tracking a potential drag.
+    /// User pressed the mouse over a tab — start tracking its stable session id.
     TabDragStart(usize),
-    /// User released the mouse over tab `usize`. If a drag was in progress and
-    /// the source differs from the target, reorder; otherwise treat as a click.
+    /// User released the mouse over a tab. Both endpoints are stable session ids.
     TabDragEnd(usize),
     /// Global mouse-up: clear `dragging_tab` if a drag was started but the
     /// release happened outside any tab.
@@ -199,6 +228,7 @@ enum Message {
     SetFontFamily(String),
     SetScrollbarAlways(bool),
     SetDisableAltScreen(bool),
+    SetAllowClipboardRead(bool),
     ThemeEditOpen,
     ThemeEditClose,
     ThemeEditName(String),
@@ -209,6 +239,9 @@ enum Message {
     ConfigReset,
     ConfigTick,
     BlinkTick,
+    PtyWriteTick,
+    SearchRefreshTick,
+    HistoryReflowTick,
     /// Right-click on a tab opened its context menu (close/duplicate/etc).
     TabMenuOpen(usize),
     /// Dismiss the tab context menu without an action.
@@ -223,7 +256,7 @@ enum Message {
     TabSwitcherInput(String),
     /// Cancel the tab switcher overlay.
     TabSwitcherClose,
-    /// Jump to the given session index from the tab switcher (and close it).
+    /// Jump to the given stable session id from the tab switcher (and close it).
     TabSwitcherJump(usize),
     /// User confirmed closing a tab with a running foreground process.
     TabCloseConfirmYes,
@@ -231,13 +264,43 @@ enum Message {
     TabCloseConfirmNo,
 }
 
-/// Context-menu actions that target a specific tab index.
+/// Context-menu actions that target a stable session id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TabMenuAction {
     Close(usize),
     CloseOthers(usize),
     CloseToRight(usize),
     Duplicate(usize),
+}
+
+/// Subscription identity plus a reader descriptor duplicated synchronously when
+/// the session is created. Equality/hash intentionally ignore the descriptor
+/// object: the monotonic session id and original fd identify the iced stream.
+#[derive(Clone)]
+struct PtySubscriptionKey {
+    id: usize,
+    master_fd: RawFd,
+    reader_fd: Arc<OwnedFd>,
+}
+
+struct PtyWriteChunk {
+    data: Vec<u8>,
+    response: bool,
+}
+
+impl PartialEq for PtySubscriptionKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.master_fd == other.master_fd
+    }
+}
+
+impl Eq for PtySubscriptionKey {}
+
+impl Hash for PtySubscriptionKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.master_fd.hash(state);
+    }
 }
 
 /// In-progress custom theme being edited in the theme editor overlay. UI-chrome
@@ -256,6 +319,7 @@ struct Session {
     terminal: TerminalState,
     pty: Pty,
     master_fd: RawFd,
+    reader_fd: Arc<OwnedFd>,
     grid: Arc<Vec<Vec<TerminalCell>>>,
     cursor: (usize, usize),
     cursor_visible: bool,
@@ -266,6 +330,15 @@ struct Session {
     /// refreshed on the same cadence as `cwd_cache`. Empty/None when the
     /// shell itself is in the foreground so tab labels can hide it.
     fg_proc_cache: Option<String>,
+    /// Non-blocking PTY writes may be partial. Keep the remainder here and let a
+    /// short-lived timer drain it without ever stalling iced's UI thread.
+    write_queue: std::collections::VecDeque<PtyWriteChunk>,
+    write_queue_offset: usize,
+    queued_write_bytes: usize,
+    queued_response_bytes: usize,
+    /// Host clipboard access is asynchronous. Limit PTY-originated reads to one
+    /// per session so a hostile child cannot accumulate work across UI batches.
+    clipboard_read_in_flight: bool,
 }
 
 impl Session {
@@ -278,6 +351,16 @@ impl Session {
     ) -> Option<Session> {
         let pty = Pty::new_with_cwd(cols, rows, cwd, None, config.shell.as_deref()).ok()?;
         let master_fd = pty.master_fd();
+        let reader_fd = unsafe { libc::fcntl(master_fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if reader_fd < 0 {
+            log::error!(
+                "[PTY] failed to duplicate reader fd: {}",
+                std::io::Error::last_os_error()
+            );
+            return None;
+        }
+        // SAFETY: `fcntl(F_DUPFD_CLOEXEC)` returned a fresh owned descriptor.
+        let reader_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(reader_fd) });
         let mut terminal = TerminalState::new(cols, rows);
         terminal.set_max_scrollback(config.scrollback_lines);
         terminal.set_disable_alt_screen(config.disable_alt_screen);
@@ -289,11 +372,17 @@ impl Session {
             terminal,
             pty,
             master_fd,
+            reader_fd,
             grid,
             cursor,
             cursor_visible,
             cwd_cache: None,
             fg_proc_cache: None,
+            write_queue: std::collections::VecDeque::new(),
+            write_queue_offset: 0,
+            queued_write_bytes: 0,
+            queued_response_bytes: 0,
+            clipboard_read_in_flight: false,
         })
     }
 
@@ -360,28 +449,150 @@ impl Session {
         self.cursor_visible = self.terminal.is_cursor_visible();
     }
 
-    fn flush_responses(&mut self) {
-        let out = self.terminal.get_output();
-        if !out.is_empty() {
-            self.write_pty(&out);
-        }
+    fn queue_accepts_entry(
+        queue: &std::collections::VecDeque<PtyWriteChunk>,
+        len: usize,
+        response: bool,
+    ) -> bool {
+        queue.len() < MAX_PTY_QUEUE_ENTRIES
+            || queue.back().is_some_and(|back| {
+                back.response == response
+                    && len <= PTY_QUEUE_COALESCE_BYTES.saturating_sub(back.data.len())
+            })
     }
 
-    fn write_pty(&mut self, data: &[u8]) {
-        let mut written = 0usize;
-        while written < data.len() {
-            match self.pty.write(&data[written..]) {
-                // Kernel write buffer full: wait until the fd drains, then retry
-                // so large pastes are not silently truncated.
-                Ok(0) => match Pty::wait_fd_writable(self.master_fd, 1000) {
-                    Ok(true) => {}
-                    // Timed out or fd dead — give up rather than spin forever.
-                    Ok(false) | Err(_) => break,
-                },
-                Ok(n) => written += n,
-                Err(_) => break,
+    fn push_queue_owned(
+        queue: &mut std::collections::VecDeque<PtyWriteChunk>,
+        data: Vec<u8>,
+        response: bool,
+    ) {
+        let coalesce = queue.back().is_some_and(|back| {
+            back.response == response
+                && data.len() <= PTY_QUEUE_COALESCE_BYTES.saturating_sub(back.data.len())
+        });
+        if coalesce {
+            if let Some(back) = queue.back_mut() {
+                back.data.extend_from_slice(&data);
+                return;
             }
         }
+        queue.push_back(PtyWriteChunk { data, response });
+    }
+
+    fn push_queue_copy(
+        queue: &mut std::collections::VecDeque<PtyWriteChunk>,
+        data: &[u8],
+        response: bool,
+    ) {
+        let coalesce = queue.back().is_some_and(|back| {
+            back.response == response
+                && data.len() <= PTY_QUEUE_COALESCE_BYTES.saturating_sub(back.data.len())
+        });
+        if coalesce {
+            if let Some(back) = queue.back_mut() {
+                back.data.extend_from_slice(data);
+                return;
+            }
+        }
+        queue.push_back(PtyWriteChunk {
+            data: data.to_vec(),
+            response,
+        });
+    }
+
+    fn flush_responses(&mut self) {
+        let out = self.terminal.get_output();
+        if out.is_empty() {
+            return;
+        }
+        if !self.flush_write_queue() {
+            return;
+        }
+        if out.len() > MAX_PTY_RESPONSE_QUEUE_BYTES.saturating_sub(self.queued_response_bytes)
+            || !Self::queue_accepts_entry(&self.write_queue, out.len(), true)
+        {
+            log::warn!(
+                "[PTY] response queue limit reached for session {} ({} queued, {} incoming)",
+                self.id,
+                self.queued_response_bytes,
+                out.len()
+            );
+            return;
+        }
+        self.queued_response_bytes += out.len();
+        Self::push_queue_owned(&mut self.write_queue, out, true);
+        let _ = self.flush_write_queue();
+    }
+
+    /// Drain prior work and report whether a user payload can be prepared while
+    /// staying inside both the byte and allocation-count limits.
+    fn can_queue_user_bytes(&mut self, len: usize) -> bool {
+        self.flush_write_queue()
+            && len <= MAX_PTY_WRITE_QUEUE_BYTES.saturating_sub(self.queued_write_bytes)
+            && Self::queue_accepts_entry(&self.write_queue, len, false)
+    }
+
+    /// Queue data in-order and make one non-blocking drain attempt. Returns false
+    /// if the bounded queue rejected the write or the PTY has failed.
+    fn write_pty(&mut self, data: &[u8]) -> bool {
+        if data.is_empty() {
+            return true;
+        }
+        if !self.can_queue_user_bytes(data.len()) {
+            log::warn!(
+                "[PTY] input backpressure for session {} ({} input, {} response, {} incoming)",
+                self.id,
+                self.queued_write_bytes,
+                self.queued_response_bytes,
+                data.len()
+            );
+            return false;
+        }
+        self.queued_write_bytes += data.len();
+        Self::push_queue_copy(&mut self.write_queue, data, false);
+        self.flush_write_queue()
+    }
+
+    fn flush_write_queue(&mut self) -> bool {
+        let mut budget = PTY_WRITE_DRAIN_BUDGET;
+        while let Some(front) = self.write_queue.front() {
+            if budget == 0 {
+                return true;
+            }
+            let front_len = front.data.len();
+            let is_response = front.response;
+            let end = (self.write_queue_offset + budget).min(front_len);
+            match self.pty.write(&front.data[self.write_queue_offset..end]) {
+                Ok(0) => return true,
+                Ok(written) => {
+                    budget = budget.saturating_sub(written);
+                    self.write_queue_offset += written;
+                    if is_response {
+                        self.queued_response_bytes =
+                            self.queued_response_bytes.saturating_sub(written);
+                    } else {
+                        self.queued_write_bytes = self.queued_write_bytes.saturating_sub(written);
+                    }
+                    if self.write_queue_offset == front_len {
+                        self.write_queue.pop_front();
+                        self.write_queue_offset = 0;
+                    }
+                }
+                Err(error) => {
+                    log::warn!("[PTY] write failed for session {}: {error}", self.id);
+                    self.write_queue.clear();
+                    self.write_queue_offset = 0;
+                    self.queued_write_bytes = 0;
+                    self.queued_response_bytes = 0;
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn has_pending_write(&self) -> bool {
+        self.queued_write_bytes != 0 || self.queued_response_bytes != 0
     }
 
     /// Working directory of the shell child, used when spawning a sibling.
@@ -409,6 +620,9 @@ struct Jterm {
     math_symbol: Option<iced::Font>,
     nerd_symbol: Option<iced::Font>,
     search: search::SearchState,
+    /// PTY output marks active-search results stale; a short timer coalesces
+    /// bursts so each chunk does not rescan the entire scrollback.
+    search_dirty: bool,
     palette: command_palette::PaletteState,
     keybindings: keybindings::KeyBindings,
     config_panel_open: bool,
@@ -423,11 +637,11 @@ struct Jterm {
     config_dirty: bool,
     link_detector: link::LinkDetector,
     links: Vec<link::Link>,
-    /// `(active, grid_version, scroll_offset)` the cached `links` were computed for.
+    /// `(stable_session_id, grid_version, scroll_offset)` for cached `links`.
     links_cache_key: Option<(usize, u64, usize)>,
-    /// Cached GPU image handles keyed by Kitty image id → (handle, decoded byte len).
-    /// Stable ids let the renderer reuse the uploaded texture across frames.
-    kitty_handles: std::collections::HashMap<u32, (iced::advanced::image::Handle, usize)>,
+    /// Cached GPU image handles keyed by (stable session id, Kitty image id).
+    /// The generation invalidates same-sized retransmissions.
+    kitty_handles: std::collections::HashMap<(usize, u32), (iced::advanced::image::Handle, u64)>,
     /// Last persisted session-snapshot JSON, to skip redundant disk writes.
     last_session_save: Option<String>,
     /// Set when session state that feeds the snapshot may have changed (PTY
@@ -463,13 +677,13 @@ struct Jterm {
     split_ratio: f32,
     /// In-progress divider drag: the layout axis is implied by `split_mode`.
     dragging_divider: bool,
-    /// Tab index the pointer is currently hovering (drives close-button reveal).
+    /// Stable id of the tab the pointer is hovering (drives close-button reveal).
     hovered_tab: Option<usize>,
-    /// Source-tab index recorded on mouse press over a tab. Cleared on mouse
+    /// Source-tab id recorded on mouse press over a tab. Cleared on mouse
     /// release (anywhere) by the global mouse-up listener; in between, it
     /// drives tab-drag visual feedback and the reorder-on-release.
     dragging_tab: Option<usize>,
-    /// Right-click context menu state: which tab the menu belongs to, or None.
+    /// Right-click context menu state: stable id of its target tab, or None.
     /// Rendered as a centered floating panel (Esc / click-outside dismiss).
     tab_menu: Option<usize>,
     /// Transient bottom-right toast queue with absolute expiry timestamps.
@@ -480,8 +694,15 @@ struct Jterm {
     /// and current selection index.
     tab_switcher: Option<TabSwitcherState>,
     /// Close-confirmation overlay for a tab with a running foreground process.
-    /// Holds `(session_index, process_name)`; cleared on cancel/confirm.
-    tab_close_confirm: Option<(usize, String)>,
+    /// Holds `(target_id, process_name, activate_after_id)`.
+    tab_close_confirm: Option<(usize, String, Option<usize>)>,
+    /// Last desktop notification launch. OSC 9/777 originates inside the PTY
+    /// (and may be remote over SSH), so process spawning is globally rate-limited.
+    last_notification_at: Option<std::time::Instant>,
+    /// Sessions whose history needs one width-normalization pass after resize
+    /// activity settles, keyed by stable session id.
+    history_reflow_sessions: std::collections::HashSet<usize>,
+    history_reflow_due: Option<std::time::Instant>,
     /// Held for the process lifetime to enforce single-instance behavior. When
     /// `None`, another instance already holds the lock and this one runs fresh
     /// (no session restore, no snapshot writes) to avoid clobbering its history.
@@ -490,8 +711,7 @@ struct Jterm {
 }
 
 impl Jterm {
-    fn new() -> (Self, Task<Message>) {
-        let config = Config::load();
+    fn new(config: Config) -> (Self, Task<Message>) {
         let theme = Theme::get_theme(&config.theme).unwrap_or_default();
         let metrics = Metrics::new(config.font_size, config.line_spacing, config.padding);
         let cols = config.cols.max(1);
@@ -545,6 +765,7 @@ impl Jterm {
             math_symbol,
             nerd_symbol,
             search: search::SearchState::new(),
+            search_dirty: false,
             palette: command_palette::PaletteState::new(),
             keybindings: load_keybindings(),
             config_panel_open: false,
@@ -579,6 +800,9 @@ impl Jterm {
             toasts: Vec::new(),
             tab_switcher: None,
             tab_close_confirm: None,
+            last_notification_at: None,
+            history_reflow_sessions: std::collections::HashSet::new(),
+            history_reflow_due: None,
             _instance_lock: instance_lock,
             is_first_instance,
         };
@@ -628,20 +852,29 @@ impl Jterm {
             self.cols = cols;
             self.rows = rows;
         }
-        let (pixel_w, pixel_h) = self.grid_pixel_size(cols, rows);
         for sess in &mut self.sessions {
             sess.terminal
                 .set_max_scrollback(self.config.scrollback_lines);
             sess.terminal
                 .set_disable_alt_screen(self.config.disable_alt_screen);
-            sess.terminal.set_viewport_pixel_size(pixel_w, pixel_h);
-            if resized {
-                sess.terminal.on_resize(cols, rows);
-                let _ = sess.pty.resize(cols, rows);
-            }
-            sess.refresh();
         }
         self.relayout();
+        if resized {
+            self.refresh_active_context();
+        }
+    }
+
+    fn sync_tab_position_ui(&mut self) {
+        match self.config.tab_position {
+            config::TabPosition::Side => {
+                self.sidebar_open = true;
+                self.sidebar_panel = SidebarPanel::Tabs;
+            }
+            config::TabPosition::Top => {
+                self.sidebar_open = false;
+                self.sidebar_panel = SidebarPanel::Files;
+            }
+        }
     }
 
     fn adjust_font_size(&mut self, delta: f32) {
@@ -685,6 +918,31 @@ impl Jterm {
         self.sidebar_open
     }
 
+    /// Whether the terminal itself owns text/IME input. Every overlay with an
+    /// editable field or modal action takes ownership until it closes.
+    fn terminal_input_active(&self) -> bool {
+        !self.search.is_open
+            && !self.palette.is_open
+            && !self.config_panel_open
+            && !self.help_open
+            && !self.debug_open
+            && self.tab_menu.is_none()
+            && self.tab_switcher.is_none()
+            && self.tab_close_confirm.is_none()
+    }
+
+    /// Search is intentionally non-modal for scrolling/selection. The remaining
+    /// overlays block pointer actions from reaching panes underneath them.
+    fn terminal_mouse_active(&self) -> bool {
+        !self.palette.is_open
+            && !self.config_panel_open
+            && !self.help_open
+            && !self.debug_open
+            && self.tab_menu.is_none()
+            && self.tab_switcher.is_none()
+            && self.tab_close_confirm.is_none()
+    }
+
     /// Toggle the left dock and refresh its file root when it becomes visible.
     /// Keeping this in one place makes the toolbar, shortcut, and command
     /// palette behave identically.
@@ -723,8 +981,30 @@ impl Jterm {
         }
     }
 
-    fn session_by_fd(&mut self, fd: RawFd) -> Option<&mut Session> {
-        self.sessions.iter_mut().find(|s| s.master_fd == fd)
+    fn session_by_identity(&mut self, id: usize, fd: RawFd) -> Option<&mut Session> {
+        self.sessions
+            .iter_mut()
+            .find(|session| session.id == id && session.master_fd == fd)
+    }
+
+    /// Refresh every cache/state object whose coordinates belong to the active
+    /// session. All tab/pane activation paths call this before accepting input.
+    fn refresh_active_context(&mut self) {
+        self.links_cache_key = None;
+        if self.search.is_open {
+            let reflow_pending = self
+                .sessions
+                .get(self.active)
+                .is_some_and(|session| self.history_reflow_sessions.contains(&session.id));
+            if reflow_pending {
+                self.search_dirty = true;
+            } else {
+                self.recompute_search();
+                self.reveal_current_search_match();
+            }
+        }
+        self.recompute_links();
+        self.refresh_kitty_handles();
     }
 
     /// Startup session setup: when `restore_session` is enabled and a snapshot
@@ -744,7 +1024,7 @@ impl Jterm {
         if !config.restore_session || !is_first_instance {
             return default(0);
         }
-        let Ok(path) = Config::session_history_path() else {
+        let Ok(path) = config.session_history_path() else {
             return default(0);
         };
         let snapshot = match session_persistence::SessionsSnapshot::load(&path) {
@@ -753,7 +1033,14 @@ impl Jterm {
         };
         let mut sessions = Vec::new();
         let mut next_id = 0usize;
-        for snap in &snapshot.sessions {
+        if snapshot.sessions.len() > MAX_RESTORED_SESSIONS {
+            log::warn!(
+                "[SessionPersistence] Snapshot has {} sessions; restoring only the first {}",
+                snapshot.sessions.len(),
+                MAX_RESTORED_SESSIONS
+            );
+        }
+        for snap in snapshot.sessions.iter().take(MAX_RESTORED_SESSIONS) {
             if let Some(sess) = Session::spawn(config, next_id, cols, rows, snap.cwd.as_deref()) {
                 sessions.push(sess);
                 next_id += 1;
@@ -792,7 +1079,7 @@ impl Jterm {
         if self.last_session_save.as_deref() == Some(json.as_str()) {
             return;
         }
-        if let Ok(path) = Config::session_history_path() {
+        if let Ok(path) = self.config.session_history_path() {
             if snapshot.save(&path).is_ok() {
                 self.last_session_save = Some(json);
             }
@@ -813,6 +1100,7 @@ impl Jterm {
             self.sessions.insert(insert, sess);
             self.active = insert;
             self.unsplit();
+            self.refresh_active_context();
             self.save_session_snapshot();
         }
     }
@@ -828,6 +1116,17 @@ impl Jterm {
             return iced::exit();
         }
         let mut sess = self.sessions.remove(index);
+        let closed_id = sess.id;
+        self.history_reflow_sessions.remove(&closed_id);
+        if self.hovered_tab == Some(closed_id) {
+            self.hovered_tab = None;
+        }
+        if self.dragging_tab == Some(closed_id) {
+            self.dragging_tab = None;
+        }
+        if self.tab_menu == Some(closed_id) {
+            self.tab_menu = None;
+        }
         let _ = sess.pty.terminate();
         if self.active >= self.sessions.len() {
             self.active = self.sessions.len() - 1;
@@ -835,24 +1134,71 @@ impl Jterm {
             self.active -= 1;
         }
         self.unsplit();
+        self.refresh_active_context();
         self.save_session_snapshot();
         Task::none()
     }
 
+    fn busy_session_name(&self, index: usize) -> Option<String> {
+        self.sessions
+            .get(index)
+            .and_then(|session| session.fg_proc_cache.clone().or_else(|| session.fg_proc()))
+    }
+
     /// Public entry point for close requests originating from user actions.
     /// Pops a confirmation overlay when the target tab is running a non-shell
-    /// foreground process; otherwise closes immediately. Force-close paths
-    /// (close-others, batch close) still call `close_session` directly.
+    /// foreground process; otherwise closes immediately. Batch close operations
+    /// preflight every affected session before reaching the force-close helper.
     fn request_close_session(&mut self, index: usize) -> Task<Message> {
-        let busy = self
-            .sessions
-            .get(index)
-            .and_then(|s| s.fg_proc_cache.clone().or_else(|| s.fg_proc()));
+        self.request_close_session_then(index, None)
+    }
+
+    fn request_close_session_then(
+        &mut self,
+        index: usize,
+        activate_after: Option<usize>,
+    ) -> Task<Message> {
+        let busy = self.busy_session_name(index);
         if let Some(name) = busy {
-            self.tab_close_confirm = Some((index, name));
+            if let Some(session) = self.sessions.get(index) {
+                self.tab_close_confirm = Some((session.id, name, activate_after));
+            }
             return Task::none();
         }
-        self.close_session(index)
+        self.close_session_then(index, activate_after)
+    }
+
+    fn close_session_then(&mut self, index: usize, activate_after: Option<usize>) -> Task<Message> {
+        let task = self.close_session(index);
+        if let Some(id) = activate_after {
+            if let Some(remaining) = self.sessions.iter().position(|session| session.id == id) {
+                self.active = remaining;
+                self.unsplit();
+                self.refresh_active_context();
+                self.save_session_snapshot();
+            }
+        }
+        task
+    }
+
+    /// Refuse a whole-window exit while a foreground job is still attached.
+    /// The user can inspect and close that tab explicitly, which uses the normal
+    /// per-process confirmation flow instead of silently terminating work.
+    fn request_window_close(&mut self) -> Task<Message> {
+        if let Some((index, process)) = (0..self.sessions.len())
+            .find_map(|index| self.busy_session_name(index).map(|name| (index, name)))
+        {
+            self.active = index;
+            self.unsplit();
+            self.refresh_active_context();
+            self.push_toast(
+                format!("{process} is still running — close its tab first"),
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+        self.save_session_snapshot();
+        iced::exit()
     }
 
     fn next_session(&mut self) {
@@ -860,6 +1206,7 @@ impl Jterm {
             self.active = (self.active + 1) % self.sessions.len();
             self.session_dirty = true;
             self.unsplit();
+            self.refresh_active_context();
         }
     }
 
@@ -868,6 +1215,7 @@ impl Jterm {
             self.active = (self.active + self.sessions.len() - 1) % self.sessions.len();
             self.session_dirty = true;
             self.unsplit();
+            self.refresh_active_context();
         }
     }
 
@@ -876,6 +1224,7 @@ impl Jterm {
             self.active = index;
             self.session_dirty = true;
             self.unsplit();
+            self.refresh_active_context();
         }
     }
 
@@ -906,9 +1255,31 @@ impl Jterm {
     /// target's cwd into a new tab adjacent to it.
     fn execute_tab_menu_action(&mut self, action: TabMenuAction) -> Task<Message> {
         match action {
-            TabMenuAction::Close(i) => self.request_close_session(i),
-            TabMenuAction::CloseOthers(keep) => {
-                if keep >= self.sessions.len() {
+            TabMenuAction::Close(id) => {
+                let Some(index) = self.sessions.iter().position(|session| session.id == id) else {
+                    return Task::none();
+                };
+                self.request_close_session(index)
+            }
+            TabMenuAction::CloseOthers(keep_id) => {
+                let Some(keep) = self
+                    .sessions
+                    .iter()
+                    .position(|session| session.id == keep_id)
+                else {
+                    return Task::none();
+                };
+                if let Some((index, process)) = (0..self.sessions.len())
+                    .filter(|&index| index != keep)
+                    .find_map(|index| self.busy_session_name(index).map(|name| (index, name)))
+                {
+                    self.active = index;
+                    self.unsplit();
+                    self.refresh_active_context();
+                    self.push_toast(
+                        format!("{process} is still running — close that tab explicitly"),
+                        ToastKind::Warning,
+                    );
                     return Task::none();
                 }
                 // Close from the back so indices stay valid; skip `keep`.
@@ -923,8 +1294,24 @@ impl Jterm {
                 self.push_toast("Closed other tabs", ToastKind::Info);
                 Task::batch(tasks)
             }
-            TabMenuAction::CloseToRight(anchor) => {
-                if anchor >= self.sessions.len() {
+            TabMenuAction::CloseToRight(anchor_id) => {
+                let Some(anchor) = self
+                    .sessions
+                    .iter()
+                    .position(|session| session.id == anchor_id)
+                else {
+                    return Task::none();
+                };
+                if let Some((index, process)) = ((anchor + 1)..self.sessions.len())
+                    .find_map(|index| self.busy_session_name(index).map(|name| (index, name)))
+                {
+                    self.active = index;
+                    self.unsplit();
+                    self.refresh_active_context();
+                    self.push_toast(
+                        format!("{process} is still running — close that tab explicitly"),
+                        ToastKind::Warning,
+                    );
                     return Task::none();
                 }
                 let mut tasks: Vec<Task<Message>> = Vec::new();
@@ -935,7 +1322,10 @@ impl Jterm {
                 self.push_toast("Closed tabs to the right", ToastKind::Info);
                 Task::batch(tasks)
             }
-            TabMenuAction::Duplicate(i) => {
+            TabMenuAction::Duplicate(id) => {
+                let Some(i) = self.sessions.iter().position(|session| session.id == id) else {
+                    return Task::none();
+                };
                 let cwd = self
                     .sessions
                     .get(i)
@@ -952,6 +1342,7 @@ impl Jterm {
                     self.sessions.insert(insert, sess);
                     self.active = insert;
                     self.unsplit();
+                    self.refresh_active_context();
                     self.save_session_snapshot();
                     self.push_toast("Duplicated tab", ToastKind::Success);
                 }
@@ -985,6 +1376,7 @@ impl Jterm {
             *p = remap(*p);
         }
         self.session_dirty = true;
+        self.refresh_active_context();
         self.save_session_snapshot();
     }
 
@@ -1020,31 +1412,42 @@ impl Jterm {
     }
 
     /// Resize one session's terminal + PTY (no-op when already that size).
-    fn resize_session(&mut self, index: usize, cols: usize, rows: usize) {
+    fn resize_session(&mut self, index: usize, cols: usize, rows: usize) -> Option<usize> {
         let (pixel_w, pixel_h) = self.grid_pixel_size(cols, rows);
         if let Some(sess) = self.sessions.get_mut(index) {
             sess.terminal.set_viewport_pixel_size(pixel_w, pixel_h);
-            if sess.terminal.get_dimensions() != (cols, rows) {
+            let old_dimensions = sess.terminal.get_dimensions();
+            if old_dimensions != (cols, rows) {
                 sess.terminal.on_resize(cols, rows);
                 let _ = sess.pty.resize(cols, rows);
             }
             sess.refresh();
+            return (old_dimensions.0 != cols).then_some(sess.id);
         }
+        None
     }
 
-    /// Resize the currently displayed pane session(s) to fit the layout.
+    /// Resize every session once for the current layout. Background tabs use the
+    /// full terminal area; sessions displayed in a split use their pane size.
     fn relayout(&mut self) {
-        match self.split_mode {
-            SplitMode::Single => {
-                let (c, r) = (self.cols, self.rows);
-                self.resize_session(self.active, c, r);
-            }
-            _ => {
-                for (pos, idx) in self.panes.clone().into_iter().enumerate() {
-                    let (c, r) = self.pane_grid(pos);
-                    self.resize_session(idx, c, r);
+        let mut targets = vec![(self.cols, self.rows); self.sessions.len()];
+        if self.split_mode != SplitMode::Single {
+            for (position, index) in self.panes.iter().copied().enumerate() {
+                if index < targets.len() {
+                    targets[index] = self.pane_grid(position);
                 }
             }
+        }
+        let mut width_changed = false;
+        for (index, (cols, rows)) in targets.into_iter().enumerate() {
+            if let Some(id) = self.resize_session(index, cols, rows) {
+                self.history_reflow_sessions.insert(id);
+                width_changed = true;
+            }
+        }
+        if width_changed {
+            self.history_reflow_due =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
         }
     }
 
@@ -1087,6 +1490,7 @@ impl Jterm {
             self.active = new_idx;
             self.split_mode = mode;
             self.relayout();
+            self.refresh_active_context();
             self.save_session_snapshot();
         }
     }
@@ -1098,6 +1502,7 @@ impl Jterm {
         }
         self.focused_pane = (self.focused_pane + 1) % self.panes.len();
         self.active = self.panes[self.focused_pane];
+        self.refresh_active_context();
     }
 
     /// Close the focused pane's session and collapse to the remaining one.
@@ -1107,18 +1512,8 @@ impl Jterm {
         }
         let victim = self.panes[self.focused_pane];
         let keep = self.panes[1 - self.focused_pane];
-        if let Some(mut sess) = (victim < self.sessions.len()).then(|| self.sessions.remove(victim))
-        {
-            let _ = sess.pty.terminate();
-        }
-        // Removing `victim` shifts later indices down by one.
-        self.active = if keep > victim { keep - 1 } else { keep };
-        self.split_mode = SplitMode::Single;
-        self.focused_pane = 0;
-        self.panes = vec![self.active];
-        self.relayout();
-        self.save_session_snapshot();
-        Task::none()
+        let keep_id = self.sessions.get(keep).map(|session| session.id);
+        self.request_close_session_then(victim, keep_id)
     }
 
     /// Look up a key event in the configurable keybindings and run the bound
@@ -1153,7 +1548,7 @@ impl Jterm {
                 Task::none()
             }
             C::SessionClose => return Some(self.request_close_session(self.active)),
-            C::WindowClose => return Some(iced::exit()),
+            C::WindowClose => return Some(self.request_window_close()),
             C::SessionNext => {
                 self.next_session();
                 Task::none()
@@ -1184,10 +1579,14 @@ impl Jterm {
                     None => Task::none(),
                 }
             }
-            C::EditPaste => iced::clipboard::read().map(Message::Pasted),
+            C::EditPaste => {
+                let id = self.sessions.get(self.active)?.id;
+                iced::clipboard::read().map(move |text| Message::Pasted(id, text))
+            }
             C::SearchOpen => {
                 self.search.toggle();
                 self.recompute_search();
+                self.reveal_current_search_match();
                 if self.search.is_open {
                     iced::widget::operation::focus(SEARCH_INPUT_ID.clone())
                 } else {
@@ -1206,6 +1605,7 @@ impl Jterm {
                     return None;
                 }
                 self.search.next_match();
+                self.reveal_current_search_match();
                 Task::none()
             }
             C::SearchPrev => {
@@ -1213,6 +1613,7 @@ impl Jterm {
                     return None;
                 }
                 self.search.prev_match();
+                self.reveal_current_search_match();
                 Task::none()
             }
             C::SearchHistoryPrev => {
@@ -1220,7 +1621,9 @@ impl Jterm {
                     return None;
                 }
                 self.search.history_prev();
+                self.search.current_match_index = 0;
                 self.recompute_search();
+                self.reveal_current_search_match();
                 Task::none()
             }
             C::SearchHistoryNext => {
@@ -1228,7 +1631,9 @@ impl Jterm {
                     return None;
                 }
                 self.search.history_next();
+                self.search.current_match_index = 0;
                 self.recompute_search();
+                self.reveal_current_search_match();
                 Task::none()
             }
             C::TerminalSendSigint => {
@@ -1365,6 +1770,14 @@ impl Jterm {
     ) -> Option<Task<Message>> {
         use keyboard::key::Named;
         use keyboard::Key;
+        if mods.control() && mods.shift() {
+            if let Key::Character(c) = key {
+                if c.eq_ignore_ascii_case("k") {
+                    self.tab_switcher = None;
+                    return Some(Task::none());
+                }
+            }
+        }
         let state = self.tab_switcher.as_mut()?;
         // Recompute the visible order once so Enter/arrows agree with what's drawn.
         let filtered = tab_switcher_filtered(&self.sessions, &state.query);
@@ -1381,6 +1794,7 @@ impl Jterm {
                         self.active = i;
                         self.panes[self.focused_pane] = i;
                         self.session_dirty = true;
+                        self.refresh_active_context();
                     }
                 }
                 return Some(Task::none());
@@ -1482,7 +1896,9 @@ impl Jterm {
                         _ => sess.terminal.start_selection((row, col)),
                     },
                     MouseButton::Middle => {
-                        return iced::clipboard::read_primary().map(Message::Pasted);
+                        let id = sess.id;
+                        return iced::clipboard::read_primary()
+                            .map(move |text| Message::Pasted(id, text));
                     }
                     MouseButton::Right => {}
                 }
@@ -1580,9 +1996,10 @@ impl Jterm {
         true
     }
 
-    /// Re-run the search over the active session's visible grid and refresh
-    /// match state. No-op when the search bar is closed.
+    /// Re-run the search over the active session's full scrollback + live grid.
+    /// Match rows remain absolute, so scrolling does not invalidate them.
     fn recompute_search(&mut self) {
+        self.search_dirty = false;
         if !self.search.is_open {
             return;
         }
@@ -1590,8 +2007,8 @@ impl Jterm {
             self.search.matches.clear();
             return;
         };
-        let (matches, error) = search::SearchEngine::search(
-            &sess.grid,
+        let (matches, error) = search::SearchEngine::search_lines(
+            sess.terminal.search_lines(),
             &self.search.query,
             self.search.use_regex,
             self.search.case_sensitive,
@@ -1604,6 +2021,20 @@ impl Jterm {
         {
             self.search.current_match_index = 0;
         }
+    }
+
+    /// Reveal the active full-buffer search result and refresh the session's
+    /// visible snapshot. Kept separate from recomputation so streaming PTY
+    /// output never steals the user's manually chosen scroll position.
+    fn reveal_current_search_match(&mut self) {
+        let Some(found) = self.search.current_match() else {
+            return;
+        };
+        if let Some(sess) = self.sessions.get_mut(self.active) {
+            sess.terminal.reveal_buffer_row(found.line);
+            sess.refresh();
+        }
+        self.links_cache_key = None;
     }
 
     /// Route a keypress into the search bar while it is open. Returns true if
@@ -1619,6 +2050,14 @@ impl Jterm {
         if !self.search.is_open {
             return false;
         }
+        if mods.control() && mods.shift() {
+            if let Key::Character(c) = key {
+                if c.eq_ignore_ascii_case("f") {
+                    self.search.close();
+                    return true;
+                }
+            }
+        }
         match key {
             Key::Named(Named::Escape) => {
                 self.search.close();
@@ -1630,6 +2069,7 @@ impl Jterm {
                 } else {
                     self.search.next_match();
                 }
+                self.reveal_current_search_match();
                 return true;
             }
             Key::Named(Named::Backspace) => {
@@ -1640,12 +2080,16 @@ impl Jterm {
             }
             Key::Named(Named::ArrowUp) => {
                 self.search.history_prev();
+                self.search.current_match_index = 0;
                 self.recompute_search();
+                self.reveal_current_search_match();
                 return true;
             }
             Key::Named(Named::ArrowDown) => {
                 self.search.history_next();
+                self.search.current_match_index = 0;
                 self.recompute_search();
+                self.reveal_current_search_match();
                 return true;
             }
             // Ctrl+R toggles regex, Ctrl+I toggles case sensitivity (Alt is the
@@ -1655,10 +2099,12 @@ impl Jterm {
                     Some('r') => {
                         self.search.toggle_regex();
                         self.recompute_search();
+                        self.reveal_current_search_match();
                     }
                     Some('i') => {
                         self.search.toggle_case_sensitive();
                         self.recompute_search();
+                        self.reveal_current_search_match();
                     }
                     _ => {}
                 }
@@ -1673,7 +2119,9 @@ impl Jterm {
                 if !printable.is_empty() {
                     self.search.query.push_str(&printable);
                     self.search.history_nav_index = None;
+                    self.search.current_match_index = 0;
                     self.recompute_search();
+                    self.reveal_current_search_match();
                     return true;
                 }
             }
@@ -1717,6 +2165,14 @@ impl Jterm {
         use keyboard::Key;
         if !self.palette.is_open {
             return None;
+        }
+        if mods.control() && mods.shift() {
+            if let Key::Character(c) = key {
+                if c.eq_ignore_ascii_case("p") {
+                    self.palette.close();
+                    return Some(Task::none());
+                }
+            }
         }
         match key {
             Key::Named(Named::Escape) => {
@@ -1796,7 +2252,12 @@ impl Jterm {
                     Task::none()
                 }
             }
-            PaletteAction::Paste => iced::clipboard::read().map(Message::Pasted),
+            PaletteAction::Paste => {
+                let Some(id) = self.sessions.get(self.active).map(|session| session.id) else {
+                    return Task::none();
+                };
+                iced::clipboard::read().map(move |text| Message::Pasted(id, text))
+            }
             PaletteAction::OpenSearch => {
                 self.search.toggle();
                 self.recompute_search();
@@ -1876,13 +2337,17 @@ impl Jterm {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::PtyOutput(fd, data) => {
+            Message::PtyOutput(id, fd, data) => {
                 let t0 = std::time::Instant::now();
+                let is_active_output = self
+                    .sessions
+                    .get(self.active)
+                    .is_some_and(|session| session.id == id && session.master_fd == fd);
                 let mut clip_set: Option<String> = None;
                 let mut clip_query = false;
                 let mut clip_requests: Vec<terminal::ClipboardReadKind> = Vec::new();
                 let mut notifications: Vec<(String, String)> = Vec::new();
-                if let Some(sess) = self.session_by_fd(fd) {
+                if let Some(sess) = self.session_by_identity(id, fd) {
                     sess.terminal.process_batch(&data);
                     sess.flush_responses();
                     sess.refresh();
@@ -1901,14 +2366,20 @@ impl Jterm {
                 // Output may have moved the shell's cwd; let the next periodic
                 // tick reconcile the session snapshot.
                 self.session_dirty = true;
-                self.recompute_search();
+                if is_active_output && self.search.is_open {
+                    self.search_dirty = true;
+                }
 
                 // Desktop notifications requested via OSC 9 / OSC 777.
-                for (title, body) in notifications {
-                    let _ = std::process::Command::new("notify-send")
-                        .arg(&title)
-                        .arg(&body)
-                        .spawn();
+                if let Some((title, body)) = notifications.into_iter().next() {
+                    let now = std::time::Instant::now();
+                    let allowed = self.last_notification_at.is_none_or(|last| {
+                        now.duration_since(last) >= std::time::Duration::from_secs(2)
+                    });
+                    if allowed {
+                        self.last_notification_at = Some(now);
+                        enqueue_desktop_notification(title, body);
+                    }
                 }
 
                 // Clipboard set/query via OSC 52. The query path reads the
@@ -1918,17 +2389,52 @@ impl Jterm {
                 if let Some(text) = clip_set {
                     tasks.push(iced::clipboard::write(text));
                 }
-                if clip_query {
-                    tasks.push(iced::clipboard::read().map(move |c| Message::Osc52Query(fd, c)));
+                if clip_query && self.config.allow_clipboard_read {
+                    let start_read = if let Some(sess) = self.session_by_identity(id, fd) {
+                        if sess.clipboard_read_in_flight {
+                            false
+                        } else {
+                            sess.clipboard_read_in_flight = true;
+                            true
+                        }
+                    } else {
+                        false
+                    };
+                    if start_read {
+                        tasks.push(
+                            iced::clipboard::read().map(move |c| Message::Osc52Query(id, fd, c)),
+                        );
+                    } else if let Some(sess) = self.session_by_identity(id, fd) {
+                        // OSC 52 has no structured busy status; an empty response
+                        // is the interoperable refusal while another read runs.
+                        sess.terminal.respond_osc52_clipboard("");
+                        sess.flush_responses();
+                    }
+                } else if clip_query {
+                    // An empty OSC 52 response reports that clipboard reads are
+                    // unavailable without exposing host clipboard contents.
+                    if let Some(sess) = self.session_by_identity(id, fd) {
+                        sess.terminal.respond_osc52_clipboard("");
+                        sess.flush_responses();
+                    }
                 }
 
                 // OSC 5522 extended-clipboard read requests. iced's clipboard is
                 // text-only, so we advertise a text MIME and serve text reads via
                 // an async clipboard read; non-text MIME types get ENOSYS.
                 for kind in clip_requests {
+                    if !self.config.allow_clipboard_read {
+                        if let Some(sess) = self.session_by_identity(id, fd) {
+                            let resp = osc_5522_packet("type=read:status=EPERM", None);
+                            sess.terminal.output_buffer.extend_from_slice(&resp);
+                            sess.flush_responses();
+                            sess.refresh();
+                        }
+                        continue;
+                    }
                     match kind {
                         terminal::ClipboardReadKind::MimeList => {
-                            if let Some(sess) = self.session_by_fd(fd) {
+                            if let Some(sess) = self.session_by_identity(id, fd) {
                                 let resp = sess
                                     .terminal
                                     .build_paste_event(&["text/plain;charset=utf-8".to_string()]);
@@ -1939,11 +2445,28 @@ impl Jterm {
                         }
                         terminal::ClipboardReadKind::MimeData(mime) => {
                             if mime.starts_with("text") {
-                                tasks.push(
-                                    iced::clipboard::read()
-                                        .map(move |c| Message::Osc5522Data(fd, mime.clone(), c)),
-                                );
-                            } else if let Some(sess) = self.session_by_fd(fd) {
+                                let start_read =
+                                    if let Some(sess) = self.session_by_identity(id, fd) {
+                                        if sess.clipboard_read_in_flight {
+                                            false
+                                        } else {
+                                            sess.clipboard_read_in_flight = true;
+                                            true
+                                        }
+                                    } else {
+                                        false
+                                    };
+                                if start_read {
+                                    tasks.push(iced::clipboard::read().map(move |c| {
+                                        Message::Osc5522Data(id, fd, mime.clone(), c)
+                                    }));
+                                } else if let Some(sess) = self.session_by_identity(id, fd) {
+                                    let resp = osc_5522_packet("type=read:status=EBUSY", None);
+                                    sess.terminal.output_buffer.extend_from_slice(&resp);
+                                    sess.flush_responses();
+                                    sess.refresh();
+                                }
+                            } else if let Some(sess) = self.session_by_identity(id, fd) {
                                 let resp = osc_5522_packet("type=read:status=ENOSYS", None);
                                 sess.terminal.output_buffer.extend_from_slice(&resp);
                                 sess.flush_responses();
@@ -1957,18 +2480,31 @@ impl Jterm {
                     return Task::batch(tasks);
                 }
             }
-            Message::Osc52Query(fd, content) => {
-                if let Some(sess) = self.session_by_fd(fd) {
-                    sess.terminal
-                        .respond_osc52_clipboard(content.as_deref().unwrap_or(""));
+            Message::Osc52Query(id, fd, content) => {
+                let allow_clipboard_read = self.config.allow_clipboard_read;
+                if let Some(sess) = self.session_by_identity(id, fd) {
+                    sess.clipboard_read_in_flight = false;
+                    let content = content
+                        .as_deref()
+                        .filter(|value| {
+                            allow_clipboard_read && value.len() <= MAX_CLIPBOARD_RESPONSE_BYTES
+                        })
+                        .unwrap_or("");
+                    sess.terminal.respond_osc52_clipboard(content);
                     sess.flush_responses();
                     sess.refresh();
                 }
             }
-            Message::Osc5522Data(fd, mime, content) => {
-                if let Some(sess) = self.session_by_fd(fd) {
+            Message::Osc5522Data(id, fd, mime, content) => {
+                let allow_clipboard_read = self.config.allow_clipboard_read;
+                if let Some(sess) = self.session_by_identity(id, fd) {
+                    sess.clipboard_read_in_flight = false;
                     let data = content.unwrap_or_default();
-                    let resp = if data.is_empty() {
+                    let resp = if !allow_clipboard_read {
+                        osc_5522_packet("type=read:status=EPERM", None)
+                    } else if data.len() > MAX_CLIPBOARD_RESPONSE_BYTES {
+                        osc_5522_packet("type=read:status=EFBIG", None)
+                    } else if data.is_empty() {
                         osc_5522_packet("type=read:status=ENOSYS", None)
                     } else {
                         clipboard_5522_response_for_mime(&mime, data.as_bytes())
@@ -1978,8 +2514,12 @@ impl Jterm {
                     sess.refresh();
                 }
             }
-            Message::PtyExited(fd, _code) => {
-                if let Some(index) = self.sessions.iter().position(|s| s.master_fd == fd) {
+            Message::PtyExited(id, fd, _code) => {
+                if let Some(index) = self
+                    .sessions
+                    .iter()
+                    .position(|session| session.id == id && session.master_fd == fd)
+                {
                     return self.close_session(index);
                 }
             }
@@ -1992,6 +2532,31 @@ impl Jterm {
                     ..
                 } = event
                 {
+                    // The close confirmation is the top-most modal. Enter confirms,
+                    // Esc cancels, and every other key is swallowed.
+                    if self.tab_close_confirm.is_some() {
+                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Enter)) {
+                            if let Some((id, _, activate_after)) = self.tab_close_confirm.take() {
+                                if let Some(index) =
+                                    self.sessions.iter().position(|session| session.id == id)
+                                {
+                                    return self.close_session_then(index, activate_after);
+                                }
+                            }
+                        } else if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
+                        {
+                            self.tab_close_confirm = None;
+                        }
+                        return Task::none();
+                    }
+                    // The tab menu currently has pointer actions only; keep all
+                    // unrelated keypresses out of the PTY while it is visible.
+                    if self.tab_menu.is_some() {
+                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                            self.tab_menu = None;
+                        }
+                        return Task::none();
+                    }
                     // Tab switcher swallows keys while open (Enter to jump,
                     // arrows to move, Esc/Ctrl+K to dismiss). Handle before the
                     // generic keybindings so its Esc/Ctrl+K shortcut wins.
@@ -2002,37 +2567,15 @@ impl Jterm {
                             return task;
                         }
                     }
-                    // Esc dismisses the tab context menu and the tab switcher
-                    // when no other handler claimed them.
-                    if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
-                        if self.tab_close_confirm.is_some() {
-                            self.tab_close_confirm = None;
-                            return Task::none();
+                    if self.help_open || self.debug_open {
+                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                            self.help_open = false;
+                            self.debug_open = false;
                         }
-                        if self.tab_menu.is_some() {
-                            self.tab_menu = None;
-                            return Task::none();
-                        }
-                        if self.tab_switcher.is_some() {
-                            self.tab_switcher = None;
-                            return Task::none();
-                        }
-                    }
-                    if let Some(task) = self.handle_keybinding(&key, modifiers) {
-                        return task;
-                    }
-                    if let Some(task) = self.handle_tab_shortcut(&key, modifiers) {
-                        return task;
-                    }
-                    // Esc closes the help / debug overlays (handled before they
-                    // would otherwise fall through to the PTY).
-                    if (self.help_open || self.debug_open)
-                        && matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
-                    {
-                        self.help_open = false;
-                        self.debug_open = false;
                         return Task::none();
                     }
+                    // Input-owning overlays route before global keybindings so a
+                    // shortcut or printable key cannot mutate the hidden terminal.
                     if let Some(task) = self.handle_config_panel_key(&key, modifiers) {
                         return task;
                     }
@@ -2041,6 +2584,12 @@ impl Jterm {
                     }
                     if self.handle_search_key(&key, modifiers, text.as_deref()) {
                         return Task::none();
+                    }
+                    if let Some(task) = self.handle_keybinding(&key, modifiers) {
+                        return task;
+                    }
+                    if let Some(task) = self.handle_tab_shortcut(&key, modifiers) {
+                        return task;
                     }
                     if self.handle_scroll_shortcut(&key, modifiers) {
                         return Task::none();
@@ -2067,6 +2616,9 @@ impl Jterm {
             }
             Message::Ime(event) => {
                 use iced::advanced::input_method::Event as Ime;
+                if !self.terminal_input_active() {
+                    return Task::none();
+                }
                 let Some(sess) = self.sessions.get_mut(self.active) else {
                     return Task::none();
                 };
@@ -2095,6 +2647,9 @@ impl Jterm {
                 self.modifiers = mods;
             }
             Message::MousePane(pane_pos, input) => {
+                if !self.terminal_mouse_active() {
+                    return Task::none();
+                }
                 // Only a press switches the focused pane. Release/Drag aren't
                 // bounds-gated in the widget, so every pane emits them — letting
                 // those move focus would let the wrong pane steal it on release.
@@ -2102,23 +2657,41 @@ impl Jterm {
                     self.focused_pane = pane_pos;
                     self.active = self.panes[pane_pos];
                     self.session_dirty = true;
+                    self.refresh_active_context();
                 }
                 return self.handle_mouse(input);
             }
-            Message::Pasted(Some(text)) => {
-                if let Some(sess) = self.sessions.get_mut(self.active) {
+            Message::Pasted(id, Some(text)) => {
+                let mut rejected = false;
+                if let Some(sess) = self.sessions.iter_mut().find(|session| session.id == id) {
                     let bracketed = sess.terminal.is_bracketed_paste_enabled();
-                    let bytes = if bracketed {
-                        wrap_bracketed_paste(text.into_bytes())
+                    let framing = if bracketed {
+                        BRACKETED_PASTE_FRAMING_BYTES
                     } else {
-                        text.into_bytes()
+                        0
                     };
-                    sess.terminal.scroll_to_bottom();
-                    sess.write_pty(&bytes);
-                    sess.refresh();
+                    let required = text.len().saturating_add(framing);
+                    if !sess.can_queue_user_bytes(required) {
+                        rejected = true;
+                    } else {
+                        let bytes = if bracketed {
+                            wrap_bracketed_paste(text.into_bytes())
+                        } else {
+                            text.into_bytes()
+                        };
+                        sess.terminal.scroll_to_bottom();
+                        rejected = !sess.write_pty(&bytes);
+                        sess.refresh();
+                    }
+                }
+                if rejected {
+                    self.push_toast(
+                        "Paste rejected: terminal input queue is full",
+                        ToastKind::Warning,
+                    );
                 }
             }
-            Message::Pasted(None) => {}
+            Message::Pasted(_, None) => {}
             Message::Resized(size) => {
                 self.win_size = size;
                 let term_h = self.term_height();
@@ -2127,15 +2700,9 @@ impl Jterm {
                 if cols != self.cols || rows != self.rows {
                     self.cols = cols;
                     self.rows = rows;
-                    let (pixel_w, pixel_h) = self.grid_pixel_size(cols, rows);
-                    for sess in &mut self.sessions {
-                        sess.terminal.set_viewport_pixel_size(pixel_w, pixel_h);
-                        sess.terminal.on_resize(cols, rows);
-                        let _ = sess.pty.resize(cols, rows);
-                        sess.refresh();
-                    }
-                    // Re-apply pane sizing for the displayed split panes.
+                    // Apply either full-tab or pane dimensions exactly once.
                     self.relayout();
+                    self.refresh_active_context();
                 }
             }
             Message::Focus(f) => {
@@ -2157,21 +2724,33 @@ impl Jterm {
                 }
             }
             Message::NewSession => self.new_session(),
-            Message::CloseTab(i) => return self.request_close_session(i),
-            Message::WindowClose => return iced::exit(),
-            Message::TabHover(i) => self.hovered_tab = i,
-            Message::TabDragStart(i) => {
-                if i < self.sessions.len() {
-                    self.dragging_tab = Some(i);
+            Message::CloseTab(id) => {
+                if let Some(index) = self.sessions.iter().position(|session| session.id == id) {
+                    return self.request_close_session(index);
                 }
             }
-            Message::TabDragEnd(i) => {
-                if let Some(from) = self.dragging_tab.take() {
-                    if from < self.sessions.len() && i < self.sessions.len() {
-                        if from == i {
-                            self.jump_session(i);
+            Message::WindowClose => return self.request_window_close(),
+            Message::TabHover(id) => self.hovered_tab = id,
+            Message::TabDragStart(id) => {
+                if self.sessions.iter().any(|session| session.id == id) {
+                    self.dragging_tab = Some(id);
+                }
+            }
+            Message::TabDragEnd(target_id) => {
+                if let Some(source_id) = self.dragging_tab.take() {
+                    let source = self
+                        .sessions
+                        .iter()
+                        .position(|session| session.id == source_id);
+                    let target = self
+                        .sessions
+                        .iter()
+                        .position(|session| session.id == target_id);
+                    if let (Some(from), Some(to)) = (source, target) {
+                        if from == to {
+                            self.jump_session(to);
                         } else {
-                            self.reorder_session(from, i);
+                            self.reorder_session(from, to);
                         }
                     }
                 }
@@ -2192,6 +2771,7 @@ impl Jterm {
                     if (ratio - self.split_ratio).abs() > f32::EPSILON {
                         self.split_ratio = ratio;
                         self.relayout();
+                        self.refresh_active_context();
                     }
                 }
             }
@@ -2227,20 +2807,8 @@ impl Jterm {
             Message::SetTabPosition(pos) => {
                 if self.config.tab_position != pos {
                     self.config.tab_position = pos;
-                    match pos {
-                        // Docking tabs to the side: open the dock and surface the
-                        // tab list (there is no top bar to show tabs otherwise).
-                        config::TabPosition::Side => {
-                            self.sidebar_open = true;
-                            self.sidebar_panel = SidebarPanel::Tabs;
-                        }
-                        // Returning tabs to the top bar: collapse the dock back to
-                        // the classic top-only layout.
-                        config::TabPosition::Top => {
-                            self.sidebar_open = false;
-                            self.sidebar_panel = SidebarPanel::Files;
-                        }
-                    }
+                    self.config_dirty = true;
+                    self.sync_tab_position_ui();
                     // Layout chrome changed (top bar shown/hidden, dock width):
                     // recompute the grid.
                     self.apply_config();
@@ -2260,15 +2828,19 @@ impl Jterm {
             Message::SearchToggleRegex => {
                 self.search.toggle_regex();
                 self.recompute_search();
+                self.reveal_current_search_match();
             }
             Message::SearchToggleCase => {
                 self.search.toggle_case_sensitive();
                 self.recompute_search();
+                self.reveal_current_search_match();
             }
             Message::SearchInput(value) => {
                 self.search.query = value;
                 self.search.history_nav_index = None;
+                self.search.current_match_index = 0;
                 self.recompute_search();
+                self.reveal_current_search_match();
             }
             Message::PaletteInput(value) => {
                 self.palette.query = value;
@@ -2287,8 +2859,49 @@ impl Jterm {
             Message::BlinkTick => {
                 self.blink_on = !self.blink_on;
             }
+            Message::PtyWriteTick => {
+                let mut failed = false;
+                for session in &mut self.sessions {
+                    if !session.flush_write_queue() {
+                        failed = true;
+                    }
+                }
+                if failed {
+                    self.push_toast("Terminal input write failed", ToastKind::Warning);
+                }
+            }
+            Message::SearchRefreshTick => {
+                let active_reflow_pending = self
+                    .sessions
+                    .get(self.active)
+                    .is_some_and(|session| self.history_reflow_sessions.contains(&session.id));
+                if self.search_dirty && !active_reflow_pending {
+                    self.recompute_search();
+                }
+            }
+            Message::HistoryReflowTick => {
+                if self
+                    .history_reflow_due
+                    .is_some_and(|due| std::time::Instant::now() >= due)
+                {
+                    let pending = std::mem::take(&mut self.history_reflow_sessions);
+                    for session in &mut self.sessions {
+                        if pending.contains(&session.id) {
+                            session.terminal.normalize_scrollback_width();
+                            session.refresh();
+                        }
+                    }
+                    self.history_reflow_due = None;
+                    if self.search.is_open {
+                        self.recompute_search();
+                        self.reveal_current_search_match();
+                    }
+                    self.links_cache_key = None;
+                }
+            }
             Message::SetTheme(name) => {
                 self.config.theme = name;
+                self.config_dirty = true;
                 self.apply_config();
             }
             Message::SetFontSize(v) => {
@@ -2298,21 +2911,26 @@ impl Jterm {
             }
             Message::SetLineSpacing(v) => {
                 self.config.line_spacing = Config::clamp_line_spacing(v);
+                self.config_dirty = true;
                 self.apply_config();
             }
             Message::SetPadding(v) => {
                 self.config.padding = Config::clamp_padding(v);
+                self.config_dirty = true;
                 self.apply_config();
             }
             Message::SetScrollback(v) => {
                 self.config.scrollback_lines = Config::clamp_scrollback_lines(v as usize);
+                self.config_dirty = true;
                 self.apply_config();
             }
             Message::SetScrollSpeed(v) => {
                 self.config.scroll_speed = Config::clamp_scroll_speed(v);
+                self.config_dirty = true;
             }
             Message::SetFontFamily(name) => {
                 self.config.font_family = name;
+                self.config_dirty = true;
                 self.apply_config();
             }
             Message::SetScrollbarAlways(always) => {
@@ -2321,10 +2939,16 @@ impl Jterm {
                 } else {
                     config::ScrollbarVisibility::Auto
                 };
+                self.config_dirty = true;
             }
             Message::SetDisableAltScreen(disable) => {
                 self.config.disable_alt_screen = disable;
+                self.config_dirty = true;
                 self.apply_config();
+            }
+            Message::SetAllowClipboardRead(allow) => {
+                self.config.allow_clipboard_read = allow;
+                self.config_dirty = true;
             }
             Message::ThemeEditOpen => {
                 // Seed the editor from the current theme; suggest a fresh name so
@@ -2380,6 +3004,7 @@ impl Jterm {
                         match theme.save_custom_theme() {
                             Ok(()) => {
                                 self.config.theme = name.clone();
+                                self.config_dirty = true;
                                 self.theme_editor = None;
                                 self.apply_config();
                                 self.push_toast(
@@ -2408,24 +3033,36 @@ impl Jterm {
                 }
                 if self.config.theme == name {
                     self.config.theme = "dark".to_string();
+                    self.config_dirty = true;
                     self.apply_config();
                 }
             }
-            Message::ConfigSave => {
-                match self.config.save() {
-                    Ok(()) => self.push_toast("Config saved", ToastKind::Success),
-                    Err(e) => self.push_toast(format!("Save failed: {}", e), ToastKind::Warning),
+            Message::ConfigSave => match self.config.save() {
+                Ok(()) => {
+                    self.config_mtime = Config::config_mtime();
+                    self.config_dirty = false;
+                    self.push_toast("Config saved", ToastKind::Success);
                 }
-                self.config_mtime = Config::config_mtime();
-                self.config_dirty = false;
-            }
+                Err(e) => self.push_toast(format!("Save failed: {}", e), ToastKind::Warning),
+            },
             Message::ConfigReset => {
                 self.config = Config::default();
+                self.sync_tab_position_ui();
                 self.apply_config();
-                let _ = self.config.save();
-                self.config_mtime = Config::config_mtime();
-                self.config_dirty = false;
-                self.push_toast("Config reset to defaults", ToastKind::Info);
+                match self.config.save() {
+                    Ok(()) => {
+                        self.config_mtime = Config::config_mtime();
+                        self.config_dirty = false;
+                        self.push_toast("Config reset to defaults", ToastKind::Info);
+                    }
+                    Err(error) => {
+                        self.config_dirty = true;
+                        self.push_toast(
+                            format!("Reset applied, save failed: {error}"),
+                            ToastKind::Warning,
+                        );
+                    }
+                }
             }
             Message::ConfigTick => {
                 self.persist_live_config();
@@ -2436,9 +3073,10 @@ impl Jterm {
                         self.config_mtime = m;
                         if let Ok(path) = Config::config_path() {
                             if let Ok(content) = std::fs::read_to_string(&path) {
-                                if let Ok(c) = toml::from_str::<Config>(&content) {
+                                if let Ok(c) = Config::from_toml(&content) {
                                     self.config = c;
                                     self.config_dirty = false;
+                                    self.sync_tab_position_ui();
                                     self.apply_config();
                                 }
                             }
@@ -2455,6 +3093,7 @@ impl Jterm {
                 // tab labels reflect both. These are cheap /proc reads at 1.5s
                 // cadence and let inactive tabs still show "vim · src" etc.
                 for sess in self.sessions.iter_mut() {
+                    sess.terminal.kitty_graphics.expire_pending_transfer();
                     sess.terminal.check_sync_output_timeout();
                     sess.refresh();
                     sess.cwd_cache = sess.cwd();
@@ -2462,9 +3101,9 @@ impl Jterm {
                 }
                 self.expire_toasts();
             }
-            Message::TabMenuOpen(i) => {
-                if i < self.sessions.len() {
-                    self.tab_menu = Some(i);
+            Message::TabMenuOpen(id) => {
+                if self.sessions.iter().any(|session| session.id == id) {
+                    self.tab_menu = Some(id);
                 }
             }
             Message::TabMenuClose => self.tab_menu = None,
@@ -2485,20 +3124,25 @@ impl Jterm {
                     s.selected = 0;
                 }
             }
-            Message::TabSwitcherJump(i) => {
+            Message::TabSwitcherJump(id) => {
                 self.tab_switcher = None;
-                if i < self.sessions.len() && i != self.active {
-                    self.active = i;
-                    self.panes[self.focused_pane] = i;
-                    self.session_dirty = true;
+                if let Some(index) = self.sessions.iter().position(|session| session.id == id) {
+                    if index != self.active {
+                        self.active = index;
+                        self.panes[self.focused_pane] = index;
+                        self.session_dirty = true;
+                        self.refresh_active_context();
+                    }
                 }
             }
             Message::TabCloseConfirmNo => {
                 self.tab_close_confirm = None;
             }
             Message::TabCloseConfirmYes => {
-                if let Some((index, _)) = self.tab_close_confirm.take() {
-                    return self.close_session(index);
+                if let Some((id, _, activate_after)) = self.tab_close_confirm.take() {
+                    if let Some(index) = self.sessions.iter().position(|session| session.id == id) {
+                        return self.close_session_then(index, activate_after);
+                    }
                 }
             }
         }
@@ -2511,10 +3155,11 @@ impl Jterm {
     /// New or content-changed images get a fresh handle; handles for images no
     /// longer referenced by any placement are dropped.
     fn refresh_kitty_handles(&mut self) {
+        type PendingHandle = ((usize, u32), u64, u32, u32, Vec<u8>);
         // Collect, under an immutable borrow, which images need a (re)build and
         // which ids are still live, then release the borrow before mutating.
-        let mut needed: Vec<(u32, u32, u32, Vec<u8>)> = Vec::new();
-        let mut live_ids = std::collections::HashSet::new();
+        let mut needed: Vec<PendingHandle> = Vec::new();
+        let mut live_keys = std::collections::HashSet::new();
         {
             let Some(sess) = self.sessions.get(self.active) else {
                 self.kitty_handles.clear();
@@ -2522,24 +3167,30 @@ impl Jterm {
             };
             let kg = &sess.terminal.kitty_graphics;
             for p in kg.get_placements() {
-                live_ids.insert(p.image_id);
-                if let Some(img) = kg.get_image(p.image_id) {
-                    let stale = self
-                        .kitty_handles
-                        .get(&p.image_id)
-                        .map(|(_, len)| *len != img.data.len())
-                        .unwrap_or(true);
-                    if stale {
-                        needed.push((img.id, img.width, img.height, img.data.clone()));
-                    }
+                let key = (sess.id, p.image_id);
+                let Some(img) = kg.get_image(p.image_id) else {
+                    continue;
+                };
+                // Many placements may reference one image. Schedule/cache each
+                // texture once so placement fan-out cannot clone and upload the
+                // same (potentially large) pixel buffer hundreds of times.
+                if !live_keys.insert(key) {
+                    continue;
+                }
+                let stale = self
+                    .kitty_handles
+                    .get(&key)
+                    .map(|(_, generation)| *generation != img.generation)
+                    .unwrap_or(true);
+                if stale {
+                    needed.push((key, img.generation, img.width, img.height, img.data.clone()));
                 }
             }
         }
-        self.kitty_handles.retain(|id, _| live_ids.contains(id));
-        for (id, w, h, data) in needed {
-            let len = data.len();
+        self.kitty_handles.retain(|key, _| live_keys.contains(key));
+        for (key, generation, w, h, data) in needed {
             let handle = iced::advanced::image::Handle::from_rgba(w, h, data);
-            self.kitty_handles.insert(id, (handle, len));
+            self.kitty_handles.insert(key, (handle, generation));
         }
     }
 
@@ -2550,7 +3201,7 @@ impl Jterm {
         kg.get_placements()
             .iter()
             .filter_map(|p| {
-                let (handle, _) = self.kitty_handles.get(&p.image_id)?;
+                let (handle, _) = self.kitty_handles.get(&(sess.id, p.image_id))?;
                 let img = kg.get_image(p.image_id)?;
                 Some(KittyRender {
                     handle: handle.clone(),
@@ -2574,7 +3225,7 @@ impl Jterm {
             return;
         };
         let key = (
-            self.active,
+            sess.id,
             sess.terminal.get_grid_version(),
             sess.terminal.scroll_offset,
         );
@@ -2781,6 +3432,7 @@ impl Jterm {
                 .style(self.ghost_btn_style()),
         );
         for (i, sess) in self.sessions.iter().enumerate() {
+            let id = sess.id;
             let active = i == self.active;
             let label = sess.label();
             let label = if label.chars().count() > 24 {
@@ -2793,17 +3445,17 @@ impl Jterm {
             // mouse_area so we get on_press/on_release/on_enter/on_exit. The
             // styling mirrors `tab_btn_style` so visually it matches the rest
             // of the chrome.
-            let hovered = self.hovered_tab == Some(i);
-            let dragging_this = self.dragging_tab == Some(i);
+            let hovered = self.hovered_tab == Some(id);
+            let dragging_this = self.dragging_tab == Some(id);
             let tab_label = container(text(label).size(13))
                 .padding([3, 8])
                 .style(self.tab_container_style(active, hovered, dragging_this));
             // Drag press/release lives on the label so a press on the close
             // button never starts a tab drag. Right-click opens the context menu.
             let tab: Element<'_, Message> = mouse_area(tab_label)
-                .on_press(Message::TabDragStart(i))
-                .on_release(Message::TabDragEnd(i))
-                .on_right_press(Message::TabMenuOpen(i))
+                .on_press(Message::TabDragStart(id))
+                .on_release(Message::TabDragEnd(id))
+                .on_right_press(Message::TabMenuOpen(id))
                 .into();
             // Reveal the close button only on the active or hovered tab to cut
             // visual noise; keep its footprint reserved otherwise so tabs don't
@@ -2811,7 +3463,7 @@ impl Jterm {
             let show_close = active || hovered;
             let close: Element<'_, Message> = if show_close {
                 button(text("×").size(13))
-                    .on_press(Message::CloseTab(i))
+                    .on_press(Message::CloseTab(id))
                     .padding([3, 6])
                     .style(self.close_btn_style())
                     .into()
@@ -2823,7 +3475,7 @@ impl Jterm {
             // button does not collapse it out of the layout.
             tabs = tabs.push(
                 mouse_area(cell)
-                    .on_enter(Message::TabHover(Some(i)))
+                    .on_enter(Message::TabHover(Some(id)))
                     .on_exit(Message::TabHover(None)),
             );
         }
@@ -2858,7 +3510,12 @@ impl Jterm {
 
     /// Floating tab context menu — Close, Close Others, Close to Right, Duplicate.
     /// Background mouse_area dismisses on outside-click; Esc also closes via key handler.
-    fn tab_context_menu(&self, i: usize) -> Element<'_, Message> {
+    fn tab_context_menu(&self, id: usize) -> Element<'_, Message> {
+        let i = self
+            .sessions
+            .iter()
+            .position(|session| session.id == id)
+            .unwrap_or(self.active);
         let label = self
             .sessions
             .get(i)
@@ -2877,24 +3534,24 @@ impl Jterm {
 
         let mut menu = column![
             text(label).size(12).style(text::secondary),
-            row_btn("Close", Message::TabMenuAction(TabMenuAction::Close(i)),),
+            row_btn("Close", Message::TabMenuAction(TabMenuAction::Close(id)),),
         ]
         .spacing(2);
         if !only_one {
             menu = menu.push(row_btn(
                 "Close Others",
-                Message::TabMenuAction(TabMenuAction::CloseOthers(i)),
+                Message::TabMenuAction(TabMenuAction::CloseOthers(id)),
             ));
         }
         if i < last_idx {
             menu = menu.push(row_btn(
                 "Close to Right",
-                Message::TabMenuAction(TabMenuAction::CloseToRight(i)),
+                Message::TabMenuAction(TabMenuAction::CloseToRight(id)),
             ));
         }
         menu = menu.push(row_btn(
             "Duplicate",
-            Message::TabMenuAction(TabMenuAction::Duplicate(i)),
+            Message::TabMenuAction(TabMenuAction::Duplicate(id)),
         ));
 
         let panel = container(menu)
@@ -2919,12 +3576,13 @@ impl Jterm {
 
     /// Centered modal: "Tab is running `<proc>`. Close anyway?". Esc / outside
     /// click cancel; only TabCloseConfirmYes proceeds with the close.
-    fn tab_close_confirm_view(&self, index: usize, proc_name: &str) -> Element<'_, Message> {
+    fn tab_close_confirm_view(&self, id: usize, proc_name: &str) -> Element<'_, Message> {
         let label = self
             .sessions
-            .get(index)
+            .iter()
+            .find(|session| session.id == id)
             .map(|s| s.label())
-            .unwrap_or_else(|| format!("Tab {}", index + 1));
+            .unwrap_or_else(|| format!("Session {}", id + 1));
         let body = column![
             text(format!("Close \"{}\"?", label)).size(14),
             text(format!("Foreground process: {}", proc_name))
@@ -3020,11 +3678,11 @@ impl Jterm {
         } else {
             for &(pos, idx) in filtered.iter() {
                 let selected = pos == state.selected;
-                let label = self
-                    .sessions
-                    .get(idx)
-                    .map(|s| s.label())
-                    .unwrap_or_default();
+                let Some(session) = self.sessions.get(idx) else {
+                    continue;
+                };
+                let label = session.label();
+                let id = session.id;
                 let info = row![
                     text(format!("{:>2}", idx + 1))
                         .size(12)
@@ -3049,7 +3707,7 @@ impl Jterm {
                         ..Default::default()
                     },
                 );
-                let row_btn = mouse_area(body).on_press(Message::TabSwitcherJump(idx));
+                let row_btn = mouse_area(body).on_press(Message::TabSwitcherJump(id));
                 list = list.push(row_btn);
             }
         }
@@ -3157,8 +3815,7 @@ impl Jterm {
         let sess = &self.sessions[sess_idx];
         // An open overlay input owns the keyboard and IME, so the terminal pane
         // renders unfocused (no blinking cursor, no competing IME request).
-        let overlay_input_active = self.search.is_open || self.palette.is_open;
-        let focused = self.focused && pane_pos == self.focused_pane && !overlay_input_active;
+        let focused = self.focused && pane_pos == self.focused_pane && self.terminal_input_active();
         let is_active = sess_idx == self.active;
         // Only walk the grid to build per-row selection spans when a selection
         // actually exists; otherwise hand the widget an empty Vec (no highlight).
@@ -3171,15 +3828,27 @@ impl Jterm {
         };
         // Only paint match highlights while the search bar is open; otherwise
         // stale matches (whose line indices drift as the grid scrolls) linger.
-        let (search_matches, current): (&[search::SearchMatch], _) =
-            if is_active && self.search.is_open {
-                (
-                    &self.search.matches,
-                    self.search.current_match().map(|m| (m.line, m.col_start)),
-                )
-            } else {
-                (&[], None)
-            };
+        let (search_matches, current) = if is_active && self.search.is_open {
+            let start = sess.terminal.viewport_absolute_start();
+            let end = start.saturating_add(sess.grid.len());
+            let visible = self
+                .search
+                .matches
+                .iter()
+                .filter(|m| m.line >= start && m.line < end)
+                .map(|m| search::SearchMatch {
+                    line: m.line - start,
+                    col_start: m.col_start,
+                    col_end: m.col_end,
+                })
+                .collect();
+            let current = self.search.current_match().and_then(|m| {
+                (m.line >= start && m.line < end).then_some((m.line - start, m.col_start))
+            });
+            (visible, current)
+        } else {
+            (Vec::new(), None)
+        };
         let links: &[link::Link] = if is_active { &self.links } else { &[] };
         let images = if is_active {
             self.kitty_images(sess)
@@ -3215,6 +3884,11 @@ impl Jterm {
         .search(search_matches, current)
         .links(links)
         .dynamic_palette(&sess.terminal.dynamic_palette)
+        .dynamic_defaults(
+            sess.terminal.dynamic_fg,
+            sess.terminal.dynamic_bg,
+            sess.terminal.dynamic_cursor_color,
+        )
         .images(images)
         .preedit(if focused && !sess.terminal.preedit_text.is_empty() {
             Some((
@@ -3304,6 +3978,7 @@ impl Jterm {
     fn sidebar_tabs_view(&self) -> Element<'_, Message> {
         let mut list = column![].spacing(2).padding([2, 4]);
         for (i, sess) in self.sessions.iter().enumerate() {
+            let id = sess.id;
             let active = i == self.active;
             let label = sess.label();
             let label = if label.chars().count() > 22 {
@@ -3312,21 +3987,21 @@ impl Jterm {
             } else {
                 label
             };
-            let hovered = self.hovered_tab == Some(i);
-            let dragging_this = self.dragging_tab == Some(i);
+            let hovered = self.hovered_tab == Some(id);
+            let dragging_this = self.dragging_tab == Some(id);
             let tab_label = container(text(label).size(13).wrapping(text::Wrapping::None))
                 .width(Length::Fill)
                 .padding([4, 8])
                 .style(self.tab_container_style(active, hovered, dragging_this));
             let tab: Element<'_, Message> = mouse_area(tab_label)
-                .on_press(Message::TabDragStart(i))
-                .on_release(Message::TabDragEnd(i))
+                .on_press(Message::TabDragStart(id))
+                .on_release(Message::TabDragEnd(id))
                 .into();
             // Reveal the close button on the active or hovered tab only.
             let show_close = active || hovered;
             let close_inner: Element<'_, Message> = if show_close {
                 button(text("×").size(13))
-                    .on_press(Message::CloseTab(i))
+                    .on_press(Message::CloseTab(id))
                     .padding([4, 6])
                     .style(self.close_btn_style())
                     .into()
@@ -3339,7 +4014,7 @@ impl Jterm {
             let cell = row![tab, close].spacing(2).align_y(iced::Alignment::Center);
             list = list.push(
                 mouse_area(cell)
-                    .on_enter(Message::TabHover(Some(i)))
+                    .on_enter(Message::TabHover(Some(id)))
                     .on_exit(Message::TabHover(None)),
             );
         }
@@ -3533,8 +4208,8 @@ impl Jterm {
         } else {
             root
         };
-        let root: Element<'_, Message> = if let Some((idx, proc)) = &self.tab_close_confirm {
-            stack![root, self.tab_close_confirm_view(*idx, proc)].into()
+        let root: Element<'_, Message> = if let Some((id, process, _)) = &self.tab_close_confirm {
+            stack![root, self.tab_close_confirm_view(*id, process)].into()
         } else {
             root
         };
@@ -3668,20 +4343,46 @@ impl Jterm {
         let current_theme = Some(self.config.theme.clone());
         let is_custom = !Theme::is_builtin(&self.config.theme);
 
-        let mut theme_row = row![
-            text("Theme").size(13).width(Length::Fixed(120.0)),
-            pick_list(themes, current_theme, Message::SetTheme).text_size(13),
-            button(text("Edit…").size(13)).on_press(Message::ThemeEditOpen),
-        ]
-        .spacing(10)
-        .align_y(iced::Alignment::Center);
+        // Keep the modal inside the current window and switch to a stacked form
+        // before horizontal controls become cramped. The content itself scrolls
+        // below, so every setting remains reachable in short windows.
+        let panel_width = (self.win_size.width - 24.0).clamp(1.0, 520.0);
+        let panel_height = (self.win_size.height - 24.0).clamp(1.0, 560.0);
+        let compact = panel_width < 430.0;
+        let panel_padding = if compact || panel_height < 360.0 {
+            10.0
+        } else {
+            16.0
+        };
+
+        let theme_picker = pick_list(themes, current_theme, Message::SetTheme)
+            .text_size(13)
+            .width(Length::Fill);
+        let mut theme_actions =
+            row![button(text("Edit…").size(13)).on_press(Message::ThemeEditOpen),]
+                .spacing(8)
+                .align_y(iced::Alignment::Center);
         if is_custom {
-            theme_row = theme_row.push(
+            theme_actions = theme_actions.push(
                 button(text("Delete").size(13))
                     .on_press(Message::ThemeDelete(self.config.theme.clone()))
                     .style(button::danger),
             );
         }
+        let theme_row: Element<'_, Message> = if compact {
+            column![text("Theme").size(13), theme_picker, theme_actions]
+                .spacing(6)
+                .into()
+        } else {
+            row![
+                text("Theme").size(13).width(Length::Fixed(120.0)),
+                theme_picker,
+                theme_actions,
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center)
+            .into()
+        };
 
         // Monospace families detected via fc-list (cached, scanned on first open).
         // Ensure the configured family is present so the pick_list shows it.
@@ -3691,40 +4392,75 @@ impl Jterm {
         {
             fonts.insert(0, self.config.font_family.clone());
         }
-        let font_family_row = row![
-            text("Font").size(13).width(Length::Fixed(120.0)),
-            pick_list(
-                fonts,
-                Some(self.config.font_family.clone()),
-                Message::SetFontFamily
-            )
-            .text_size(13),
-        ]
-        .spacing(10)
-        .align_y(iced::Alignment::Center);
+        let font_picker = pick_list(
+            fonts,
+            Some(self.config.font_family.clone()),
+            Message::SetFontFamily,
+        )
+        .text_size(13)
+        .width(Length::Fill);
+        let font_family_row: Element<'_, Message> = if compact {
+            column![text("Font").size(13), font_picker]
+                .spacing(6)
+                .into()
+        } else {
+            row![
+                text("Font").size(13).width(Length::Fixed(120.0)),
+                font_picker,
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center)
+            .into()
+        };
 
-        let font_size = slider_row(
+        fn responsive_slider_row<'a>(
+            compact: bool,
+            label: &'static str,
+            value: String,
+            control: Element<'a, Message>,
+        ) -> Element<'a, Message> {
+            if compact {
+                column![
+                    row![
+                        text(label).size(13).width(Length::Fill),
+                        text(value).size(13),
+                    ]
+                    .align_y(iced::Alignment::Center),
+                    control,
+                ]
+                .spacing(6)
+                .into()
+            } else {
+                slider_row(label, value, control)
+            }
+        }
+
+        let font_size = responsive_slider_row(
+            compact,
             "Font Size",
             format!("{:.0}", self.config.font_size),
             slider(8.0..=72.0, self.config.font_size, Message::SetFontSize)
                 .step(1.0)
                 .into(),
         );
-        let line_spacing = slider_row(
+        let line_spacing = responsive_slider_row(
+            compact,
             "Line Spacing",
             format!("{:.2}", self.config.line_spacing),
             slider(0.8..=3.0, self.config.line_spacing, Message::SetLineSpacing)
                 .step(0.05)
                 .into(),
         );
-        let padding = slider_row(
+        let padding = responsive_slider_row(
+            compact,
             "Padding",
             format!("{:.0}", self.config.padding),
             slider(0.0..=20.0, self.config.padding, Message::SetPadding)
                 .step(1.0)
                 .into(),
         );
-        let scrollback = slider_row(
+        let scrollback = responsive_slider_row(
+            compact,
             "Scrollback",
             format!("{}", self.config.scrollback_lines),
             slider(
@@ -3735,49 +4471,77 @@ impl Jterm {
             .step(100u32)
             .into(),
         );
-        let scroll_speed = slider_row(
+        let scroll_speed = responsive_slider_row(
+            compact,
             "Scroll Speed",
             format!("{}", self.config.scroll_speed),
             slider(1..=10u32, self.config.scroll_speed, Message::SetScrollSpeed)
                 .step(1u32)
                 .into(),
         );
-        let scrollbar_row = row![
-            text("Scrollbar").size(13).width(Length::Fixed(120.0)),
+        fn responsive_control_row<'a>(
+            compact: bool,
+            label: &'static str,
+            control: Element<'a, Message>,
+        ) -> Element<'a, Message> {
+            if compact {
+                column![text(label).size(13), control].spacing(6).into()
+            } else {
+                row![text(label).size(13).width(Length::Fixed(120.0)), control,]
+                    .spacing(10)
+                    .align_y(iced::Alignment::Center)
+                    .into()
+            }
+        }
+
+        let scrollbar_row = responsive_control_row(
+            compact,
+            "Scrollbar",
             checkbox(matches!(
                 self.config.scrollbar_visibility,
                 config::ScrollbarVisibility::Always
             ))
             .label("Always show")
             .text_size(13)
-            .on_toggle(Message::SetScrollbarAlways),
-        ]
-        .spacing(10)
-        .align_y(iced::Alignment::Center);
+            .on_toggle(Message::SetScrollbarAlways)
+            .into(),
+        );
 
-        let alt_screen_row = row![
-            text("Alt Screen").size(13).width(Length::Fixed(120.0)),
+        let alt_screen_row = responsive_control_row(
+            compact,
+            "Alt Screen",
             checkbox(self.config.disable_alt_screen)
                 .label("Disable")
                 .text_size(13)
-                .on_toggle(Message::SetDisableAltScreen),
-        ]
-        .spacing(10)
-        .align_y(iced::Alignment::Center);
+                .on_toggle(Message::SetDisableAltScreen)
+                .into(),
+        );
 
-        let tab_position_row = row![
-            text("Tabs").size(13).width(Length::Fixed(120.0)),
+        let clipboard_row = responsive_control_row(
+            compact,
+            "Clipboard",
+            checkbox(self.config.allow_clipboard_read)
+                .label("Allow PTY reads (unsafe over SSH)")
+                .text_size(13)
+                .on_toggle(Message::SetAllowClipboardRead)
+                .into(),
+        );
+
+        let tab_position_row = responsive_control_row(
+            compact,
+            "Tabs",
             checkbox(self.config.tab_position == config::TabPosition::Side)
                 .label("In sidebar")
                 .text_size(13)
-                .on_toggle(|side| Message::SetTabPosition(if side {
-                    config::TabPosition::Side
-                } else {
-                    config::TabPosition::Top
-                })),
-        ]
-        .spacing(10)
-        .align_y(iced::Alignment::Center);
+                .on_toggle(|side| {
+                    Message::SetTabPosition(if side {
+                        config::TabPosition::Side
+                    } else {
+                        config::TabPosition::Top
+                    })
+                })
+                .into(),
+        );
 
         let buttons = row![
             button(text("Save").size(13)).on_press(Message::ConfigSave),
@@ -3790,32 +4554,36 @@ impl Jterm {
         ]
         .spacing(8);
 
-        let footer = text("Ctrl+Shift+O toggles · Esc closes")
+        let footer = text("Changes auto-save · Ctrl+Shift+O toggles · Esc closes")
             .size(10)
+            .width(Length::Fill)
+            .wrapping(text::Wrapping::Word)
             .style(text::secondary);
 
-        let inner = container(
-            column![
-                text("Settings").size(18),
-                theme_row,
-                font_family_row,
-                font_size,
-                line_spacing,
-                padding,
-                scrollback,
-                scroll_speed,
-                scrollbar_row,
-                alt_screen_row,
-                tab_position_row,
-                buttons,
-                footer,
-            ]
-            .spacing(12),
-        )
-        .width(Length::Fixed(460.0))
-        .max_height(480.0)
-        .padding(16)
-        .style(container::dark);
+        let content = column![
+            text("Settings").size(18),
+            theme_row,
+            font_family_row,
+            font_size,
+            line_spacing,
+            padding,
+            scrollback,
+            scroll_speed,
+            scrollbar_row,
+            alt_screen_row,
+            clipboard_row,
+            tab_position_row,
+            buttons,
+            footer,
+        ]
+        .spacing(12)
+        .width(Length::Fill);
+
+        let inner = container(scrollable(content).width(Length::Fill).height(Length::Fill))
+            .width(Length::Fixed(panel_width))
+            .height(Length::Fixed(panel_height))
+            .padding(panel_padding)
+            .style(container::dark);
         container(inner)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
@@ -4051,7 +4819,13 @@ impl Jterm {
         let mut subs: Vec<Subscription<Message>> = self
             .sessions
             .iter()
-            .map(|s| pty_subscription(s.id, s.master_fd))
+            .map(|s| {
+                pty_subscription(PtySubscriptionKey {
+                    id: s.id,
+                    master_fd: s.master_fd,
+                    reader_fd: Arc::clone(&s.reader_fd),
+                })
+            })
             .collect();
         let events = iced::event::listen_with(|event, status, _id| match event {
             iced::Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => {
@@ -4063,10 +4837,12 @@ impl Jterm {
             // so editing the search/palette query never double-inputs.
             iced::Event::Keyboard(_) if status == iced::event::Status::Captured => None,
             iced::Event::Keyboard(k) => Some(Message::Key(k)),
+            iced::Event::InputMethod(_) if status == iced::event::Status::Captured => None,
             iced::Event::InputMethod(ime) => Some(Message::Ime(ime)),
             iced::Event::Window(iced::window::Event::Resized(size)) => Some(Message::Resized(size)),
             iced::Event::Window(iced::window::Event::Focused) => Some(Message::Focus(true)),
             iced::Event::Window(iced::window::Event::Unfocused) => Some(Message::Focus(false)),
+            iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::WindowClose),
             // Catch every left-button release so a tab drag that ends outside
             // any tab still clears `dragging_tab`. When the release lands on a
             // tab, mouse_area's on_release fires Message::TabDragEnd first
@@ -4097,6 +4873,24 @@ impl Jterm {
             subs.push(
                 iced::time::every(std::time::Duration::from_millis(530))
                     .map(|_| Message::BlinkTick),
+            );
+        }
+        if self.sessions.iter().any(Session::has_pending_write) {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(8))
+                    .map(|_| Message::PtyWriteTick),
+            );
+        }
+        if self.search.is_open && self.search_dirty {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(50))
+                    .map(|_| Message::SearchRefreshTick),
+            );
+        }
+        if self.history_reflow_due.is_some() {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(50))
+                    .map(|_| Message::HistoryReflowTick),
             );
         }
         if !self.toasts.is_empty() {
@@ -4141,7 +4935,7 @@ fn tab_switcher_filtered(sessions: &[Session], query: &str) -> Vec<(usize, usize
         .enumerate()
         .filter_map(|(i, s)| matcher.fuzzy_match(&s.label(), query).map(|sc| (sc, i)))
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|item| std::cmp::Reverse(item.0));
     scored
         .into_iter()
         .enumerate()
@@ -4170,7 +4964,6 @@ fn btn_code(button: MouseButton) -> u8 {
     }
 }
 
-/// Wrap a paste payload in bracketed-paste delimiters.
 /// Shell-quote a path for typing into the terminal, with a trailing space.
 fn shell_quote(s: &str) -> String {
     if s.is_empty() {
@@ -4186,12 +4979,42 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
+/// Submit an OSC 9/777 notification to one bounded worker. The worker owns and
+/// waits for every `notify-send` child, preventing zombies; a stuck notifier can
+/// fill at most this small queue instead of spawning unbounded processes/threads.
+fn enqueue_desktop_notification(title: String, body: String) {
+    type Notification = (String, String);
+    static SENDER: std::sync::OnceLock<std::sync::mpsc::SyncSender<Notification>> =
+        std::sync::OnceLock::new();
+
+    let sender = SENDER.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Notification>(8);
+        let _ = std::thread::Builder::new()
+            .name("jterm3-notifications".to_string())
+            .spawn(move || {
+                while let Ok((title, body)) = receiver.recv() {
+                    let _ = std::process::Command::new("notify-send")
+                        .arg(title)
+                        .arg(body)
+                        .status();
+                }
+            });
+        sender
+    });
+    let _ = sender.try_send((title, body));
+}
+
+/// Wrap a paste payload in bracketed-paste delimiters.
 fn wrap_bracketed_paste(mut payload: Vec<u8>) -> Vec<u8> {
-    let mut wrapped = Vec::with_capacity(payload.len() + 12);
-    wrapped.extend_from_slice(b"\x1b[200~");
-    wrapped.append(&mut payload);
-    wrapped.extend_from_slice(b"\x1b[201~");
-    wrapped
+    const PREFIX: &[u8] = b"\x1b[200~";
+    const SUFFIX: &[u8] = b"\x1b[201~";
+    let payload_len = payload.len();
+    payload.reserve(BRACKETED_PASTE_FRAMING_BYTES);
+    payload.resize(payload_len + BRACKETED_PASTE_FRAMING_BYTES, 0);
+    payload.copy_within(0..payload_len, PREFIX.len());
+    payload[..PREFIX.len()].copy_from_slice(PREFIX);
+    payload[PREFIX.len() + payload_len..].copy_from_slice(SUFFIX);
+    payload
 }
 
 /// Build a single OSC 5522 packet: `ESC ] 5522 ; <metadata> [; <payload>] ESC \`.
@@ -4223,100 +5046,129 @@ fn clipboard_5522_response_for_mime(mime_type: &str, data: &[u8]) -> Vec<u8> {
     output
 }
 
-fn pty_subscription(id: usize, fd: RawFd) -> Subscription<Message> {
+fn pty_subscription(key: PtySubscriptionKey) -> Subscription<Message> {
     // Key on the stable session id (not the raw fd): a closed session's fd
     // number can be reused by a new session, and keying on fd alone would let
     // iced confuse the two and reuse the old reader thread on the reused fd.
-    Subscription::run_with((id, fd), |&(_, fd): &(usize, RawFd)| pty_stream(fd))
+    Subscription::run_with(key, |key: &PtySubscriptionKey| pty_stream(key.clone()))
 }
 
-fn pty_stream(fd: RawFd) -> impl iced::futures::Stream<Item = Message> {
+fn pty_stream(key: PtySubscriptionKey) -> impl iced::futures::Stream<Item = Message> {
     use iced::futures::{SinkExt, StreamExt};
     iced::stream::channel(
-        256,
+        2,
         move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
-            let (tx, mut rx) = iced::futures::channel::mpsc::unbounded::<Message>();
+            let id = key.id;
+            let fd = key.master_fd;
+            // Each message is capped at 1 MiB below. Two shallow handoff queues
+            // keep only a few MiB resident per session while backpressuring read(2).
+            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<Message>(2);
             // Self-pipe so dropping this subscription (session/tab closed) wakes the
             // reader thread and stops it BEFORE it can read from a PTY fd whose
             // number may have been reused by a freshly spawned session.
-            let (shutdown_r, shutdown_w) = Pty::make_shutdown_pipe().unwrap_or((-1, -1));
-            std::thread::spawn(move || {
-                // Drain everything currently readable into one message instead of
-                // emitting a separate message per 64 KiB read. Bursty output (e.g.
-                // `cat bigfile`) then triggers far fewer process/refresh/render
-                // cycles, while a lone keystroke still hits WouldBlock immediately
-                // and is delivered with no added latency. Capped so the UI gets a
-                // chance to repaint between very large bursts.
-                const COALESCE_CAP: usize = 1 << 20; // 1 MiB per message
-                let mut buf = vec![0u8; 65536];
-                loop {
-                    match Pty::wait_fd_or_shutdown(fd, shutdown_r, 200) {
-                        Ok(ReaderPoll::Shutdown) => break,
-                        Ok(ReaderPoll::Timeout) => continue,
-                        Ok(ReaderPoll::Data) => {
-                            let mut acc: Vec<u8> = Vec::new();
-                            let mut exited = false;
-                            let mut errored = false;
-                            loop {
-                                let n = unsafe {
-                                    libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-                                };
-                                if n > 0 {
-                                    acc.extend_from_slice(&buf[..n as usize]);
-                                    if acc.len() >= COALESCE_CAP {
+            let (shutdown_r, shutdown_w) = match Pty::make_shutdown_pipe() {
+                Ok((read_fd, write_fd)) => {
+                    // SAFETY: make_shutdown_pipe returns two fresh owned fds.
+                    unsafe {
+                        (
+                            OwnedFd::from_raw_fd(read_fd),
+                            OwnedFd::from_raw_fd(write_fd),
+                        )
+                    }
+                }
+                Err(error) => {
+                    log::error!("[PTY] failed to create reader shutdown pipe: {error}");
+                    let _ = output.send(Message::PtyExited(id, fd, -1)).await;
+                    return;
+                }
+            };
+            let reader_fd = key.reader_fd;
+            let spawn_result = std::thread::Builder::new()
+                .name(format!("jterm3-pty-{id}"))
+                .spawn(move || {
+                    let reader_raw = reader_fd.as_raw_fd();
+                    let shutdown_raw = shutdown_r.as_raw_fd();
+                    // Drain everything currently readable into one message instead of
+                    // emitting a separate message per 64 KiB read. Bursty output (e.g.
+                    // `cat bigfile`) then triggers far fewer process/refresh/render
+                    // cycles, while a lone keystroke still hits WouldBlock immediately
+                    // and is delivered with no added latency. Capped so the UI gets a
+                    // chance to repaint between very large bursts.
+                    const COALESCE_CAP: usize = 1 << 20; // 1 MiB per message
+                    let mut buf = vec![0u8; 65536];
+                    loop {
+                        match Pty::wait_fd_or_shutdown(reader_raw, shutdown_raw, 200) {
+                            Ok(ReaderPoll::Shutdown) => break,
+                            Ok(ReaderPoll::Timeout) => continue,
+                            Ok(ReaderPoll::Data) => {
+                                let mut acc: Vec<u8> = Vec::new();
+                                let mut exited = false;
+                                let mut errored = false;
+                                loop {
+                                    let n = unsafe {
+                                        libc::read(
+                                            reader_raw,
+                                            buf.as_mut_ptr() as *mut libc::c_void,
+                                            buf.len(),
+                                        )
+                                    };
+                                    if n > 0 {
+                                        acc.extend_from_slice(&buf[..n as usize]);
+                                        if acc.len() >= COALESCE_CAP {
+                                            break;
+                                        }
+                                    } else if n == 0 {
+                                        exited = true;
+                                        break;
+                                    } else {
+                                        let err = std::io::Error::last_os_error();
+                                        if err.kind() == std::io::ErrorKind::WouldBlock {
+                                            break;
+                                        }
+                                        if err.raw_os_error() == Some(libc::EINTR) {
+                                            continue;
+                                        }
+                                        errored = true;
                                         break;
                                     }
-                                } else if n == 0 {
-                                    exited = true;
+                                }
+                                if !acc.is_empty()
+                                    && iced::futures::executor::block_on(
+                                        tx.send(Message::PtyOutput(id, fd, acc)),
+                                    )
+                                    .is_err()
+                                {
                                     break;
-                                } else {
-                                    let err = std::io::Error::last_os_error();
-                                    if err.kind() == std::io::ErrorKind::WouldBlock {
-                                        break;
-                                    }
-                                    errored = true;
+                                }
+                                if exited {
+                                    let _ = iced::futures::executor::block_on(
+                                        tx.send(Message::PtyExited(id, fd, 0)),
+                                    );
+                                    break;
+                                }
+                                if errored {
+                                    let _ = iced::futures::executor::block_on(
+                                        tx.send(Message::PtyExited(id, fd, -1)),
+                                    );
                                     break;
                                 }
                             }
-                            if !acc.is_empty()
-                                && tx.unbounded_send(Message::PtyOutput(fd, acc)).is_err()
-                            {
-                                break;
-                            }
-                            if exited {
-                                let _ = tx.unbounded_send(Message::PtyExited(fd, 0));
-                                break;
-                            }
-                            if errored {
-                                let _ = tx.unbounded_send(Message::PtyExited(fd, -1));
+                            Err(_) => {
+                                let _ = iced::futures::executor::block_on(
+                                    tx.send(Message::PtyExited(id, fd, -1)),
+                                );
                                 break;
                             }
                         }
-                        Err(_) => {
-                            let _ = tx.unbounded_send(Message::PtyExited(fd, -1));
-                            break;
-                        }
                     }
-                }
-                // Reader is done; release our end of the shutdown pipe.
-                if shutdown_r >= 0 {
-                    unsafe {
-                        libc::close(shutdown_r);
-                    }
-                }
-            });
-            // Closing the write end on drop (subscription removed) signals the reader.
-            struct ShutdownGuard(RawFd);
-            impl Drop for ShutdownGuard {
-                fn drop(&mut self) {
-                    if self.0 >= 0 {
-                        unsafe {
-                            libc::close(self.0);
-                        }
-                    }
-                }
+                });
+            if let Err(error) = spawn_result {
+                log::error!("[PTY] failed to spawn reader thread: {error}");
+                let _ = output.send(Message::PtyExited(id, fd, -1)).await;
+                return;
             }
-            let _shutdown_guard = ShutdownGuard(shutdown_w);
+            // Dropping this owned write end (subscription removed) signals the reader.
+            let _shutdown_guard = shutdown_w;
             while let Some(msg) = rx.next().await {
                 if output.send(msg).await.is_err() {
                     break;
@@ -4656,6 +5508,39 @@ fn xterm_modify_other_keys_encode(
 mod tests {
     use super::*;
     use iced::keyboard::key::Named;
+
+    #[test]
+    fn bracketed_paste_framing_preserves_payload() {
+        assert_eq!(
+            wrap_bracketed_paste(b"hello\nworld".to_vec()),
+            b"\x1b[200~hello\nworld\x1b[201~"
+        );
+        assert_eq!(wrap_bracketed_paste(Vec::new()), b"\x1b[200~\x1b[201~");
+    }
+
+    #[test]
+    fn tiny_pty_writes_are_coalesced_and_entry_bounded() {
+        let mut queue = std::collections::VecDeque::new();
+        for _ in 0..1000 {
+            Session::push_queue_copy(&mut queue, b"x", false);
+        }
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].data.len(), 1000);
+
+        Session::push_queue_copy(&mut queue, b"response", true);
+        Session::push_queue_copy(&mut queue, b"later-input", false);
+        assert_eq!(queue.len(), 3, "different classes must preserve FIFO order");
+        assert!(!queue[0].response);
+        assert!(queue[1].response);
+        assert!(!queue[2].response);
+
+        queue.resize_with(MAX_PTY_QUEUE_ENTRIES, || PtyWriteChunk {
+            data: Vec::new(),
+            response: false,
+        });
+        queue.back_mut().expect("queue is populated").data = vec![0; PTY_QUEUE_COALESCE_BYTES];
+        assert!(!Session::queue_accepts_entry(&queue, 1, false));
+    }
 
     #[test]
     fn enter_honors_key_location_in_application_keypad_mode() {

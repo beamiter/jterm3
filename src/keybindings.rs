@@ -254,10 +254,12 @@ impl KeyBinding {
         out.push_str(&key);
         Some(out)
     }
+}
 
-    /// 转换为快捷键字符串表示
-    #[cfg(test)]
-    pub fn to_string(&self) -> String {
+#[cfg(test)]
+impl std::fmt::Display for KeyBinding {
+    /// 转换为快捷键字符串表示。
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut parts = Vec::new();
 
         if self.modifiers.ctrl {
@@ -285,7 +287,7 @@ impl KeyBinding {
         };
         parts.push(&key);
 
-        parts.join("+")
+        formatter.write_str(&parts.join("+"))
     }
 }
 

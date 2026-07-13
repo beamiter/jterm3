@@ -168,8 +168,8 @@ mod unix_pty {
                 let mut slave = 0;
 
                 let win_size = libc::winsize {
-                    ws_row: rows as u16,
-                    ws_col: cols as u16,
+                    ws_row: pty_dimension(rows),
+                    ws_col: pty_dimension(cols),
                     ws_xpixel: 0,
                     ws_ypixel: 0,
                 };
@@ -187,14 +187,22 @@ mod unix_pty {
 
                 // 2. 设置 master 非阻塞模式
                 let flags = libc::fcntl(master, libc::F_GETFL, 0);
-                if flags >= 0 {
-                    let _ = libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                if flags < 0 || libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                    let error = std::io::Error::last_os_error();
+                    libc::close(master);
+                    libc::close(slave);
+                    return Err(anyhow!("Failed to make PTY non-blocking: {error}"));
                 }
 
                 // 设置 FD_CLOEXEC，防止子进程继承
                 let fd_flags = libc::fcntl(master, libc::F_GETFD, 0);
-                if fd_flags >= 0 {
-                    let _ = libc::fcntl(master, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC);
+                if fd_flags < 0
+                    || libc::fcntl(master, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) < 0
+                {
+                    let error = std::io::Error::last_os_error();
+                    libc::close(master);
+                    libc::close(slave);
+                    return Err(anyhow!("Failed to set PTY CLOEXEC: {error}"));
                 }
 
                 // Prepare everything that needs heap allocation or environment
@@ -241,8 +249,7 @@ mod unix_pty {
                 };
 
                 let (exec_cstr, argv_cstrings): (CString, Vec<CString>) =
-                    if shell_name == "rsh" && bash_path.is_some() {
-                        let bash_path = bash_path.unwrap();
+                    if let ("rsh", Some(bash_path)) = (shell_name.as_str(), bash_path) {
                         let exec_cmd = build_rsh_exec_command(&shell_path, session_id);
                         (
                             cstr_or_bail!(bash_path, "bash path contains NUL"),
@@ -348,7 +355,10 @@ mod unix_pty {
                     None => None,
                 };
 
-                // 3. Fork 子进程
+                // 3. Fork 子进程. Remember the parent so the child can close the
+                // small fork→prctl race where the parent dies before PDEATHSIG is
+                // installed.
+                let parent_pid = libc::getpid();
                 let fork_result = libc::fork();
 
                 if fork_result < 0 {
@@ -365,28 +375,36 @@ mod unix_pty {
                     // 作为 SIGKILL/panic 情况下避免孤儿进程的最后一道防线。
                     #[cfg(target_os = "linux")]
                     {
-                        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0
+                            || libc::getppid() != parent_pid
+                        {
+                            libc::_exit(127);
+                        }
                     }
 
                     // 新建会话/进程组，使其成为会话 leader，便于按进程组发信号。
-                    libc::setsid();
+                    if libc::setsid() < 0 {
+                        libc::_exit(127);
+                    }
 
                     // 切换工作目录（CString 已在 fork 前构造好）。
                     if let Some(ref dir_cstr) = cwd_cstr {
                         if libc::chdir(dir_cstr.as_ptr()) != 0 {
-                            libc::perror(b"chdir failed\0".as_ptr() as *const i8);
-                            libc::exit(127);
+                            libc::_exit(127);
                         }
                     }
 
                     // 设置 slave 为控制终端
                     if libc::ioctl(slave, libc::TIOCSCTTY, 0) != 0 {
-                        libc::perror(b"ioctl TIOCSCTTY failed\0".as_ptr() as *const i8);
+                        libc::_exit(127);
                     }
 
-                    libc::dup2(slave, libc::STDIN_FILENO);
-                    libc::dup2(slave, libc::STDOUT_FILENO);
-                    libc::dup2(slave, libc::STDERR_FILENO);
+                    if libc::dup2(slave, libc::STDIN_FILENO) < 0
+                        || libc::dup2(slave, libc::STDOUT_FILENO) < 0
+                        || libc::dup2(slave, libc::STDERR_FILENO) < 0
+                    {
+                        libc::_exit(127);
+                    }
                     if slave > libc::STDERR_FILENO {
                         libc::close(slave);
                     }
@@ -395,8 +413,7 @@ mod unix_pty {
                     libc::execve(exec_cstr.as_ptr(), argv_ptrs.as_ptr(), envp.as_ptr());
 
                     // execve 仅在出错时返回。
-                    libc::perror(b"execve failed\0".as_ptr() as *const i8);
-                    libc::exit(127);
+                    libc::_exit(127);
                 } else {
                     // 父进程分支
                     // 关闭 slave
@@ -424,13 +441,34 @@ mod unix_pty {
         /// on the read end report POLLHUP immediately.
         pub fn make_shutdown_pipe() -> Result<(RawFd, RawFd)> {
             let mut fds = [0 as RawFd; 2];
-            // SAFETY: fds is a valid 2-element array; pipe() fills both ends.
+            // CLOEXEC is essential here. A later terminal session is created with
+            // fork/exec; if it inherits an older subscription's write end, closing
+            // that subscription can never deliver POLLHUP to its reader thread.
+            // pipe2 makes creation + CLOEXEC atomic on Linux/Android.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
             let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
             if rc != 0 {
                 return Err(anyhow!(
                     "Failed to create shutdown pipe: {}",
                     std::io::Error::last_os_error()
                 ));
+            }
+
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            for &fd in &fds {
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFD, 0) };
+                if flags < 0
+                    || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
+                {
+                    let error = std::io::Error::last_os_error();
+                    unsafe {
+                        libc::close(fds[0]);
+                        libc::close(fds[1]);
+                    }
+                    return Err(anyhow!("Failed to set pipe CLOEXEC: {error}"));
+                }
             }
             Ok((fds[0], fds[1]))
         }
@@ -458,13 +496,16 @@ mod unix_pty {
                 },
             ];
             // SAFETY: fds is a valid 2-element array on the stack.
-            let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
-            if ready < 0 {
-                return Err(anyhow!(
-                    "Failed to poll PTY: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
+            let ready = loop {
+                let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
+                if ready >= 0 {
+                    break ready;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EINTR) {
+                    return Err(anyhow!("Failed to poll PTY: {error}"));
+                }
+            };
             if ready == 0 {
                 return Ok(ReaderPoll::Timeout);
             }
@@ -483,42 +524,24 @@ mod unix_pty {
             Ok(ReaderPoll::Timeout)
         }
 
-        /// Block until the fd is writable (POLLOUT) or the timeout elapses.
-        pub fn wait_fd_writable(fd: RawFd, timeout_ms: i32) -> Result<bool> {
-            let mut poll_fd = libc::pollfd {
-                fd,
-                events: libc::POLLOUT,
-                revents: 0,
-            };
-            let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
-            if ready < 0 {
-                Err(anyhow!(
-                    "Failed to poll PTY: {}",
-                    std::io::Error::last_os_error()
-                ))
-            } else if ready == 0 {
-                Ok(false)
-            } else {
-                Ok((poll_fd.revents & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR)) != 0)
-            }
-        }
-
         /// Single non-blocking write. Returns bytes written, `Ok(0)` if the
         /// buffer is full (WouldBlock), or an error for a real failure.
         pub fn write(&mut self, data: &[u8]) -> Result<usize> {
             // SAFETY: self.master 是有效的文件描述符，data.as_ptr() 指向有效的内存，
             // data.len() 是正确的长度。write 系统调用不会超出缓冲区边界。
-            unsafe {
-                let n = libc::write(self.master, data.as_ptr() as *const _, data.len());
+            loop {
+                let n = unsafe { libc::write(self.master, data.as_ptr() as *const _, data.len()) };
                 if n < 0 {
                     let err = std::io::Error::last_os_error();
                     if err.kind() == std::io::ErrorKind::WouldBlock {
-                        Ok(0)
+                        return Ok(0);
+                    } else if err.raw_os_error() == Some(libc::EINTR) {
+                        continue;
                     } else {
-                        Err(anyhow!("Failed to write to PTY: {}", err))
+                        return Err(anyhow!("Failed to write to PTY: {}", err));
                     }
                 } else {
-                    Ok(n as usize)
+                    return Ok(n as usize);
                 }
             }
         }
@@ -528,8 +551,8 @@ mod unix_pty {
             // ioctl TIOCSWINSZ 调用是标准的 PTY 窗口大小设置操作。
             unsafe {
                 let win_size = libc::winsize {
-                    ws_row: rows as u16,
-                    ws_col: cols as u16,
+                    ws_row: pty_dimension(rows),
+                    ws_col: pty_dimension(cols),
                     ws_xpixel: 0,
                     ws_ypixel: 0,
                 };
@@ -556,7 +579,14 @@ mod unix_pty {
             // status 是有效的栈变量，child_pid 是有效的进程 ID。
             unsafe {
                 let mut status = 0;
-                let result = libc::waitpid(self.child_pid, &mut status, libc::WNOHANG);
+                let result = loop {
+                    let result = libc::waitpid(self.child_pid, &mut status, libc::WNOHANG);
+                    if result >= 0
+                        || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                    {
+                        break result;
+                    }
+                };
                 if result == 0 {
                     // Still running.
                     true
@@ -603,11 +633,25 @@ mod unix_pty {
             std::thread::spawn(move || unsafe {
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 let mut status = 0;
-                if libc::waitpid(child_pid, &mut status, libc::WNOHANG) == 0 {
+                let observed = loop {
+                    let result = libc::waitpid(child_pid, &mut status, libc::WNOHANG);
+                    if result >= 0
+                        || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                    {
+                        break result;
+                    }
+                };
+                if observed == 0 {
                     // Still alive after the grace period: force kill, then reap.
                     let _ = libc::kill(-child_pid, libc::SIGKILL);
                     let _ = libc::kill(child_pid, libc::SIGKILL);
-                    let _ = libc::waitpid(child_pid, &mut status, 0);
+                    loop {
+                        if libc::waitpid(child_pid, &mut status, 0) >= 0
+                            || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                        {
+                            break;
+                        }
+                    }
                 }
             });
             // The child is being torn down; record that so is_alive() stops
@@ -628,6 +672,11 @@ mod unix_pty {
                 let _ = libc::close(self.master);
             }
         }
+    }
+
+    #[inline]
+    fn pty_dimension(value: usize) -> u16 {
+        value.clamp(1, u16::MAX as usize) as u16
     }
 }
 

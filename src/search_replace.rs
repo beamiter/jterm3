@@ -167,9 +167,10 @@ impl SearchAndReplaceEngine {
                 let start = idx.saturating_sub(context_lines);
                 let end = std::cmp::min(idx + context_lines + 1, lines.len());
 
-                for i in start..end {
+                for (offset, line) in lines[start..end].iter().enumerate() {
+                    let i = start + offset;
                     let prefix = if i == idx { "→ " } else { "  " };
-                    result.push(format!("{}{:3}: {}", prefix, i + 1, lines[i]));
+                    result.push(format!("{}{:3}: {}", prefix, i + 1, line));
                 }
                 result.push(String::new()); // 空行分隔
             }
@@ -204,8 +205,10 @@ mod tests {
     #[test]
     fn test_replace_all() {
         let config = SearchConfig::default();
-        let mut options = ReplaceOptions::default();
-        options.replace_all = true;
+        let options = ReplaceOptions {
+            replace_all: true,
+            ..ReplaceOptions::default()
+        };
 
         let (result, count) = SearchAndReplaceEngine::search_and_replace(
             "hello world hello",
@@ -222,8 +225,10 @@ mod tests {
 
     #[test]
     fn test_literal_replace_case_insensitive_unicode() {
-        let mut config = SearchConfig::default();
-        config.case_sensitive = false;
+        let config = SearchConfig {
+            case_sensitive: false,
+            ..SearchConfig::default()
+        };
         let options = ReplaceOptions::default();
 
         let (result, count) =

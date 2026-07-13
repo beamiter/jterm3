@@ -1,5 +1,6 @@
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -171,6 +172,12 @@ pub struct Config {
     /// Explicit shell path (overrides auto-detection). Useful when PATH is stripped by launchers like wofi.
     #[serde(default)]
     pub shell: Option<String>,
+
+    /// Permit applications running in the PTY to read the host clipboard via
+    /// OSC 52 / OSC 5522. Disabled by default because this crosses the local /
+    /// remote-shell trust boundary.
+    #[serde(default)]
+    pub allow_clipboard_read: bool,
 }
 
 fn default_font_size() -> f32 {
@@ -350,24 +357,69 @@ impl Default for Config {
             subpixel_rendering: default_subpixel_rendering(),
             ui_scale: None,
             shell: None,
+            allow_clipboard_read: false,
         }
     }
 }
 
 impl Config {
+    /// Parse and normalize configuration from TOML. Keeping this as the single
+    /// path ensures startup and live reload enforce identical bounds.
+    pub fn from_toml(content: &str) -> Result<Self, toml::de::Error> {
+        toml::from_str::<Config>(content).map(Self::normalized)
+    }
+
+    fn normalized(mut self) -> Self {
+        self.font_size = Self::clamp_font_size(self.font_size);
+        self.line_spacing = Self::clamp_line_spacing(self.line_spacing);
+        self.padding = Self::clamp_padding(self.padding);
+        self.scrollback_lines = Self::clamp_scrollback_lines(self.scrollback_lines);
+        self.scroll_speed = Self::clamp_scroll_speed(self.scroll_speed);
+        self.opacity = Self::clamp_opacity(self.opacity);
+        self.font_weight = finite_clamp(self.font_weight, default_font_weight(), 0.1, 2.0);
+        self.font_sharpness = finite_clamp(self.font_sharpness, default_font_sharpness(), 0.1, 2.0);
+        self.initial_width =
+            finite_clamp(self.initial_width, default_initial_width(), 320.0, 16_384.0);
+        self.initial_height = finite_clamp(
+            self.initial_height,
+            default_initial_height(),
+            200.0,
+            16_384.0,
+        );
+        self.cols = self.cols.clamp(1, crate::terminal::MAX_TERMINAL_COLS);
+        self.rows = self.rows.clamp(1, crate::terminal::MAX_TERMINAL_ROWS);
+        self.ui_scale = self
+            .ui_scale
+            .filter(|value| value.is_finite())
+            .map(|value| value.clamp(0.5, 4.0));
+        self.font_family = self.font_family.trim().to_string();
+        self.theme = self.theme.trim().to_string();
+        if self.theme.is_empty() {
+            self.theme = default_theme();
+        }
+        self.shell = self
+            .shell
+            .map(|shell| shell.trim().to_string())
+            .filter(|shell| !shell.is_empty());
+        self
+    }
+
     pub fn load() -> Self {
         if let Ok(config_path) = Self::config_path() {
             if config_path.exists() {
                 if let Ok(content) = std::fs::read_to_string(&config_path) {
-                    if let Ok(config) = toml::from_str::<Config>(&content) {
-                        eprintln!("[Config] Loaded from {}", config_path.display());
-                        eprintln!("[Config] Font: {}", config.font_family);
-                        return config;
-                    } else {
-                        eprintln!(
-                            "[Config] Failed to parse config file: {}",
-                            config_path.display()
-                        );
+                    match Self::from_toml(&content) {
+                        Ok(config) => {
+                            eprintln!("[Config] Loaded from {}", config_path.display());
+                            eprintln!("[Config] Font: {}", config.font_family);
+                            return config;
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[Config] Failed to parse {}: {error}",
+                                config_path.display()
+                            );
+                        }
                     }
                 }
             }
@@ -380,21 +432,49 @@ impl Config {
 
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         let config_path = Self::config_path()?;
-        let config_dir = config_path.parent().unwrap();
+        let config_dir = config_path.parent().ok_or("Config path has no parent")?;
 
         // Create config directory if it doesn't exist
         std::fs::create_dir_all(config_dir)?;
 
-        // Write config file
+        // Write and fsync a sibling temporary file before the atomic rename so
+        // a crash cannot leave a half-written TOML file behind.
         let content = toml::to_string_pretty(self)?;
-        std::fs::write(&config_path, content)?;
+        let tmp = config_path.with_extension(format!("toml.tmp.{}", std::process::id()));
+        let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&tmp)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, &config_path)?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        write_result?;
         eprintln!("[Config] Saved to {}", config_path.display());
         Ok(())
     }
 
-    pub fn session_history_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    pub fn session_history_path(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let config_dir = dirs::config_dir().ok_or("Failed to determine config directory")?;
-        Ok(config_dir.join("jterm3").join("session_history.json"))
+        let default = config_dir.join("jterm3").join("session_history.json");
+        let Some(path) = self.session_history_file.as_ref() else {
+            return Ok(default);
+        };
+        if path.is_absolute() {
+            return Ok(path.clone());
+        }
+        if let Ok(rest) = path.strip_prefix("~") {
+            if let Some(home) = dirs::home_dir() {
+                return Ok(home.join(rest));
+            }
+        }
+        Ok(config_dir.join("jterm3").join(path))
     }
 
     pub fn config_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -412,17 +492,17 @@ impl Config {
     // 配置值约束方法
     #[allow(dead_code)]
     pub fn clamp_font_size(size: f32) -> f32 {
-        size.clamp(8.0, 72.0)
+        finite_clamp(size, default_font_size(), 8.0, 72.0)
     }
 
     #[allow(dead_code)]
     pub fn clamp_line_spacing(spacing: f32) -> f32 {
-        spacing.clamp(0.8, 3.0)
+        finite_clamp(spacing, default_line_spacing(), 0.8, 3.0)
     }
 
     #[allow(dead_code)]
     pub fn clamp_padding(padding: f32) -> f32 {
-        padding.clamp(0.0, 20.0)
+        finite_clamp(padding, default_padding(), 0.0, 20.0)
     }
 
     #[allow(dead_code)]
@@ -432,7 +512,7 @@ impl Config {
 
     #[allow(dead_code)]
     pub fn clamp_opacity(opacity: f32) -> f32 {
-        opacity.clamp(0.05, 1.0)
+        finite_clamp(opacity, default_opacity(), 0.05, 1.0)
     }
 
     #[allow(dead_code)]
@@ -461,10 +541,59 @@ impl Config {
     }
 }
 
+fn finite_clamp(value: f32, fallback: f32, min: f32, max: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        fallback
+    }
+}
+
 #[allow(dead_code)]
 pub fn create_default_config() {
     let config = Config::default();
     if let Err(e) = config.save() {
         eprintln!("[Config] Warning: Could not save default config: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalization_bounds_untrusted_numeric_values() {
+        let config = Config {
+            font_size: f32::NAN,
+            line_spacing: f32::INFINITY,
+            initial_width: -1.0,
+            cols: usize::MAX,
+            rows: 0,
+            ui_scale: Some(f32::NAN),
+            ..Config::default()
+        };
+
+        let normalized = config.normalized();
+
+        assert_eq!(normalized.font_size, default_font_size());
+        assert_eq!(normalized.line_spacing, default_line_spacing());
+        assert_eq!(normalized.initial_width, 320.0);
+        assert_eq!(normalized.cols, crate::terminal::MAX_TERMINAL_COLS);
+        assert_eq!(normalized.rows, 1);
+        assert_eq!(normalized.ui_scale, None);
+    }
+
+    #[test]
+    fn empty_optional_strings_are_normalized() {
+        let config = Config {
+            theme: "   ".to_string(),
+            shell: Some("  ".to_string()),
+            ..Config::default()
+        };
+
+        let normalized = config.normalized();
+
+        assert_eq!(normalized.theme, default_theme());
+        assert_eq!(normalized.shell, None);
     }
 }

@@ -1,7 +1,6 @@
 /// 链接检测和交互模块
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
 /// OSC 8 超链接（从 ANSI 转义序列解析）
 /// Will be integrated in Phase 3
@@ -310,7 +309,7 @@ impl LinkDetector {
                 // 将逻辑偏移分割到多个物理行
                 for (i, &row_offset) in char_offsets.iter().enumerate() {
                     let row_idx = start_row + i;
-                    let row_len = visible_cells[row_idx].iter().map(|c| c.character).count();
+                    let row_len = visible_cells[row_idx].len();
                     let row_end_offset = row_offset + row_len;
 
                     // 检查该链接是否与这个物理行重叠
@@ -381,16 +380,9 @@ fn open_url(url: &str) -> Result<(), Box<dyn std::error::Error>> {
 fn open_file_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let expanded_path = expand_path(path);
 
-    // 如果是目录，用文件管理器打开；否则用默认应用打开
-    if Path::new(&expanded_path).is_dir() {
-        std::process::Command::new("xdg-open")
-            .arg(&expanded_path)
-            .spawn()?;
-    } else {
-        std::process::Command::new("xdg-open")
-            .arg(&expanded_path)
-            .spawn()?;
-    }
+    std::process::Command::new("xdg-open")
+        .arg(&expanded_path)
+        .spawn()?;
     Ok(())
 }
 
@@ -513,8 +505,10 @@ mod tests {
 
     #[test]
     fn test_link_detection_config() {
-        let mut config = LinkDetectionConfig::default();
-        config.detect_urls = false;
+        let config = LinkDetectionConfig {
+            detect_urls: false,
+            ..LinkDetectionConfig::default()
+        };
 
         let detector = LinkDetector::new(config);
         let line = "Visit https://example.com for more info";

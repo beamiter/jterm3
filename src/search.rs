@@ -1,8 +1,12 @@
 /// 搜索功能模块
-use crate::terminal::TerminalCell;
+use crate::terminal::{Color, TerminalCell};
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::VecDeque;
+
+const MAX_SEARCH_MATCHES: usize = 20_000;
+const MATCH_LIMIT_MESSAGE: &str = "Showing the first 20,000 matches";
 
 /// Compiled-regex cache slot. Held by `SearchState` so consecutive
 /// `recompute_search` calls with the same pattern reuse the same `Regex`
@@ -17,7 +21,7 @@ pub struct RegexCache {
 /// 单个搜索匹配项
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub struct SearchMatch {
-    /// 所在行（可见网格行索引）
+    /// Absolute row in the terminal buffer (`scrollback + live grid`).
     pub line: usize,
     /// 列起始位置
     pub col_start: usize,
@@ -224,8 +228,28 @@ pub struct SearchEngine;
 
 impl SearchEngine {
     /// 在网格中搜索文本
+    #[cfg(test)]
     pub fn search(
         grid: &[Vec<TerminalCell>],
+        query: &str,
+        use_regex: bool,
+        case_sensitive: bool,
+        regex_cache: &mut Option<RegexCache>,
+    ) -> (Vec<SearchMatch>, Option<String>) {
+        Self::search_lines(
+            grid.iter().map(|line| Cow::Borrowed(line.as_slice())),
+            query,
+            use_regex,
+            case_sensitive,
+            regex_cache,
+        )
+    }
+
+    /// Search an arbitrary terminal buffer without first cloning every row.
+    /// Callers can mix borrowed live-grid rows with owned decompressed history
+    /// rows through [`Cow`]. Match row indices follow iterator order.
+    pub fn search_lines<'a>(
+        lines: impl IntoIterator<Item = Cow<'a, [TerminalCell]>>,
         query: &str,
         use_regex: bool,
         case_sensitive: bool,
@@ -236,19 +260,21 @@ impl SearchEngine {
         }
 
         if use_regex {
-            Self::search_regex(grid, query, case_sensitive, regex_cache)
+            Self::search_regex(lines, query, case_sensitive, regex_cache)
         } else {
-            (Self::search_plaintext(grid, query, case_sensitive), None)
+            let (matches, truncated) = Self::search_plaintext(lines, query, case_sensitive);
+            (matches, truncated.then(|| MATCH_LIMIT_MESSAGE.to_string()))
         }
     }
 
     /// 普通文本搜索
-    fn search_plaintext(
-        grid: &[Vec<TerminalCell>],
+    fn search_plaintext<'a>(
+        lines: impl IntoIterator<Item = Cow<'a, [TerminalCell]>>,
         query: &str,
         case_sensitive: bool,
-    ) -> Vec<SearchMatch> {
+    ) -> (Vec<SearchMatch>, bool) {
         let mut matches = Vec::new();
+        let mut truncated = false;
 
         let search_query = if case_sensitive {
             query.to_string()
@@ -257,24 +283,28 @@ impl SearchEngine {
         };
 
         let query_chars = search_query.chars().count();
-        for (line_idx, line) in grid.iter().enumerate() {
-            let line_str = Self::grid_line_to_string(line);
-            let search_line = if case_sensitive {
-                line_str.clone()
-            } else {
-                line_str.to_lowercase()
-            };
+        'lines: for (line_idx, line) in lines.into_iter().enumerate() {
+            let (search_line, columns) = Self::line_text_and_columns(&line, !case_sensitive);
 
             let mut start_byte = 0;
             while let Some(rel) = search_line[start_byte..].find(&search_query) {
                 let match_byte = start_byte + rel;
-                // Grid columns are char indices, not byte offsets.
-                let col_start = search_line[..match_byte].chars().count();
-                matches.push(SearchMatch {
-                    line: line_idx,
-                    col_start,
-                    col_end: col_start + query_chars,
-                });
+                let char_start = search_line[..match_byte].chars().count();
+                let char_end = char_start + query_chars;
+                if let (Some(&(col_start, _)), Some(&(_, col_end))) = (
+                    columns.get(char_start),
+                    columns.get(char_end.saturating_sub(1)),
+                ) {
+                    matches.push(SearchMatch {
+                        line: line_idx,
+                        col_start,
+                        col_end,
+                    });
+                    if matches.len() >= MAX_SEARCH_MATCHES {
+                        truncated = true;
+                        break 'lines;
+                    }
+                }
                 // Advance one char past the match start, staying on a UTF-8
                 // boundary (a raw +1 would panic inside a multi-byte char).
                 let step = search_line[match_byte..]
@@ -286,12 +316,12 @@ impl SearchEngine {
             }
         }
 
-        matches
+        (matches, truncated)
     }
 
     /// 正则表达式搜索
-    fn search_regex(
-        grid: &[Vec<TerminalCell>],
+    fn search_regex<'a>(
+        lines: impl IntoIterator<Item = Cow<'a, [TerminalCell]>>,
         pattern: &str,
         case_sensitive: bool,
         cache: &mut Option<RegexCache>,
@@ -325,28 +355,75 @@ impl SearchEngine {
             }
         }
         let regex = &cache.as_ref().unwrap().regex;
+        let mut truncated = false;
 
-        for (line_idx, line) in grid.iter().enumerate() {
-            let line_str = Self::grid_line_to_string(line);
+        'lines: for (line_idx, line) in lines.into_iter().enumerate() {
+            let (line_str, columns) = Self::line_text_and_columns(&line, false);
 
             for mat in regex.find_iter(&line_str) {
-                // Map byte offsets to char/column indices.
-                let col_start = line_str[..mat.start()].chars().count();
-                let col_end = line_str[..mat.end()].chars().count();
-                matches.push(SearchMatch {
-                    line: line_idx,
-                    col_start,
-                    col_end,
-                });
+                if mat.is_empty() {
+                    continue;
+                }
+                let char_start = line_str[..mat.start()].chars().count();
+                let char_end = line_str[..mat.end()].chars().count();
+                if let (Some(&(col_start, _)), Some(&(_, col_end))) = (
+                    columns.get(char_start),
+                    columns.get(char_end.saturating_sub(1)),
+                ) {
+                    matches.push(SearchMatch {
+                        line: line_idx,
+                        col_start,
+                        col_end,
+                    });
+                    if matches.len() >= MAX_SEARCH_MATCHES {
+                        truncated = true;
+                        break 'lines;
+                    }
+                }
             }
         }
 
-        (matches, None)
+        (matches, truncated.then(|| MATCH_LIMIT_MESSAGE.to_string()))
     }
 
-    /// 将网格行转换为字符串
-    fn grid_line_to_string(line: &[TerminalCell]) -> String {
-        line.iter().map(|cell| cell.character).collect()
+    /// Build searchable text and a character-to-cell mapping. Wide-character
+    /// continuation placeholders are skipped so adjacent CJK text stays
+    /// searchable. Case-fold expansions retain the source cell span.
+    fn line_text_and_columns(
+        line: &[TerminalCell],
+        fold_case: bool,
+    ) -> (String, Vec<(usize, usize)>) {
+        // Ignore structural row padding so a query such as a single space cannot
+        // turn a 100k×1024 buffer into tens of millions of meaningless hits.
+        let meaningful_len = line
+            .iter()
+            .rposition(|cell| {
+                cell.character != ' '
+                    || cell.background != Color::Default
+                    || cell.foreground != Color::Default
+                    || cell.flags.wide()
+                    || cell.flags.wide_continuation()
+            })
+            .map_or(0, |index| index + 1);
+        let line = &line[..meaningful_len];
+        let mut text = String::with_capacity(line.len());
+        let mut columns = Vec::with_capacity(line.len());
+        for (column, cell) in line.iter().enumerate() {
+            if cell.flags.wide_continuation() {
+                continue;
+            }
+            let end = column + usize::from(cell.flags.wide()) + 1;
+            if fold_case {
+                for ch in cell.character.to_lowercase() {
+                    text.push(ch);
+                    columns.push((column, end));
+                }
+            } else {
+                text.push(cell.character);
+                columns.push((column, end));
+            }
+        }
+        (text, columns)
     }
 }
 
@@ -404,5 +481,67 @@ mod tests {
         assert!(!state.use_regex);
         state.toggle_regex();
         assert!(state.use_regex);
+    }
+
+    #[test]
+    fn search_skips_wide_character_continuation_cells() {
+        let mut row = vec![TerminalCell::default(); 6];
+        row[0].character = '中';
+        row[0].flags.set_wide(true);
+        row[1].flags.set_wide_continuation(true);
+        row[2].character = '文';
+        row[2].flags.set_wide(true);
+        row[3].flags.set_wide_continuation(true);
+        let mut cache = None;
+
+        let (matches, error) = SearchEngine::search(&[row], "中文", false, true, &mut cache);
+
+        assert!(error.is_none());
+        assert_eq!(
+            matches,
+            vec![SearchMatch {
+                line: 0,
+                col_start: 0,
+                col_end: 4,
+            }]
+        );
+    }
+
+    #[test]
+    fn case_fold_expansion_keeps_terminal_columns() {
+        let mut row = vec![TerminalCell::default(); 3];
+        row[0].character = 'İ';
+        row[1].character = 'B';
+        let mut cache = None;
+
+        let (matches, _) = SearchEngine::search(&[row], "i\u{307}b", false, false, &mut cache);
+
+        assert_eq!(matches[0].col_start, 0);
+        assert_eq!(matches[0].col_end, 2);
+    }
+
+    #[test]
+    fn structural_padding_is_not_searchable() {
+        let row = vec![TerminalCell::default(); 1024];
+        let mut cache = None;
+
+        let (matches, _) = SearchEngine::search(&[row], " ", false, true, &mut cache);
+
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn match_count_is_bounded() {
+        let cell = TerminalCell {
+            character: 'A',
+            ..TerminalCell::default()
+        };
+        let grid = vec![vec![cell; 1000]; 21];
+        let mut cache = None;
+
+        let (matches, warning) = SearchEngine::search(&grid, "A", false, true, &mut cache);
+
+        assert_eq!(matches.len(), MAX_SEARCH_MATCHES);
+        assert_eq!(warning.as_deref(), Some(MATCH_LIMIT_MESSAGE));
     }
 }

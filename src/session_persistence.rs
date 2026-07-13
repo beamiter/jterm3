@@ -63,10 +63,15 @@ pub fn try_acquire_instance_lock() -> Option<std::fs::File> {
         let _ = std::fs::create_dir_all(parent);
     }
 
+    use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .create(true)
-        .truncate(true)
+        // PTY children are fork/exec'd from this process. Without CLOEXEC they
+        // inherit the flock and can make jterm3 look permanently running after
+        // the UI exits.
+        .custom_flags(libc::O_CLOEXEC)
         .open(&lock_path)
         .ok()?;
 
@@ -75,8 +80,13 @@ pub fn try_acquire_instance_lock() -> Option<std::fs::File> {
     // LOCK_EX | LOCK_NB: 非阻塞排他锁。fd 来自有效的 File，生命周期覆盖本次调用。
     let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
     if ret == 0 {
-        use std::io::Write;
+        use std::io::{Seek, Write};
+        // Truncate only after owning the lock. Opening with truncate(true)
+        // allowed a second instance to erase the first instance's PID even
+        // though its flock attempt subsequently failed.
+        let _ = file.set_len(0);
         let mut f = &file;
+        let _ = f.seek(std::io::SeekFrom::Start(0));
         let _ = write!(f, "{}", std::process::id());
         Some(file)
     } else {

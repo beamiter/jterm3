@@ -262,7 +262,7 @@ impl PaletteState {
                     .map(|score| (score, i, item))
             })
             .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         scored.into_iter().map(|(_, i, item)| (i, item)).collect()
     }
 

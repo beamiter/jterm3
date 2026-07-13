@@ -2,7 +2,12 @@
 name = "jterm3"
 version = "0.1.0"
 edition = "2021"
-description = "A terminal emulator built with iced, a functional reimplementation of jterm2"
+description = "A fast, GPU-rendered Linux terminal emulator built with Rust and iced"
+repository = "https://github.com/beamiter/jterm3"
+homepage = "https://github.com/beamiter/jterm3"
+readme = "README.md"
+keywords = ["terminal", "terminal-emulator", "iced", "gpu", "linux"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 iced = { version = "0.14", features = ["canvas", "tokio", "advanced", "image", "wgpu"] }
@@ -31,8 +36,8 @@ incremental = true
 [profile.dev.package."*"]
 opt-level = 1
 
-# [profile.release]
-# lto = "thin"
-# strip = true
-# codegen-units = 1
-# opt-level = 3
+[profile.release]
+lto = "thin"
+strip = "symbols"
+codegen-units = 1
+opt-level = 3

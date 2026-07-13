@@ -1,6 +1,8 @@
 use crate::color::{resolve_bg_with_palette, resolve_fg_with_palette};
 use crate::search::SearchMatch;
-use crate::terminal::{CursorShape, DynamicColorPalette, TerminalCell, UnderlineStyle};
+use crate::terminal::{
+    clamp_terminal_dimensions, CursorShape, DynamicColorPalette, TerminalCell, UnderlineStyle,
+};
 use crate::theme::Theme;
 
 use std::time::Instant;
@@ -126,7 +128,7 @@ impl Metrics {
         let usable_h = (height - self.padding * 2.0).max(0.0);
         let cols = (usable_w / self.cell_w).floor() as usize;
         let rows = (usable_h / self.cell_h).floor() as usize;
-        (cols.max(1), rows.max(1))
+        clamp_terminal_dimensions(cols.max(1), rows.max(1))
     }
 }
 
@@ -140,6 +142,9 @@ pub struct TermWidget<'a, Message> {
     focused: bool,
     theme: &'a Theme,
     dynamic_palette: Option<&'a DynamicColorPalette>,
+    dynamic_fg: Option<(u8, u8, u8)>,
+    dynamic_bg: Option<(u8, u8, u8)>,
+    dynamic_cursor: Option<(u8, u8, u8)>,
     metrics: Metrics,
     mono: iced::Font,
     cjk_mono: Option<iced::Font>,
@@ -152,7 +157,7 @@ pub struct TermWidget<'a, Message> {
     scroll_offset: usize,
     scrollback_len: usize,
     /// Search matches in visible-grid coordinates (line = grid row index).
-    search_matches: &'a [SearchMatch],
+    search_matches: Vec<SearchMatch>,
     /// Identity `(line, col_start)` of the active match, highlighted distinctly.
     current_match: Option<(usize, usize)>,
     shift: bool,
@@ -202,6 +207,9 @@ impl<'a, Message> TermWidget<'a, Message> {
             focused,
             theme,
             dynamic_palette: None,
+            dynamic_fg: None,
+            dynamic_bg: None,
+            dynamic_cursor: None,
             metrics,
             mono,
             cjk_mono,
@@ -211,7 +219,7 @@ impl<'a, Message> TermWidget<'a, Message> {
             selection,
             scroll_offset,
             scrollback_len,
-            search_matches: &[],
+            search_matches: Vec::new(),
             current_match: None,
             shift: false,
             alt: false,
@@ -256,6 +264,20 @@ impl<'a, Message> TermWidget<'a, Message> {
         self
     }
 
+    /// Supply OSC 10/11/12 overrides for the default foreground, background,
+    /// and cursor colors.
+    pub fn dynamic_defaults(
+        mut self,
+        foreground: Option<(u8, u8, u8)>,
+        background: Option<(u8, u8, u8)>,
+        cursor: Option<(u8, u8, u8)>,
+    ) -> Self {
+        self.dynamic_fg = foreground;
+        self.dynamic_bg = background;
+        self.dynamic_cursor = cursor;
+        self
+    }
+
     /// Supply Kitty-graphics placements to paint over the grid.
     pub fn images(mut self, images: Vec<KittyRender>) -> Self {
         self.images = images;
@@ -270,7 +292,7 @@ impl<'a, Message> TermWidget<'a, Message> {
     }
 
     /// Supply search matches (and the active match identity) to highlight.
-    pub fn search(mut self, matches: &'a [SearchMatch], current: Option<(usize, usize)>) -> Self {
+    pub fn search(mut self, matches: Vec<SearchMatch>, current: Option<(usize, usize)>) -> Self {
         self.search_matches = matches;
         self.current_match = current;
         self
@@ -433,6 +455,7 @@ fn solid_quad(bounds: Rectangle) -> Quad {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
         should_use_cjk_fallback_font, should_use_math_symbol_fallback_font,
@@ -777,7 +800,14 @@ where
         let ch = self.metrics.cell_h;
         let ox = bounds.x + pad;
         let oy = bounds.y + pad;
-        let default_bg = self.theme.terminal_background();
+        let default_fg = self
+            .dynamic_fg
+            .map(|(r, g, b)| Color::from_rgb8(r, g, b))
+            .unwrap_or_else(|| self.theme.terminal_foreground());
+        let default_bg = self
+            .dynamic_bg
+            .map(|(r, g, b)| Color::from_rgb8(r, g, b))
+            .unwrap_or_else(|| self.theme.terminal_background());
 
         // Whole-widget background.
         renderer.fill_quad(solid_quad(bounds), Background::Color(default_bg));
@@ -805,15 +835,22 @@ where
                 if cell.flags.wide_continuation() {
                     continue;
                 }
-                let mut bg =
-                    resolve_bg_with_palette(cell.background, self.theme, self.dynamic_palette);
-                let mut fg = resolve_fg_with_palette(
-                    cell.foreground,
-                    self.theme,
-                    self.dynamic_palette,
-                    cell.flags.bold(),
-                    cell.flags.dim(),
-                );
+                let mut bg = if cell.background == crate::terminal::Color::Default {
+                    default_bg
+                } else {
+                    resolve_bg_with_palette(cell.background, self.theme, self.dynamic_palette)
+                };
+                let mut fg = if cell.foreground == crate::terminal::Color::Default {
+                    default_fg
+                } else {
+                    resolve_fg_with_palette(
+                        cell.foreground,
+                        self.theme,
+                        self.dynamic_palette,
+                        cell.flags.bold(),
+                        cell.flags.dim(),
+                    )
+                };
                 if cell.flags.inverse() {
                     std::mem::swap(&mut bg, &mut fg);
                 }
@@ -879,12 +916,10 @@ where
                 }
             }
 
-            // Glyphs + decorations. Consecutive narrow cells sharing a foreground
-            // color are coalesced into a single shaped text run, which slashes the
-            // number of per-frame String allocations and text-shaping calls. Runs
-            // break on color changes, spaces, wide glyphs, and links so each run
-            // starts at an exact cell origin — drift from approximate cell widths
-            // can never accumulate across a break.
+            // Glyphs + decorations. Shape each narrow glyph as a one-cell run at
+            // its exact grid origin. A font's measured advance can differ slightly
+            // from `cell_w`; shaping multiple cells together would accumulate that
+            // difference and make later glyphs drift away from the terminal grid.
             let font = self.mono;
             let font_size = self.metrics.font_size;
             // Cells covered by the active selection draw their glyphs in the
@@ -932,15 +967,23 @@ where
                 let is_wide = cell.flags.wide();
                 let span = if is_wide { 2.0 } else { 1.0 };
                 let x = ox + col_idx as f32 * cw;
-                let mut fg = resolve_fg_with_palette(
-                    cell.foreground,
-                    self.theme,
-                    self.dynamic_palette,
-                    cell.flags.bold(),
-                    cell.flags.dim(),
-                );
+                let mut fg = if cell.foreground == crate::terminal::Color::Default {
+                    default_fg
+                } else {
+                    resolve_fg_with_palette(
+                        cell.foreground,
+                        self.theme,
+                        self.dynamic_palette,
+                        cell.flags.bold(),
+                        cell.flags.dim(),
+                    )
+                };
                 if cell.flags.inverse() {
-                    fg = resolve_bg_with_palette(cell.background, self.theme, self.dynamic_palette);
+                    fg = if cell.background == crate::terminal::Color::Default {
+                        default_bg
+                    } else {
+                        resolve_bg_with_palette(cell.background, self.theme, self.dynamic_palette)
+                    };
                 }
                 let selected = sel_range.is_some_and(|(sc, ec)| col_idx >= sc && col_idx <= ec);
                 if selected {
@@ -976,8 +1019,8 @@ where
                 let printable = glyph != ' ' && glyph != '\0' && !blink_hidden;
 
                 if printable && !is_wide {
-                    // Extend the current run, or flush and start a new one when the
-                    // color, font (italic), or contiguity changes.
+                    // Start a one-cell run. The defensive flush keeps this correct
+                    // if a future branch ever leaves a run pending.
                     if run_len != 0
                         && (fg != run_fg
                             || glyph_font != run_font
@@ -1077,7 +1120,10 @@ where
             let (cr, cc) = self.cursor;
             let x = ox + cc as f32 * cw;
             let y = oy + cr as f32 * ch;
-            let cur = self.theme.cursor_color();
+            let cur = self
+                .dynamic_cursor
+                .map(|(r, g, b)| Color::from_rgb8(r, g, b))
+                .unwrap_or_else(|| self.theme.cursor_color());
             let cursor_cell = self.grid.get(cr).and_then(|r| r.get(cc));
             // A wide (CJK) glyph occupies two cells; the cursor must cover both.
             let cursor_w = if cursor_cell.is_some_and(|c| c.flags.wide()) {
