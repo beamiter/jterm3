@@ -145,6 +145,10 @@ pub struct TermWidget<'a, Message> {
     dynamic_fg: Option<(u8, u8, u8)>,
     dynamic_bg: Option<(u8, u8, u8)>,
     dynamic_cursor: Option<(u8, u8, u8)>,
+    /// Background inferred from the active full-screen application's SGR
+    /// output. Unlike the terminal default (OSC 11/theme), this is scoped to
+    /// the active screen buffer and is restored when leaving the alt screen.
+    global_bg: crate::terminal::Color,
     metrics: Metrics,
     mono: iced::Font,
     cjk_mono: Option<iced::Font>,
@@ -210,6 +214,7 @@ impl<'a, Message> TermWidget<'a, Message> {
             dynamic_fg: None,
             dynamic_bg: None,
             dynamic_cursor: None,
+            global_bg: crate::terminal::Color::Default,
             metrics,
             mono,
             cjk_mono,
@@ -275,6 +280,14 @@ impl<'a, Message> TermWidget<'a, Message> {
         self.dynamic_fg = foreground;
         self.dynamic_bg = background;
         self.dynamic_cursor = cursor;
+        self
+    }
+
+    /// Supply the active screen buffer's canvas background. Full-screen TUIs
+    /// such as Vim often paint their Normal background through SGR and leave
+    /// untouched cells to inherit it.
+    pub fn global_background(mut self, background: crate::terminal::Color) -> Self {
+        self.global_bg = background;
         self
     }
 
@@ -808,9 +821,14 @@ where
             .dynamic_bg
             .map(|(r, g, b)| Color::from_rgb8(r, g, b))
             .unwrap_or_else(|| self.theme.terminal_background());
+        let canvas_bg = if self.global_bg == crate::terminal::Color::Default {
+            default_bg
+        } else {
+            resolve_bg_with_palette(self.global_bg, self.theme, self.dynamic_palette)
+        };
 
         // Whole-widget background.
-        renderer.fill_quad(solid_quad(bounds), Background::Color(default_bg));
+        renderer.fill_quad(solid_quad(bounds), Background::Color(canvas_bg));
 
         // Bucket links by visible row so the per-cell hit test scans only the
         // links on that row instead of the whole list. Skipped entirely (no
@@ -836,7 +854,7 @@ where
                     continue;
                 }
                 let mut bg = if cell.background == crate::terminal::Color::Default {
-                    default_bg
+                    canvas_bg
                 } else {
                     resolve_bg_with_palette(cell.background, self.theme, self.dynamic_palette)
                 };
@@ -855,7 +873,7 @@ where
                     std::mem::swap(&mut bg, &mut fg);
                 }
                 let span = if cell.flags.wide() { 2.0 } else { 1.0 };
-                if bg != default_bg {
+                if bg != canvas_bg {
                     let x = ox + col_idx as f32 * cw;
                     renderer.fill_quad(
                         solid_quad(Rectangle {
@@ -1184,7 +1202,7 @@ where
                                     wrapping: text::Wrapping::None,
                                 },
                                 Point::new(x + cursor_w / 2.0, y + ch / 2.0),
-                                default_bg,
+                                canvas_bg,
                                 clip,
                             );
                         }

@@ -4055,6 +4055,7 @@ impl Jterm {
             sess.terminal.dynamic_bg,
             sess.terminal.dynamic_cursor_color,
         )
+        .global_background(sess.terminal.global_bg)
         .images(images)
         .preedit(if focused && !sess.terminal.preedit_text.is_empty() {
             Some((
