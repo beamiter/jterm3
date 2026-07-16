@@ -47,11 +47,13 @@ install -Dm755 target/release/jterm3 "$HOME/.local/bin/jterm3"
 | 复制 / 粘贴 | `Ctrl+Shift+C` / `Ctrl+Shift+V` |
 | 搜索全部回滚 | `Ctrl+Shift+F` |
 | 命令面板 | `Ctrl+Shift+P` |
-| 快速切换标签 | `Ctrl+Shift+K` |
-| 左右 / 上下分屏 | `Ctrl+Shift+D` / `Ctrl+Shift+E` |
-| 切换分屏焦点 | `Ctrl+Shift+J` |
+| 快速切换标签 | `Ctrl+Shift+L` |
+| 标签 1–8 / 最后一个 | `Ctrl+1`…`Ctrl+8` / `Ctrl+9` |
+| 左右 / 上下分屏 | `Ctrl+Shift+E` / `Ctrl+Shift+D` |
+| 方向聚焦 Pane | `Ctrl+Alt+方向键`（边缘不回绕） |
+| 调整 Pane 大小 | `Ctrl+Alt+Shift+方向键` |
 | 关闭当前标签或 pane | `Ctrl+Shift+W` |
-| 文件/标签侧栏 | `Ctrl+Shift+B` |
+| 文件/标签侧栏 | `Ctrl+\` |
 | 设置 | `Ctrl+Shift+O` |
 | 放大 / 缩小 / 重置字体 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
 

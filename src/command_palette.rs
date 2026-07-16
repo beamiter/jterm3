@@ -14,7 +14,14 @@ pub enum PaletteAction {
     OpenSearch,
     SplitVertical,
     SplitHorizontal,
-    FocusNextPane,
+    FocusPaneLeft,
+    FocusPaneRight,
+    FocusPaneUp,
+    FocusPaneDown,
+    ResizePaneLeft,
+    ResizePaneRight,
+    ResizePaneUp,
+    ResizePaneDown,
     ClosePane,
     ToggleSidebar,
     OpenSettings,
@@ -33,7 +40,8 @@ pub enum PaletteAction {
 pub struct PaletteItem {
     pub name: &'static str,
     pub description: &'static str,
-    /// 静态快捷键提示（jterm3 键位硬编码于 handle_tab_shortcut，无需注册表）。
+    /// Static shortcut hint. Keep synchronized with the default binding table
+    /// and the small set of app-chrome shortcuts in `handle_tab_shortcut`.
     pub shortcut: &'static str,
     pub action: PaletteAction,
 }
@@ -75,13 +83,13 @@ impl PaletteState {
             PaletteItem {
                 name: "Next Tab",
                 description: "Switch to the next tab",
-                shortcut: "",
+                shortcut: "Ctrl+Tab",
                 action: PaletteAction::NextTab,
             },
             PaletteItem {
                 name: "Previous Tab",
                 description: "Switch to the previous tab",
-                shortcut: "",
+                shortcut: "Ctrl+Shift+Tab",
                 action: PaletteAction::PrevTab,
             },
             PaletteItem {
@@ -105,20 +113,62 @@ impl PaletteState {
             PaletteItem {
                 name: "Split Right",
                 description: "Split the terminal into left and right panes",
-                shortcut: "Ctrl+Shift+D",
+                shortcut: "Ctrl+Shift+E",
                 action: PaletteAction::SplitVertical,
             },
             PaletteItem {
                 name: "Split Down",
                 description: "Split the terminal into top and bottom panes",
-                shortcut: "Ctrl+Shift+E",
+                shortcut: "Ctrl+Shift+D",
                 action: PaletteAction::SplitHorizontal,
             },
             PaletteItem {
-                name: "Focus Next Pane",
-                description: "Move keyboard focus to the other pane",
-                shortcut: "Ctrl+Shift+J",
-                action: PaletteAction::FocusNextPane,
+                name: "Focus Pane Left",
+                description: "Move keyboard focus to the pane on the left",
+                shortcut: "Ctrl+Alt+Left",
+                action: PaletteAction::FocusPaneLeft,
+            },
+            PaletteItem {
+                name: "Focus Pane Right",
+                description: "Move keyboard focus to the pane on the right",
+                shortcut: "Ctrl+Alt+Right",
+                action: PaletteAction::FocusPaneRight,
+            },
+            PaletteItem {
+                name: "Focus Pane Up",
+                description: "Move keyboard focus to the pane above",
+                shortcut: "Ctrl+Alt+Up",
+                action: PaletteAction::FocusPaneUp,
+            },
+            PaletteItem {
+                name: "Focus Pane Down",
+                description: "Move keyboard focus to the pane below",
+                shortcut: "Ctrl+Alt+Down",
+                action: PaletteAction::FocusPaneDown,
+            },
+            PaletteItem {
+                name: "Resize Pane Left",
+                description: "Move the split divider to the left",
+                shortcut: "Ctrl+Alt+Shift+Left",
+                action: PaletteAction::ResizePaneLeft,
+            },
+            PaletteItem {
+                name: "Resize Pane Right",
+                description: "Move the split divider to the right",
+                shortcut: "Ctrl+Alt+Shift+Right",
+                action: PaletteAction::ResizePaneRight,
+            },
+            PaletteItem {
+                name: "Resize Pane Up",
+                description: "Move the split divider upward",
+                shortcut: "Ctrl+Alt+Shift+Up",
+                action: PaletteAction::ResizePaneUp,
+            },
+            PaletteItem {
+                name: "Resize Pane Down",
+                description: "Move the split divider downward",
+                shortcut: "Ctrl+Alt+Shift+Down",
+                action: PaletteAction::ResizePaneDown,
             },
             PaletteItem {
                 name: "Close Focused Pane",
@@ -129,7 +179,7 @@ impl PaletteState {
             PaletteItem {
                 name: "Toggle Sidebar",
                 description: "Show or hide the tabs and files sidebar",
-                shortcut: "Ctrl+Shift+B",
+                shortcut: "Ctrl+\\",
                 action: PaletteAction::ToggleSidebar,
             },
             PaletteItem {
@@ -141,7 +191,7 @@ impl PaletteState {
             PaletteItem {
                 name: "Switch Tab",
                 description: "Fuzzy-find and switch to an open tab",
-                shortcut: "Ctrl+Shift+K",
+                shortcut: "Ctrl+Shift+L",
                 action: PaletteAction::QuickTabSwitch,
             },
             PaletteItem {
@@ -153,7 +203,7 @@ impl PaletteState {
             PaletteItem {
                 name: "Zoom In",
                 description: "Increase terminal font size",
-                shortcut: "Ctrl++",
+                shortcut: "Ctrl+=",
                 action: PaletteAction::ZoomIn,
             },
             PaletteItem {
@@ -300,5 +350,36 @@ impl PaletteState {
     /// 按 `all` 中的索引取动作（用于鼠标点击分发）。
     pub fn action_at(&self, index: usize) -> Option<PaletteAction> {
         self.all.get(index).map(|item| item.action)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shortcut_hints_follow_the_unified_default_contract() {
+        let palette = PaletteState::new();
+        let shortcut = |action| {
+            palette
+                .all
+                .iter()
+                .find(|item| item.action == action)
+                .map(|item| item.shortcut)
+        };
+        let cases = [
+            (PaletteAction::SplitVertical, "Ctrl+Shift+E"),
+            (PaletteAction::SplitHorizontal, "Ctrl+Shift+D"),
+            (PaletteAction::FocusPaneLeft, "Ctrl+Alt+Left"),
+            (PaletteAction::FocusPaneDown, "Ctrl+Alt+Down"),
+            (PaletteAction::ResizePaneLeft, "Ctrl+Alt+Shift+Left"),
+            (PaletteAction::ResizePaneDown, "Ctrl+Alt+Shift+Down"),
+            (PaletteAction::ToggleSidebar, "Ctrl+\\"),
+            (PaletteAction::QuickTabSwitch, "Ctrl+Shift+L"),
+            (PaletteAction::ZoomIn, "Ctrl+="),
+        ];
+        for (action, expected) in cases {
+            assert_eq!(shortcut(action), Some(expected), "{action:?}");
+        }
     }
 }

@@ -41,6 +41,9 @@ const SIDEBAR_W_MIN: f32 = 120.0;
 const SIDEBAR_W_MAX: f32 = 500.0;
 /// Thickness of the divider drawn between split panes (also its drag hit area).
 const DIVIDER: f32 = 6.0;
+const SPLIT_RATIO_MIN: f32 = 0.15;
+const SPLIT_RATIO_MAX: f32 = 0.85;
+const SPLIT_RATIO_KEY_STEP: f32 = 0.05;
 /// Guard against a corrupted or hostile session snapshot spawning unbounded PTYs.
 const MAX_RESTORED_SESSIONS: usize = 32;
 /// Bound pending user/protocol input while a child is not reading its PTY.
@@ -81,7 +84,7 @@ struct Toast {
     expires_at: std::time::Instant,
 }
 
-/// State for the Ctrl+Shift+K quick tab switcher overlay.
+/// State for the Ctrl+Shift+L quick tab switcher overlay.
 #[derive(Debug, Clone, Default)]
 struct TabSwitcherState {
     query: String,
@@ -107,6 +110,81 @@ enum SplitMode {
     Vertical,
     /// Two panes stacked (top / bottom).
     Horizontal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChromeShortcut {
+    CommandPalette,
+    Help,
+    TabSwitcher,
+    Debug,
+}
+
+fn chrome_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Option<ChromeShortcut> {
+    use keyboard::key::Named;
+    use keyboard::Key;
+
+    if matches!(key, Key::Named(Named::F12)) {
+        return Some(ChromeShortcut::Debug);
+    }
+    if !(modifiers.control() && modifiers.shift()) {
+        return None;
+    }
+    let Key::Character(s) = key else {
+        return None;
+    };
+    match s.chars().next()?.to_ascii_lowercase() {
+        'p' => Some(ChromeShortcut::CommandPalette),
+        '/' | '?' => Some(ChromeShortcut::Help),
+        'l' => Some(ChromeShortcut::TabSwitcher),
+        _ => None,
+    }
+}
+
+/// Return the adjacent pane in a physical direction. With the current two-pane
+/// layout, the perpendicular directions and outer edges deliberately do nothing.
+fn directional_pane_target(
+    split_mode: SplitMode,
+    focused_pane: usize,
+    direction: PaneDirection,
+) -> Option<usize> {
+    match (split_mode, focused_pane, direction) {
+        (SplitMode::Vertical, 1, PaneDirection::Left)
+        | (SplitMode::Horizontal, 1, PaneDirection::Up) => Some(0),
+        (SplitMode::Vertical, 0, PaneDirection::Right)
+        | (SplitMode::Horizontal, 0, PaneDirection::Down) => Some(1),
+        _ => None,
+    }
+}
+
+/// Move the divider along its physical axis. Perpendicular arrows do not resize
+/// anything, and keyboard and pointer resizing share the same safe bounds.
+fn directional_split_ratio(
+    split_mode: SplitMode,
+    split_ratio: f32,
+    direction: PaneDirection,
+) -> Option<f32> {
+    let delta = match (split_mode, direction) {
+        (SplitMode::Vertical, PaneDirection::Left) | (SplitMode::Horizontal, PaneDirection::Up) => {
+            -SPLIT_RATIO_KEY_STEP
+        }
+        (SplitMode::Vertical, PaneDirection::Right)
+        | (SplitMode::Horizontal, PaneDirection::Down) => SPLIT_RATIO_KEY_STEP,
+        _ => return None,
+    };
+    Some((split_ratio + delta).clamp(SPLIT_RATIO_MIN, SPLIT_RATIO_MAX))
+}
+
+fn last_session_index(session_count: usize) -> Option<usize> {
+    session_count.checked_sub(1)
 }
 
 /// Linear blend between two colors (t=0 → a, t=1 → b); result is fully opaque.
@@ -649,7 +727,7 @@ struct Jterm {
     /// save is skipped while this is false, so a fully idle app does no per-tab
     /// `readlink` or JSON serialization on every tick.
     session_dirty: bool,
-    /// Diagnostics (Ctrl+Shift+G): wall-clock microseconds spent ingesting the
+    /// Diagnostics (F12): wall-clock microseconds spent ingesting the
     /// most recent PTY-output batch (parse + refresh) and its byte count, used
     /// to derive a throughput figure for profiling.
     last_ingest_us: u128,
@@ -672,8 +750,8 @@ struct Jterm {
     dock_width: f32,
     /// Whether the sidebar-resize divider is being dragged.
     dragging_sidebar: bool,
-    /// Split ratio for the first pane (0.1..=0.9); adjusted by dragging the
-    /// divider. 0.5 is an even split.
+    /// Split ratio for the first pane (0.15..=0.85); adjusted by dragging the
+    /// divider or with the resize shortcuts. 0.5 is an even split.
     split_ratio: f32,
     /// In-progress divider drag: the layout axis is implied by `split_mode`.
     dragging_divider: bool,
@@ -689,7 +767,7 @@ struct Jterm {
     /// Transient bottom-right toast queue with absolute expiry timestamps.
     /// Cleared lazily on each render and on ConfigTick.
     toasts: Vec<Toast>,
-    /// Tab-switcher overlay (Ctrl+Shift+K): when open, a small fuzzy list of
+    /// Tab-switcher overlay (Ctrl+Shift+L): when open, a small fuzzy list of
     /// tab labels lets the user jump by typing. Field holds the typed query
     /// and current selection index.
     tab_switcher: Option<TabSwitcherState>,
@@ -1505,6 +1583,32 @@ impl Jterm {
         self.refresh_active_context();
     }
 
+    fn focus_pane_direction(&mut self, direction: PaneDirection) {
+        if self.panes.len() < 2 {
+            return;
+        }
+        let Some(target) = directional_pane_target(self.split_mode, self.focused_pane, direction)
+        else {
+            return;
+        };
+        self.focused_pane = target;
+        self.active = self.panes[target];
+        self.refresh_active_context();
+    }
+
+    fn resize_pane_direction(&mut self, direction: PaneDirection) {
+        let Some(ratio) = directional_split_ratio(self.split_mode, self.split_ratio, direction)
+        else {
+            return;
+        };
+        if (ratio - self.split_ratio).abs() <= f32::EPSILON {
+            return;
+        }
+        self.split_ratio = ratio;
+        self.relayout();
+        self.refresh_active_context();
+    }
+
     /// Close the focused pane's session and collapse to the remaining one.
     fn close_focused_pane(&mut self) -> Task<Message> {
         if self.split_mode == SplitMode::Single {
@@ -1559,6 +1663,12 @@ impl Jterm {
             }
             C::SessionJump(n) => {
                 self.jump_session(n);
+                Task::none()
+            }
+            C::SessionLast => {
+                if let Some(last) = last_session_index(self.sessions.len()) {
+                    self.jump_session(last);
+                }
                 Task::none()
             }
             C::EditCopy => {
@@ -1675,6 +1785,38 @@ impl Jterm {
                 self.focus_next_pane();
                 Task::none()
             }
+            C::PaneFocusLeft => {
+                self.focus_pane_direction(PaneDirection::Left);
+                Task::none()
+            }
+            C::PaneFocusRight => {
+                self.focus_pane_direction(PaneDirection::Right);
+                Task::none()
+            }
+            C::PaneFocusUp => {
+                self.focus_pane_direction(PaneDirection::Up);
+                Task::none()
+            }
+            C::PaneFocusDown => {
+                self.focus_pane_direction(PaneDirection::Down);
+                Task::none()
+            }
+            C::PaneResizeLeft => {
+                self.resize_pane_direction(PaneDirection::Left);
+                Task::none()
+            }
+            C::PaneResizeRight => {
+                self.resize_pane_direction(PaneDirection::Right);
+                Task::none()
+            }
+            C::PaneResizeUp => {
+                self.resize_pane_direction(PaneDirection::Up);
+                Task::none()
+            }
+            C::PaneResizeDown => {
+                self.resize_pane_direction(PaneDirection::Down);
+                Task::none()
+            }
             C::ConfigOpen => {
                 self.config_panel_open = true;
                 Task::none()
@@ -1715,49 +1857,34 @@ impl Jterm {
         key: &keyboard::Key,
         mods: keyboard::Modifiers,
     ) -> Option<Task<Message>> {
-        use keyboard::key::Named;
-        use keyboard::Key;
-        // F12 toggles the diagnostics overlay (also reachable via Ctrl+Shift+G),
-        // checked before the modifier gate since it takes no modifier.
-        if matches!(key, Key::Named(Named::F12)) {
-            self.debug_open = !self.debug_open;
-            return Some(Task::none());
-        }
-        if !(mods.control() && mods.shift()) {
-            return None;
-        }
-        if let Key::Character(s) = key {
-            match s.chars().next()?.to_ascii_lowercase() {
-                'p' => {
-                    self.palette.toggle();
-                    return Some(if self.palette.is_open {
-                        iced::widget::operation::focus(PALETTE_INPUT_ID.clone())
-                    } else {
-                        Task::none()
-                    });
-                }
-                'g' => {
-                    self.debug_open = !self.debug_open;
+        match chrome_shortcut(key, mods)? {
+            ChromeShortcut::CommandPalette => {
+                self.palette.toggle();
+                Some(if self.palette.is_open {
+                    iced::widget::operation::focus(PALETTE_INPUT_ID.clone())
+                } else {
+                    Task::none()
+                })
+            }
+            ChromeShortcut::Help => {
+                self.help_open = !self.help_open;
+                Some(Task::none())
+            }
+            ChromeShortcut::TabSwitcher => {
+                if self.tab_switcher.is_some() {
+                    self.tab_switcher = None;
                     return Some(Task::none());
                 }
-                '/' | '?' => {
-                    self.help_open = !self.help_open;
-                    return Some(Task::none());
-                }
-                'k' => {
-                    if self.tab_switcher.is_some() {
-                        self.tab_switcher = None;
-                        return Some(Task::none());
-                    }
-                    self.tab_switcher = Some(TabSwitcherState::default());
-                    return Some(iced::widget::operation::focus(
-                        TAB_SWITCHER_INPUT_ID.clone(),
-                    ));
-                }
-                _ => {}
+                self.tab_switcher = Some(TabSwitcherState::default());
+                Some(iced::widget::operation::focus(
+                    TAB_SWITCHER_INPUT_ID.clone(),
+                ))
+            }
+            ChromeShortcut::Debug => {
+                self.debug_open = !self.debug_open;
+                Some(Task::none())
             }
         }
-        None
     }
 
     /// Tab switcher key handling. Mirrors `handle_palette_key`: filters by
@@ -1770,13 +1897,9 @@ impl Jterm {
     ) -> Option<Task<Message>> {
         use keyboard::key::Named;
         use keyboard::Key;
-        if mods.control() && mods.shift() {
-            if let Key::Character(c) = key {
-                if c.eq_ignore_ascii_case("k") {
-                    self.tab_switcher = None;
-                    return Some(Task::none());
-                }
-            }
+        if chrome_shortcut(key, mods) == Some(ChromeShortcut::TabSwitcher) {
+            self.tab_switcher = None;
+            return Some(Task::none());
         }
         let state = self.tab_switcher.as_mut()?;
         // Recompute the visible order once so Enter/arrows agree with what's drawn.
@@ -2135,12 +2258,21 @@ impl Jterm {
     fn handle_config_panel_key(
         &mut self,
         key: &keyboard::Key,
-        _mods: keyboard::Modifiers,
+        mods: keyboard::Modifiers,
     ) -> Option<Task<Message>> {
         use keyboard::key::Named;
         use keyboard::Key;
         if !self.config_panel_open {
             return None;
+        }
+        if mods.control() && mods.shift() {
+            if let Key::Character(c) = key {
+                if c.eq_ignore_ascii_case("o") {
+                    self.theme_editor = None;
+                    self.config_panel_open = false;
+                    return Some(Task::none());
+                }
+            }
         }
         if let Key::Named(Named::Escape) = key {
             // Esc backs out of the theme editor first, then the panel itself.
@@ -2275,8 +2407,36 @@ impl Jterm {
                 self.split(SplitMode::Horizontal);
                 Task::none()
             }
-            PaletteAction::FocusNextPane => {
-                self.focus_next_pane();
+            PaletteAction::FocusPaneLeft => {
+                self.focus_pane_direction(PaneDirection::Left);
+                Task::none()
+            }
+            PaletteAction::FocusPaneRight => {
+                self.focus_pane_direction(PaneDirection::Right);
+                Task::none()
+            }
+            PaletteAction::FocusPaneUp => {
+                self.focus_pane_direction(PaneDirection::Up);
+                Task::none()
+            }
+            PaletteAction::FocusPaneDown => {
+                self.focus_pane_direction(PaneDirection::Down);
+                Task::none()
+            }
+            PaletteAction::ResizePaneLeft => {
+                self.resize_pane_direction(PaneDirection::Left);
+                Task::none()
+            }
+            PaletteAction::ResizePaneRight => {
+                self.resize_pane_direction(PaneDirection::Right);
+                Task::none()
+            }
+            PaletteAction::ResizePaneUp => {
+                self.resize_pane_direction(PaneDirection::Up);
+                Task::none()
+            }
+            PaletteAction::ResizePaneDown => {
+                self.resize_pane_direction(PaneDirection::Down);
                 Task::none()
             }
             PaletteAction::ClosePane => self.close_focused_pane(),
@@ -2558,8 +2718,8 @@ impl Jterm {
                         return Task::none();
                     }
                     // Tab switcher swallows keys while open (Enter to jump,
-                    // arrows to move, Esc/Ctrl+K to dismiss). Handle before the
-                    // generic keybindings so its Esc/Ctrl+K shortcut wins.
+                    // arrows to move, Esc/Ctrl+Shift+L to dismiss). Handle before
+                    // generic keybindings so its toggle shortcut wins.
                     if self.tab_switcher.is_some() {
                         if let Some(task) =
                             self.handle_tab_switcher_key(&key, modifiers, text.as_deref())
@@ -2568,7 +2728,13 @@ impl Jterm {
                         }
                     }
                     if self.help_open || self.debug_open {
-                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                        let active_overlay_toggle = (self.help_open
+                            && chrome_shortcut(&key, modifiers) == Some(ChromeShortcut::Help))
+                            || (self.debug_open
+                                && chrome_shortcut(&key, modifiers) == Some(ChromeShortcut::Debug));
+                        if active_overlay_toggle
+                            || matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
+                        {
                             self.help_open = false;
                             self.debug_open = false;
                         }
@@ -2767,7 +2933,7 @@ impl Jterm {
                         SplitMode::Horizontal => pt.y / self.term_height().max(1.0),
                         SplitMode::Single => self.split_ratio,
                     };
-                    let ratio = ratio.clamp(0.15, 0.85);
+                    let ratio = ratio.clamp(SPLIT_RATIO_MIN, SPLIT_RATIO_MAX);
                     if (ratio - self.split_ratio).abs() > f32::EPSILON {
                         self.split_ratio = ratio;
                         self.relayout();
@@ -3659,7 +3825,7 @@ impl Jterm {
             .into()
     }
 
-    /// Ctrl+Shift+K fuzzy tab switcher overlay (palette-style).
+    /// Ctrl+Shift+L fuzzy tab switcher overlay (palette-style).
     fn tab_switcher_view(&self, state: &TabSwitcherState) -> Element<'_, Message> {
         let filtered = tab_switcher_filtered(&self.sessions, &state.query);
 
@@ -4670,8 +4836,8 @@ impl Jterm {
             .into()
     }
 
-    /// Centered keybindings cheat-sheet (Ctrl+Shift+/). All listed bindings are
-    /// Ctrl-based — jterm3 never binds Alt (reserved by the JWM window manager).
+    /// Centered keybindings cheat-sheet (Ctrl+Shift+/). Pane direction chords
+    /// combine Ctrl with Alt so JWM's bare-Alt shortcuts remain untouched.
     fn help_panel(&self) -> Element<'_, Message> {
         let section = |title: &str| -> Element<'_, Message> {
             text(title.to_string()).size(13).style(text::primary).into()
@@ -4679,7 +4845,7 @@ impl Jterm {
         let kb = |key: &str, desc: &str| -> Element<'_, Message> {
             row![
                 container(text(key.to_string()).size(12).font(iced::Font::MONOSPACE))
-                    .width(Length::Fixed(150.0)),
+                    .width(Length::Fixed(190.0)),
                 text(desc.to_string()).size(12).style(text::secondary),
             ]
             .spacing(8)
@@ -4692,12 +4858,15 @@ impl Jterm {
             kb("Ctrl+Shift+T", "New tab"),
             kb("Ctrl+Shift+W", "Close current tab"),
             kb("Ctrl+Tab / Ctrl+PgDn", "Next tab"),
-            kb("Ctrl+Shift+Tab / PgUp", "Previous tab"),
-            kb("Ctrl+1 .. Ctrl+9", "Jump to tab 1-9"),
+            kb("Ctrl+Shift+Tab / Ctrl+PgUp", "Previous tab"),
+            kb("Ctrl+1 .. Ctrl+8", "Jump to tab 1-8"),
+            kb("Ctrl+9", "Jump to last tab"),
+            kb("Ctrl+Shift+L", "Fuzzy tab switcher"),
             section("Splits / Panes"),
-            kb("Ctrl+Shift+D", "Split left/right (toggle)"),
-            kb("Ctrl+Shift+E", "Split top/bottom (toggle)"),
-            kb("Ctrl+Shift+J", "Focus next pane"),
+            kb("Ctrl+Shift+E", "Split left/right (toggle)"),
+            kb("Ctrl+Shift+D", "Split top/bottom (toggle)"),
+            kb("Ctrl+Alt+Arrow", "Focus adjacent pane"),
+            kb("Ctrl+Alt+Shift+Arrow", "Resize split"),
             kb("Ctrl+Shift+W", "Close focused pane / tab"),
             section("Edit / Clipboard"),
             kb("Ctrl+Shift+C", "Copy selection"),
@@ -4709,17 +4878,20 @@ impl Jterm {
             kb("Shift+End", "Scroll to bottom (live)"),
             kb("Ctrl+Shift+F", "Find"),
             section("Panels"),
-            kb("Ctrl+Shift+B", "Toggle tabs / files sidebar"),
+            kb("Ctrl+\\", "Toggle tabs / files sidebar"),
             kb("Ctrl+Shift+P", "Command palette"),
             kb("Ctrl+Shift+O", "Settings"),
-            kb("Ctrl+Shift+G", "Debug / diagnostics"),
+            kb("F12", "Debug / diagnostics"),
             kb("Ctrl+Shift+/", "This help"),
             kb("Esc", "Close any panel"),
+            section("Appearance"),
+            kb("Ctrl+= / Ctrl+-", "Increase / decrease font size"),
+            kb("Ctrl+0", "Reset font size"),
         ]
         .spacing(6);
 
         let inner = container(scrollable(body).height(Length::Shrink))
-            .width(Length::Fixed(420.0))
+            .width(Length::Fixed(460.0))
             .max_height(560.0)
             .padding(16)
             .style(container::dark);
@@ -4729,7 +4901,7 @@ impl Jterm {
             .into()
     }
 
-    /// Top-right diagnostics overlay (Ctrl+Shift+G): live grid / session /
+    /// Top-right diagnostics overlay (F12): live grid / session /
     /// scrollback / Kitty-image / process-memory stats for the active session.
     fn debug_panel(&self) -> Element<'_, Message> {
         let stat = |label: &str, value: String| -> Element<'_, Message> {
@@ -5210,7 +5382,10 @@ fn key_to_binding_string(key: &keyboard::Key, mods: keyboard::Modifiers) -> Opti
             if !(mods.control() || mods.alt() || mods.logo()) {
                 return None;
             }
-            s.chars().next()?.to_ascii_lowercase().to_string()
+            match s.chars().next()?.to_ascii_lowercase() {
+                '\\' => "backslash".to_string(),
+                c => c.to_string(),
+            }
         }
         Key::Named(named) => match named {
             Named::Tab => "tab",
@@ -5508,6 +5683,147 @@ fn xterm_modify_other_keys_encode(
 mod tests {
     use super::*;
     use iced::keyboard::key::Named;
+
+    #[test]
+    fn app_chrome_shortcuts_keep_palette_help_switcher_and_f12_contract() {
+        let ctrl_shift = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        let character = |s: &str| keyboard::Key::Character(s.into());
+
+        assert_eq!(
+            chrome_shortcut(&character("p"), ctrl_shift),
+            Some(ChromeShortcut::CommandPalette)
+        );
+        assert_eq!(
+            chrome_shortcut(&character("/"), ctrl_shift),
+            Some(ChromeShortcut::Help)
+        );
+        assert_eq!(
+            chrome_shortcut(&character("l"), ctrl_shift),
+            Some(ChromeShortcut::TabSwitcher)
+        );
+        assert_eq!(
+            chrome_shortcut(&keyboard::Key::Named(Named::F12), keyboard::Modifiers::NONE),
+            Some(ChromeShortcut::Debug)
+        );
+
+        assert_eq!(chrome_shortcut(&character("g"), ctrl_shift), None);
+        assert_eq!(chrome_shortcut(&character("k"), ctrl_shift), None);
+        assert_eq!(
+            chrome_shortcut(&character("p"), keyboard::Modifiers::CTRL),
+            None
+        );
+    }
+
+    #[test]
+    fn physical_key_events_match_sidebar_focus_and_resize_binding_names() {
+        assert_eq!(
+            key_to_binding_string(
+                &keyboard::Key::Character("\\".into()),
+                keyboard::Modifiers::CTRL
+            )
+            .as_deref(),
+            Some("ctrl+backslash")
+        );
+
+        let focus_mods = keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT;
+        let resize_mods = focus_mods | keyboard::Modifiers::SHIFT;
+        let cases = [
+            (Named::ArrowLeft, focus_mods, "ctrl+alt+left"),
+            (Named::ArrowRight, focus_mods, "ctrl+alt+right"),
+            (Named::ArrowUp, focus_mods, "ctrl+alt+up"),
+            (Named::ArrowDown, focus_mods, "ctrl+alt+down"),
+            (Named::ArrowLeft, resize_mods, "ctrl+shift+alt+left"),
+            (Named::ArrowRight, resize_mods, "ctrl+shift+alt+right"),
+            (Named::ArrowUp, resize_mods, "ctrl+shift+alt+up"),
+            (Named::ArrowDown, resize_mods, "ctrl+shift+alt+down"),
+        ];
+        for (named, modifiers, expected) in cases {
+            assert_eq!(
+                key_to_binding_string(&keyboard::Key::Named(named), modifiers).as_deref(),
+                Some(expected),
+                "{named:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pane_focus_is_axis_aware_and_never_wraps_at_an_edge() {
+        assert_eq!(
+            directional_pane_target(SplitMode::Vertical, 0, PaneDirection::Right),
+            Some(1)
+        );
+        assert_eq!(
+            directional_pane_target(SplitMode::Vertical, 1, PaneDirection::Left),
+            Some(0)
+        );
+        assert_eq!(
+            directional_pane_target(SplitMode::Horizontal, 0, PaneDirection::Down),
+            Some(1)
+        );
+        assert_eq!(
+            directional_pane_target(SplitMode::Horizontal, 1, PaneDirection::Up),
+            Some(0)
+        );
+
+        assert_eq!(
+            directional_pane_target(SplitMode::Vertical, 0, PaneDirection::Left),
+            None,
+            "left edge must not wrap"
+        );
+        assert_eq!(
+            directional_pane_target(SplitMode::Horizontal, 1, PaneDirection::Down),
+            None,
+            "bottom edge must not wrap"
+        );
+        assert_eq!(
+            directional_pane_target(SplitMode::Vertical, 0, PaneDirection::Down),
+            None,
+            "perpendicular direction must not change focus"
+        );
+        assert_eq!(
+            directional_pane_target(SplitMode::Single, 0, PaneDirection::Right),
+            None
+        );
+    }
+
+    #[test]
+    fn pane_keyboard_resize_follows_axis_and_clamps_to_drag_bounds() {
+        assert_eq!(
+            directional_split_ratio(SplitMode::Vertical, 0.5, PaneDirection::Left),
+            Some(0.45)
+        );
+        assert_eq!(
+            directional_split_ratio(SplitMode::Vertical, 0.5, PaneDirection::Right),
+            Some(0.55)
+        );
+        assert_eq!(
+            directional_split_ratio(SplitMode::Horizontal, 0.5, PaneDirection::Up),
+            Some(0.45)
+        );
+        assert_eq!(
+            directional_split_ratio(SplitMode::Horizontal, 0.5, PaneDirection::Down),
+            Some(0.55)
+        );
+        assert_eq!(
+            directional_split_ratio(SplitMode::Vertical, 0.5, PaneDirection::Up),
+            None
+        );
+        assert_eq!(
+            directional_split_ratio(SplitMode::Vertical, SPLIT_RATIO_MIN, PaneDirection::Left),
+            Some(SPLIT_RATIO_MIN)
+        );
+        assert_eq!(
+            directional_split_ratio(SplitMode::Horizontal, SPLIT_RATIO_MAX, PaneDirection::Down),
+            Some(SPLIT_RATIO_MAX)
+        );
+    }
+
+    #[test]
+    fn session_last_targets_the_final_index_without_underflow() {
+        assert_eq!(last_session_index(0), None);
+        assert_eq!(last_session_index(1), Some(0));
+        assert_eq!(last_session_index(12), Some(11));
+    }
 
     #[test]
     fn bracketed_paste_framing_preserves_payload() {

@@ -11,7 +11,8 @@ pub enum Command {
     SessionClose,
     SessionNext,
     SessionPrev,
-    SessionJump(usize), // 跳转到第 N 个会话 (0-8)
+    SessionJump(usize), // 跳转到第 N 个会话 (0-8; defaults expose 0-7)
+    SessionLast,
 
     // === 编辑操作 ===
     EditCopy,
@@ -33,11 +34,19 @@ pub enum Command {
     TerminalScrollDown,
 
     // === 分屏操作 ===
-    TerminalSplitVertical,   // Ctrl+Shift+D
-    TerminalSplitHorizontal, // Ctrl+Shift+E
+    TerminalSplitVertical,   // Ctrl+Shift+E (left/right)
+    TerminalSplitHorizontal, // Ctrl+Shift+D (top/bottom)
     TerminalClosePane,       // Ctrl+Shift+W
-    PaneFocusNext,           // Alt+Tab
-    PaneFocusPrev,           // Alt+Shift+Tab
+    PaneFocusNext,
+    PaneFocusPrev,
+    PaneFocusLeft,
+    PaneFocusRight,
+    PaneFocusUp,
+    PaneFocusDown,
+    PaneResizeLeft,
+    PaneResizeRight,
+    PaneResizeUp,
+    PaneResizeDown,
 
     // === 窗口操作 ===
     WindowClose,
@@ -62,6 +71,7 @@ impl std::fmt::Display for Command {
             Command::SessionNext => write!(f, "session:next"),
             Command::SessionPrev => write!(f, "session:prev"),
             Command::SessionJump(n) => write!(f, "session:jump:{}", n),
+            Command::SessionLast => write!(f, "session:last"),
             Command::EditCopy => write!(f, "edit:copy"),
             Command::EditPaste => write!(f, "edit:paste"),
             Command::SearchOpen => write!(f, "search:open"),
@@ -80,6 +90,14 @@ impl std::fmt::Display for Command {
             Command::TerminalClosePane => write!(f, "terminal:close_pane"),
             Command::PaneFocusNext => write!(f, "pane:focus_next"),
             Command::PaneFocusPrev => write!(f, "pane:focus_prev"),
+            Command::PaneFocusLeft => write!(f, "pane:focus_left"),
+            Command::PaneFocusRight => write!(f, "pane:focus_right"),
+            Command::PaneFocusUp => write!(f, "pane:focus_up"),
+            Command::PaneFocusDown => write!(f, "pane:focus_down"),
+            Command::PaneResizeLeft => write!(f, "pane:resize_left"),
+            Command::PaneResizeRight => write!(f, "pane:resize_right"),
+            Command::PaneResizeUp => write!(f, "pane:resize_up"),
+            Command::PaneResizeDown => write!(f, "pane:resize_down"),
             Command::WindowClose => write!(f, "window:close"),
             Command::ConfigOpen => write!(f, "config:open"),
             Command::ConfigClose => write!(f, "config:close"),
@@ -101,6 +119,7 @@ impl std::str::FromStr for Command {
             "session:close" => Ok(Command::SessionClose),
             "session:next" => Ok(Command::SessionNext),
             "session:prev" => Ok(Command::SessionPrev),
+            "session:last" => Ok(Command::SessionLast),
             "edit:copy" => Ok(Command::EditCopy),
             "edit:paste" => Ok(Command::EditPaste),
             "search:open" => Ok(Command::SearchOpen),
@@ -119,6 +138,14 @@ impl std::str::FromStr for Command {
             "terminal:close_pane" => Ok(Command::TerminalClosePane),
             "pane:focus_next" => Ok(Command::PaneFocusNext),
             "pane:focus_prev" => Ok(Command::PaneFocusPrev),
+            "pane:focus_left" => Ok(Command::PaneFocusLeft),
+            "pane:focus_right" => Ok(Command::PaneFocusRight),
+            "pane:focus_up" => Ok(Command::PaneFocusUp),
+            "pane:focus_down" => Ok(Command::PaneFocusDown),
+            "pane:resize_left" => Ok(Command::PaneResizeLeft),
+            "pane:resize_right" => Ok(Command::PaneResizeRight),
+            "pane:resize_up" => Ok(Command::PaneResizeUp),
+            "pane:resize_down" => Ok(Command::PaneResizeDown),
             "window:close" => Ok(Command::WindowClose),
             "config:open" => Ok(Command::ConfigOpen),
             "config:close" => Ok(Command::ConfigClose),
@@ -237,7 +264,10 @@ impl KeyBinding {
                 }
             }
         }
-        let key = key?;
+        let key = match key?.as_str() {
+            "\\" | "backslash" => "backslash".to_string(),
+            other => other.to_string(),
+        };
         let mut out = String::new();
         if ctrl {
             out.push_str("ctrl+");
@@ -329,13 +359,16 @@ impl KeyBindings {
             .bindings
             .insert("ctrl+pageup".to_string(), "session:prev".to_string());
 
-        // 会话切换（数字快捷键）。键是 1-indexed（ctrl+1 跳到第一个会话），
-        // 让 ctrl+0 空出来给字体缩放重置使用。
-        for i in 0..9 {
+        // Browser-style tab switching: Ctrl+1..8 address the first eight tabs,
+        // Ctrl+9 always selects the last tab, and Ctrl+0 resets font zoom.
+        for i in 0..8 {
             bindings
                 .bindings
                 .insert(format!("ctrl+{}", i + 1), format!("session:jump:{}", i));
         }
+        bindings
+            .bindings
+            .insert("ctrl+9".to_string(), "session:last".to_string());
 
         // 编辑操作
         bindings
@@ -347,20 +380,37 @@ impl KeyBindings {
 
         // 分屏操作
         bindings.bindings.insert(
-            "ctrl+shift+d".to_string(),
+            "ctrl+shift+e".to_string(),
             "terminal:split_vertical".to_string(),
         );
         bindings.bindings.insert(
-            "ctrl+shift+e".to_string(),
+            "ctrl+shift+d".to_string(),
             "terminal:split_horizontal".to_string(),
         );
         bindings.bindings.insert(
             "ctrl+shift+w".to_string(),
             "terminal:close_pane".to_string(),
         );
-        bindings
-            .bindings
-            .insert("ctrl+shift+j".to_string(), "pane:focus_next".to_string());
+        for (key, command) in [
+            ("left", "pane:focus_left"),
+            ("right", "pane:focus_right"),
+            ("up", "pane:focus_up"),
+            ("down", "pane:focus_down"),
+        ] {
+            bindings
+                .bindings
+                .insert(format!("ctrl+alt+{key}"), command.to_string());
+        }
+        for (key, command) in [
+            ("left", "pane:resize_left"),
+            ("right", "pane:resize_right"),
+            ("up", "pane:resize_up"),
+            ("down", "pane:resize_down"),
+        ] {
+            bindings
+                .bindings
+                .insert(format!("ctrl+shift+alt+{key}"), command.to_string());
+        }
 
         // 搜索操作
         bindings
@@ -373,7 +423,7 @@ impl KeyBindings {
             .insert("ctrl+shift+o".to_string(), "config:toggle".to_string());
         bindings
             .bindings
-            .insert("ctrl+shift+b".to_string(), "sidebar:toggle".to_string());
+            .insert("ctrl+backslash".to_string(), "sidebar:toggle".to_string());
 
         // 终端操作
         bindings
@@ -498,17 +548,65 @@ mod tests {
     }
 
     #[test]
-    fn test_default_bindings() {
+    fn common_default_chord_matrix() {
         let bindings = KeyBindings::default_bindings();
-        assert!(bindings.get_command("ctrl+shift+t").is_some());
+        let cases = [
+            ("ctrl+shift+t", Command::SessionNew),
+            ("ctrl+shift+w", Command::TerminalClosePane),
+            ("ctrl+shift+c", Command::EditCopy),
+            ("ctrl+shift+v", Command::EditPaste),
+            ("ctrl+shift+f", Command::SearchOpen),
+            ("ctrl+shift+o", Command::ConfigToggle),
+            ("ctrl+backslash", Command::SidebarToggle),
+            ("ctrl+shift+e", Command::TerminalSplitVertical),
+            ("ctrl+shift+d", Command::TerminalSplitHorizontal),
+            ("ctrl+=", Command::FontZoomIn),
+            ("ctrl+-", Command::FontZoomOut),
+            ("ctrl+0", Command::FontZoomReset),
+        ];
+        for (chord, expected) in cases {
+            assert_eq!(bindings.get_command(chord), Some(expected), "{chord}");
+        }
+
         assert_eq!(
-            bindings.get_command("ctrl+shift+t"),
-            Some(Command::SessionNew)
+            bindings.get_command("ctrl+\\"),
+            Some(Command::SidebarToggle),
+            "literal and named backslash forms must canonicalize identically"
         );
-        assert_eq!(
-            bindings.get_command("ctrl+shift+b"),
-            Some(Command::SidebarToggle)
-        );
+        assert_eq!(bindings.get_command("ctrl+shift+j"), None);
+    }
+
+    #[test]
+    fn browser_style_digit_bindings_use_nine_for_last_and_zero_for_zoom() {
+        let bindings = KeyBindings::default_bindings();
+        for digit in 1usize..=8 {
+            let chord = format!("ctrl+{digit}");
+            assert_eq!(
+                bindings.get_command(&chord),
+                Some(Command::SessionJump(digit - 1)),
+                "{chord}"
+            );
+        }
+        assert_eq!(bindings.get_command("ctrl+9"), Some(Command::SessionLast));
+        assert_eq!(bindings.get_command("ctrl+0"), Some(Command::FontZoomReset));
+    }
+
+    #[test]
+    fn pane_direction_and_resize_chords_are_complete() {
+        let bindings = KeyBindings::default_bindings();
+        let cases = [
+            ("ctrl+alt+left", Command::PaneFocusLeft),
+            ("ctrl+alt+right", Command::PaneFocusRight),
+            ("ctrl+alt+up", Command::PaneFocusUp),
+            ("ctrl+alt+down", Command::PaneFocusDown),
+            ("ctrl+alt+shift+left", Command::PaneResizeLeft),
+            ("ctrl+alt+shift+right", Command::PaneResizeRight),
+            ("ctrl+alt+shift+up", Command::PaneResizeUp),
+            ("ctrl+alt+shift+down", Command::PaneResizeDown),
+        ];
+        for (chord, expected) in cases {
+            assert_eq!(bindings.get_command(chord), Some(expected), "{chord}");
+        }
     }
 
     #[test]
@@ -525,5 +623,8 @@ mod tests {
     fn test_command_display() {
         assert_eq!(Command::SessionNew.to_string(), "session:new");
         assert_eq!(Command::SessionJump(3).to_string(), "session:jump:3");
+        assert_eq!(Command::SessionLast.to_string(), "session:last");
+        assert_eq!(Command::PaneFocusLeft.to_string(), "pane:focus_left");
+        assert_eq!(Command::PaneResizeDown.to_string(), "pane:resize_down");
     }
 }
