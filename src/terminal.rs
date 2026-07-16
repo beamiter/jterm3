@@ -2088,9 +2088,10 @@ impl TerminalState {
         let src_start = top * cols;
         let src_end = bottom * cols;
         let dst = (top + 1) * cols;
+        let blank = self.create_blank_cell();
         self.grid.cells.copy_within(src_start..src_end, dst);
         // Clear top row
-        self.grid.cells[src_start..src_start + cols].fill(TerminalCell::default());
+        self.grid.cells[src_start..src_start + cols].fill(blank);
         self.grid.row_wrapped.copy_within(top..bottom, top + 1);
         self.grid.row_wrapped[top] = false;
         self.mark_rows_dirty(top, bottom);
@@ -2124,9 +2125,10 @@ impl TerminalState {
         let src_start = (top + 1) * cols;
         let src_end = (bottom + 1) * cols;
         let dst_start = top * cols;
+        let blank = self.create_blank_cell();
         self.grid.cells.copy_within(src_start..src_end, dst_start);
         let blank_start = bottom * cols;
-        self.grid.cells[blank_start..blank_start + cols].fill(TerminalCell::default());
+        self.grid.cells[blank_start..blank_start + cols].fill(blank);
         self.grid.row_wrapped.copy_within(top + 1..=bottom, top);
         self.grid.row_wrapped[bottom] = false;
 
@@ -3031,6 +3033,7 @@ impl TerminalState {
             }
             'L' => {
                 let n = params.first().copied().unwrap_or(1).max(1) as usize;
+                let blank = self.create_blank_cell();
                 for _ in 0..n {
                     if self.cursor_row >= self.scroll_region_top
                         && self.cursor_row <= self.scroll_region_bottom
@@ -3040,13 +3043,14 @@ impl TerminalState {
                         let src_end = self.scroll_region_bottom * cols;
                         let dst = (self.cursor_row + 1) * cols;
                         self.grid.cells.copy_within(src_start..src_end, dst);
-                        self.grid.cells[src_start..src_start + cols].fill(TerminalCell::default());
+                        self.grid.cells[src_start..src_start + cols].fill(blank);
                     }
                 }
                 self.mark_rows_dirty(self.cursor_row, self.scroll_region_bottom);
             }
             'M' => {
                 let n = params.first().copied().unwrap_or(1).max(1) as usize;
+                let blank = self.create_blank_cell();
                 for _ in 0..n {
                     if self.cursor_row >= self.scroll_region_top
                         && self.cursor_row <= self.scroll_region_bottom
@@ -3057,8 +3061,7 @@ impl TerminalState {
                         let dst = self.cursor_row * cols;
                         self.grid.cells.copy_within(src_start..src_end, dst);
                         let blank_start = self.scroll_region_bottom * cols;
-                        self.grid.cells[blank_start..blank_start + cols]
-                            .fill(TerminalCell::default());
+                        self.grid.cells[blank_start..blank_start + cols].fill(blank);
                     }
                 }
                 self.mark_rows_dirty(self.cursor_row, self.scroll_region_bottom);
@@ -5788,6 +5791,35 @@ mod tests {
         );
         assert_eq!(terminal.scroll_region_top, 0);
         assert_eq!(terminal.scroll_region_bottom, 3);
+    }
+
+    #[test]
+    fn structural_blank_lines_honor_background_color_erase() {
+        let expected = Color::Rgb(40, 44, 52);
+
+        let mut scrolled_up = TerminalState::new(4, 3);
+        scrolled_up.process_input(b"\x1b[48;2;40;44;52m\x1b[3;1H\n");
+        assert!(scrolled_up.grid[2]
+            .iter()
+            .all(|cell| cell.background == expected));
+
+        let mut scrolled_down = TerminalState::new(4, 3);
+        scrolled_down.process_input(b"\x1b[48;2;40;44;52m\x1b[1;1H\x1bM");
+        assert!(scrolled_down.grid[0]
+            .iter()
+            .all(|cell| cell.background == expected));
+
+        let mut inserted = TerminalState::new(4, 3);
+        inserted.process_input(b"\x1b[48;2;40;44;52m\x1b[2;1H\x1b[L");
+        assert!(inserted.grid[1]
+            .iter()
+            .all(|cell| cell.background == expected));
+
+        let mut deleted = TerminalState::new(4, 3);
+        deleted.process_input(b"\x1b[48;2;40;44;52m\x1b[2;1H\x1b[M");
+        assert!(deleted.grid[2]
+            .iter()
+            .all(|cell| cell.background == expected));
     }
 
     #[test]
