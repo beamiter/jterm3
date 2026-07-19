@@ -56,6 +56,7 @@ fn is_token_suffix_wrapper(c: char) -> bool {
 const PRIMARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[?65;1;9c";
 const SECONDARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[>1;7802;0c";
 const XTERM_VERSION_RESPONSE: &[u8] = b"\x1bP>|VTE(7802)\x1b\\";
+const MAX_TERMINAL_TITLE_CHARS: usize = 256;
 pub const MAX_TERMINAL_COLS: usize = 1024;
 pub const MAX_TERMINAL_ROWS: usize = 512;
 pub type DynamicColorPalette = [Option<(u8, u8, u8)>; 256];
@@ -1518,8 +1519,21 @@ impl TerminalState {
     fn sanitized_title(title: &str) -> String {
         title
             .chars()
-            .filter(|&ch| ch != '\x1b' && ch != '\x07')
-            .take(1024)
+            // Titles are rendered in trusted app chrome. Drop line/layout
+            // controls and bidi overrides/isolation marks so PTY output cannot
+            // create multiline tabs or visually reorder the window title.
+            .filter(|&ch| {
+                !ch.is_control()
+                    && !matches!(
+                        ch,
+                        '\u{061c}'
+                            | '\u{200e}'
+                            | '\u{200f}'
+                            | '\u{202a}'..='\u{202e}'
+                            | '\u{2066}'..='\u{2069}'
+                    )
+            })
+            .take(MAX_TERMINAL_TITLE_CHARS)
             .collect()
     }
 
@@ -2460,16 +2474,13 @@ impl TerminalState {
                                         payload.split_once(';').unwrap_or((payload, ""));
                                     if !command.is_empty() {
                                         if command == "0" {
-                                            self.icon_title.clear();
-                                            self.icon_title.push_str(value);
-                                            self.window_title.clear();
-                                            self.window_title.push_str(value);
+                                            let title = Self::sanitized_title(value);
+                                            self.icon_title.clone_from(&title);
+                                            self.window_title = title;
                                         } else if command == "1" {
-                                            self.icon_title.clear();
-                                            self.icon_title.push_str(value);
+                                            self.icon_title = Self::sanitized_title(value);
                                         } else if command == "2" {
-                                            self.window_title.clear();
-                                            self.window_title.push_str(value);
+                                            self.window_title = Self::sanitized_title(value);
                                         } else if command == "8" {
                                             // OSC 8 - Hyperlinks
                                             // Format: ESC ] 8 ; params ; URI ST
@@ -4882,6 +4893,7 @@ impl TerminalState {
 mod tests {
     use super::{
         ClipboardReadKind, Color, CursorShape, ScrollbackLine, TerminalCell, TerminalState,
+        MAX_TERMINAL_TITLE_CHARS,
     };
 
     #[test]
@@ -5451,6 +5463,26 @@ mod tests {
             String::from_utf8(terminal.get_output()).unwrap(),
             "\x1b]Licon\x1b\\\x1b]lwindow\x1b\\"
         );
+    }
+
+    #[test]
+    fn osc_titles_are_bounded_and_safe_for_app_chrome() {
+        let mut terminal = TerminalState::new(80, 24);
+        let hostile = format!(
+            "\x1b]2;safe\n\u{202e}{}tail\x1b\\",
+            "x".repeat(MAX_TERMINAL_TITLE_CHARS + 64)
+        );
+
+        terminal.process_input(hostile.as_bytes());
+
+        assert_eq!(
+            terminal.window_title.chars().count(),
+            MAX_TERMINAL_TITLE_CHARS
+        );
+        assert!(terminal.window_title.starts_with("safe"));
+        assert!(!terminal.window_title.contains('\n'));
+        assert!(!terminal.window_title.contains('\u{202e}'));
+        assert!(!terminal.window_title.ends_with("tail"));
     }
 
     #[test]

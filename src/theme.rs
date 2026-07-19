@@ -2,6 +2,8 @@ use iced::Color;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+const MAX_CUSTOM_THEME_NAME_BYTES: usize = 160;
+
 /// 终端颜色配置
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TerminalColors {
@@ -845,7 +847,13 @@ impl Theme {
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "toml") {
                 if let Ok(theme) = Self::from_file(&path) {
-                    themes.push(theme);
+                    // A theme's embedded name later becomes a filename for save
+                    // and delete operations. Ignore hand-written files with
+                    // unsafe names so a path component can never escape this
+                    // directory through UI actions.
+                    if Self::validate_custom_theme_name(&theme.name).is_ok() {
+                        themes.push(theme);
+                    }
                 }
             }
         }
@@ -853,8 +861,41 @@ impl Theme {
         themes
     }
 
+    /// Validate a custom-theme display name before it is used as a filename.
+    /// Unicode and spaces are welcome, but path syntax, control characters, and
+    /// overlong components are rejected.
+    pub fn validate_custom_theme_name(name: &str) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("Name cannot be empty".to_string());
+        }
+        if name.trim() != name {
+            return Err("Name cannot start or end with whitespace".to_string());
+        }
+        if name.len() > MAX_CUSTOM_THEME_NAME_BYTES {
+            return Err(format!(
+                "Name is too long (maximum {MAX_CUSTOM_THEME_NAME_BYTES} bytes)"
+            ));
+        }
+        if matches!(name, "." | "..")
+            || name.contains(['/', '\\'])
+            || name.chars().any(char::is_control)
+        {
+            return Err("Name cannot contain path separators or control characters".to_string());
+        }
+        Ok(())
+    }
+
     /// Save this theme as a custom theme file
     pub fn save_custom_theme(&self) -> Result<(), Box<dyn std::error::Error>> {
+        Self::validate_custom_theme_name(&self.name)
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+        if Self::is_builtin(&self.name) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Name collides with a builtin theme",
+            )
+            .into());
+        }
         let dir = Self::custom_themes_dir().ok_or("Cannot determine config directory")?;
         std::fs::create_dir_all(&dir)?;
         let filename = format!("{}.toml", self.name);
@@ -864,6 +905,15 @@ impl Theme {
 
     /// Delete a custom theme file
     pub fn delete_custom_theme(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        Self::validate_custom_theme_name(name)
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+        if Self::is_builtin(name) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Builtin themes cannot be deleted",
+            )
+            .into());
+        }
         let dir = Self::custom_themes_dir().ok_or("Cannot determine config directory")?;
         let filename = format!("{}.toml", name);
         let path = dir.join(filename);
@@ -1062,5 +1112,40 @@ impl Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self::builtin_dark()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_theme_names_are_safe_single_path_components() {
+        for valid in ["work dark", "东京夜", "nord-custom_v2"] {
+            assert!(
+                Theme::validate_custom_theme_name(valid).is_ok(),
+                "{valid:?} should be accepted"
+            );
+        }
+
+        for invalid in [
+            "",
+            ".",
+            "..",
+            "../config",
+            "nested/theme",
+            r"..\config",
+            " leading",
+            "trailing ",
+            "line\nbreak",
+        ] {
+            assert!(
+                Theme::validate_custom_theme_name(invalid).is_err(),
+                "{invalid:?} should be rejected"
+            );
+        }
+
+        let overlong = "x".repeat(MAX_CUSTOM_THEME_NAME_BYTES + 1);
+        assert!(Theme::validate_custom_theme_name(&overlong).is_err());
     }
 }

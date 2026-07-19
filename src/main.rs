@@ -1979,8 +1979,20 @@ impl Jterm {
                     .links
                     .iter()
                     .find(|l| l.line == row && col >= l.col_start && col < l.col_end)
+                    .cloned()
                 {
-                    let _ = link::open_link(link);
+                    let cwd = self
+                        .sessions
+                        .get(self.active)
+                        .and_then(|session| session.cwd_cache.clone().or_else(|| session.cwd()));
+                    if let Err(error) =
+                        link::open_link(&link, cwd.as_deref().map(std::path::Path::new))
+                    {
+                        self.push_toast(
+                            format!("Could not open link: {error}"),
+                            ToastKind::Warning,
+                        );
+                    }
                     return Task::none();
                 }
             }
@@ -3152,8 +3164,8 @@ impl Jterm {
                 let mut save_error: Option<String> = None;
                 if let Some(ed) = &mut self.theme_editor {
                     let name = ed.name.trim().to_string();
-                    if name.is_empty() {
-                        ed.error = Some("Name cannot be empty".to_string());
+                    if let Err(message) = Theme::validate_custom_theme_name(&name) {
+                        ed.error = Some(message);
                     } else if Theme::is_builtin(&name) {
                         ed.error = Some("Name collides with a builtin theme".to_string());
                     } else if let Some(bad) =
@@ -5464,33 +5476,30 @@ fn encode_key(
     let alt = mods.alt();
 
     // Enhanced keyboard protocols (Kitty / xterm modifyOtherKeys) take
-    // precedence when an app has enabled them. A bare alphanumeric keypress
-    // that already carries committed text is left to the normal path so plain
-    // typing is not double-encoded (mirrors jterm2's key/text de-duplication).
-    let bare_alnum_text =
-        text.is_some_and(|t| t.len() == 1 && t.as_bytes()[0].is_ascii_alphanumeric());
-    if !bare_alnum_text {
-        if let Some(enc) = kitty_encode_key(key, mods, enh.kitty_flags) {
-            return Some(enc);
-        }
-        if let Some(enc) = xterm_modify_other_keys_encode(
-            key,
-            mods,
-            enh.modify_other_keys,
-            enh.format_other_keys,
-            enh.report_all_keys,
-        ) {
-            return Some(enc);
-        }
+    // precedence when an app has enabled them. Unlike jterm2/egui, iced puts
+    // committed text on this same key event; there is no second text event to
+    // suppress. Skipping an alphanumeric key here would therefore violate
+    // Kitty's report-all-keys mode and send plain text instead.
+    if let Some(enc) = kitty_encode_key(key, mods, enh.kitty_flags) {
+        return Some(enc);
+    }
+    if let Some(enc) = xterm_modify_other_keys_encode(
+        key,
+        mods,
+        text,
+        enh.modify_other_keys,
+        enh.format_other_keys,
+        enh.report_all_keys,
+    ) {
+        return Some(enc);
     }
 
     let csi = |c: &str| -> Vec<u8> { format!("\x1b[{c}").into_bytes() };
     let ss3 = |c: &str| -> Vec<u8> { format!("\x1bO{c}").into_bytes() };
-    let cursor = |c: &str| if app_cursor { ss3(c) } else { csi(c) };
 
     match key {
         Key::Named(named) => {
-            let bytes = match named {
+            let mut bytes = match named {
                 Named::Enter => {
                     if enh.application_keypad && location == keyboard::Location::Numpad {
                         ss3("M")
@@ -5498,7 +5507,7 @@ fn encode_key(
                         vec![b'\r']
                     }
                 }
-                Named::Backspace => vec![0x7f],
+                Named::Backspace => vec![if ctrl { 0x08 } else { 0x7f }],
                 Named::Tab => {
                     if mods.shift() {
                         csi("Z")
@@ -5507,38 +5516,20 @@ fn encode_key(
                     }
                 }
                 Named::Escape => vec![0x1b],
-                Named::Space => vec![b' '],
-                Named::ArrowUp => cursor("A"),
-                Named::ArrowDown => cursor("B"),
-                Named::ArrowRight => cursor("C"),
-                Named::ArrowLeft => cursor("D"),
-                Named::Home => cursor("H"),
-                Named::End => cursor("F"),
-                Named::PageUp => csi("5~"),
-                Named::PageDown => csi("6~"),
-                Named::Delete => csi("3~"),
-                Named::Insert => csi("2~"),
-                Named::F1 => ss3("P"),
-                Named::F2 => ss3("Q"),
-                Named::F3 => ss3("R"),
-                Named::F4 => ss3("S"),
-                Named::F5 => csi("15~"),
-                Named::F6 => csi("17~"),
-                Named::F7 => csi("18~"),
-                Named::F8 => csi("19~"),
-                Named::F9 => csi("20~"),
-                Named::F10 => csi("21~"),
-                Named::F11 => csi("23~"),
-                Named::F12 => csi("24~"),
-                _ => return None,
+                Named::Space => vec![if ctrl { 0x00 } else { b' ' }],
+                _ => {
+                    return legacy_function_key_sequence(
+                        named,
+                        mods,
+                        app_cursor,
+                        enh.report_all_keys,
+                    )
+                }
             };
             if alt {
-                let mut v = vec![0x1b];
-                v.extend_from_slice(&bytes);
-                Some(v)
-            } else {
-                Some(bytes)
+                bytes.insert(0, 0x1b);
             }
+            Some(bytes)
         }
         Key::Character(s) => {
             let c = s.chars().next()?;
@@ -5582,28 +5573,105 @@ fn encode_key(
     }
 }
 
-/// The base Unicode codepoint a key reports under the Kitty keyboard protocol.
-/// Only ASCII alphanumerics are mapped, matching jterm2.
-fn kitty_text_key_code(key: &keyboard::Key) -> Option<u32> {
-    if let keyboard::Key::Character(s) = key {
-        let c = s.chars().next()?.to_ascii_lowercase();
-        if c.is_ascii_alphanumeric() {
-            return Some(c as u32);
+/// Encode the legacy xterm/terminfo functional-key family. Modified cursor,
+/// editing, and function keys carry a parameter instead of losing Ctrl/Shift
+/// or being represented as an ambiguous ESC prefix.
+fn legacy_function_key_sequence(
+    named: &keyboard::key::Named,
+    mods: keyboard::Modifiers,
+    app_cursor: bool,
+    force_modifier: bool,
+) -> Option<Vec<u8>> {
+    use keyboard::key::Named;
+
+    let csi = |body: &str| format!("\x1b[{body}").into_bytes();
+    let ss3 = |final_byte: char| format!("\x1bO{final_byte}").into_bytes();
+    let has_modifier = mods.shift() || mods.alt() || mods.control() || mods.logo();
+    let modified = force_modifier || has_modifier;
+    let modifier = keyboard_modifier_value(mods);
+    let cursor = |final_byte: char| {
+        if modified {
+            csi(&format!("1;{modifier}{final_byte}"))
+        } else if app_cursor {
+            ss3(final_byte)
+        } else {
+            csi(&final_byte.to_string())
         }
+    };
+    let tilde = |code: u8| {
+        if modified {
+            csi(&format!("{code};{modifier}~"))
+        } else {
+            csi(&format!("{code}~"))
+        }
+    };
+    let function = |final_byte: char| {
+        if modified {
+            csi(&format!("1;{modifier}{final_byte}"))
+        } else {
+            ss3(final_byte)
+        }
+    };
+
+    Some(match named {
+        Named::ArrowUp => cursor('A'),
+        Named::ArrowDown => cursor('B'),
+        Named::ArrowRight => cursor('C'),
+        Named::ArrowLeft => cursor('D'),
+        Named::Home => cursor('H'),
+        Named::End => cursor('F'),
+        Named::PageUp => tilde(5),
+        Named::PageDown => tilde(6),
+        Named::Delete => tilde(3),
+        Named::Insert => tilde(2),
+        Named::F1 => function('P'),
+        Named::F2 => function('Q'),
+        Named::F3 => function('R'),
+        Named::F4 => function('S'),
+        Named::F5 => tilde(15),
+        Named::F6 => tilde(17),
+        Named::F7 => tilde(18),
+        Named::F8 => tilde(19),
+        Named::F9 => tilde(20),
+        Named::F10 => tilde(21),
+        Named::F11 => tilde(23),
+        Named::F12 => tilde(24),
+        _ => return None,
+    })
+}
+
+/// The base Unicode codepoint a key reports under the Kitty keyboard protocol.
+/// Kitty uses the unshifted/lowercase form for text keys and C0 values for the
+/// handful of named keys that have legacy control-byte encodings.
+fn kitty_text_key_code(key: &keyboard::Key) -> Option<u32> {
+    use keyboard::key::Named;
+    use keyboard::Key;
+
+    match key {
+        Key::Character(s) => s.chars().next()?.to_lowercase().next().map(u32::from),
+        Key::Named(Named::Escape) => Some(27),
+        Key::Named(Named::Enter) => Some(13),
+        Key::Named(Named::Tab) => Some(9),
+        Key::Named(Named::Backspace) => Some(127),
+        Key::Named(Named::Space) => Some(32),
+        _ => None,
     }
-    None
 }
 
 /// Codepoint for the xterm modifyOtherKeys report; like [`kitty_text_key_code`]
-/// but reports the shifted (uppercase) form when Shift is held.
-fn text_key_code(key: &keyboard::Key, mods: keyboard::Modifiers) -> Option<u32> {
+/// but prefers iced's committed text when modifiers changed the character.
+fn text_key_code(
+    key: &keyboard::Key,
+    mods: keyboard::Modifiers,
+    text: Option<&str>,
+) -> Option<u32> {
     let codepoint = kitty_text_key_code(key)?;
     if mods.shift() {
+        if let Some(character) = text.and_then(|value| value.chars().find(|c| !c.is_control())) {
+            return Some(character as u32);
+        }
         if let keyboard::Key::Character(s) = key {
-            let c = s.chars().next()?;
-            if c.is_ascii_alphabetic() {
-                return Some(c.to_ascii_uppercase() as u32);
-            }
+            return s.chars().next()?.to_uppercase().next().map(u32::from);
         }
     }
     Some(codepoint)
@@ -5621,7 +5689,7 @@ fn keyboard_modifier_value(mods: keyboard::Modifiers) -> u8 {
     if mods.control() {
         bits |= 0b100;
     }
-    if mods.logo() && !mods.control() {
+    if mods.logo() {
         bits |= 0b1000;
     }
     bits + 1
@@ -5641,8 +5709,19 @@ fn kitty_encode_key(
         return None;
     }
     let codepoint = kitty_text_key_code(key)?;
-    let should_encode =
-        report_all_keys || mods.control() || mods.alt() || (mods.logo() && !mods.control());
+    let legacy_c0_exception = matches!(
+        key,
+        keyboard::Key::Named(
+            keyboard::key::Named::Enter
+                | keyboard::key::Named::Tab
+                | keyboard::key::Named::Backspace
+        )
+    );
+    if legacy_c0_exception && !report_all_keys {
+        return None;
+    }
+    let is_escape = matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape));
+    let should_encode = report_all_keys || is_escape || mods.control() || mods.alt() || mods.logo();
     if !should_encode {
         return None;
     }
@@ -5653,20 +5732,22 @@ fn kitty_encode_key(
 fn xterm_modify_other_keys_encode(
     key: &keyboard::Key,
     mods: keyboard::Modifiers,
+    text: Option<&str>,
     modify_other_keys: u16,
     format_other_keys: u16,
     report_all_keys: bool,
 ) -> Option<Vec<u8>> {
-    let codepoint = text_key_code(key, mods)?;
+    let codepoint = text_key_code(key, mods, text)?;
     let modifier_value = keyboard_modifier_value(mods);
-    let has_non_shift_modifier = mods.control() || mods.alt() || (mods.logo() && !mods.control());
+    let has_non_shift_modifier = mods.control() || mods.alt() || mods.logo();
     let should_encode = if report_all_keys {
-        modifier_value > 1
+        true
     } else {
         match modify_other_keys {
             0 => false,
-            1 => mods.alt() || (mods.logo() && !mods.control()),
-            _ => has_non_shift_modifier || mods.shift(),
+            1 => mods.alt() || mods.logo(),
+            2 => has_non_shift_modifier || mods.shift(),
+            _ => true,
         }
     };
     if !should_encode {
@@ -5856,6 +5937,207 @@ mod tests {
         });
         queue.back_mut().expect("queue is populated").data = vec![0; PTY_QUEUE_COALESCE_BYTES];
         assert!(!Session::queue_accepts_entry(&queue, 1, false));
+    }
+
+    #[test]
+    fn modified_function_keys_keep_their_xterm_modifier_parameters() {
+        let cases = [
+            (
+                Named::ArrowLeft,
+                keyboard::Modifiers::CTRL,
+                false,
+                b"\x1b[1;5D".as_slice(),
+            ),
+            (
+                Named::F5,
+                keyboard::Modifiers::SHIFT,
+                false,
+                b"\x1b[15;2~".as_slice(),
+            ),
+            (
+                Named::PageDown,
+                keyboard::Modifiers::ALT,
+                false,
+                b"\x1b[6;3~".as_slice(),
+            ),
+            (
+                Named::F1,
+                keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                false,
+                b"\x1b[1;6P".as_slice(),
+            ),
+            (
+                Named::ArrowUp,
+                keyboard::Modifiers::NONE,
+                true,
+                b"\x1bOA".as_slice(),
+            ),
+        ];
+
+        for (named, modifiers, app_cursor, expected) in cases {
+            let encoded = encode_key(
+                &keyboard::Key::Named(named),
+                keyboard::Location::Standard,
+                modifiers,
+                None,
+                app_cursor,
+                KeyboardEnhancements::default(),
+            );
+            assert_eq!(encoded.as_deref(), Some(expected), "{named:?}");
+        }
+
+        let report_all_arrow = encode_key(
+            &keyboard::Key::Named(Named::ArrowUp),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::NONE,
+            None,
+            true,
+            KeyboardEnhancements {
+                report_all_keys: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(report_all_arrow.as_deref(), Some(&b"\x1b[1;1A"[..]));
+    }
+
+    #[test]
+    fn legacy_control_keys_preserve_ctrl_and_alt_semantics() {
+        let ctrl_backspace = encode_key(
+            &keyboard::Key::Named(Named::Backspace),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::CTRL,
+            None,
+            false,
+            KeyboardEnhancements::default(),
+        );
+        assert_eq!(ctrl_backspace.as_deref(), Some(&b"\x08"[..]));
+
+        let ctrl_alt_backspace = encode_key(
+            &keyboard::Key::Named(Named::Backspace),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT,
+            None,
+            false,
+            KeyboardEnhancements::default(),
+        );
+        assert_eq!(ctrl_alt_backspace.as_deref(), Some(&b"\x1b\x08"[..]));
+
+        let ctrl_space = encode_key(
+            &keyboard::Key::Named(Named::Space),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::CTRL,
+            Some(" "),
+            false,
+            KeyboardEnhancements::default(),
+        );
+        assert_eq!(ctrl_space.as_deref(), Some(&b"\0"[..]));
+    }
+
+    #[test]
+    fn kitty_report_all_and_disambiguation_do_not_fall_back_to_plain_text() {
+        let report_all = KeyboardEnhancements {
+            kitty_flags: 0b1000,
+            report_all_keys: true,
+            ..Default::default()
+        };
+        let letter = encode_key(
+            &keyboard::Key::Character("a".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::NONE,
+            Some("a"),
+            false,
+            report_all,
+        );
+        assert_eq!(letter.as_deref(), Some(&b"\x1b[97;1u"[..]));
+
+        let enter = encode_key(
+            &keyboard::Key::Named(Named::Enter),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::NONE,
+            None,
+            false,
+            report_all,
+        );
+        assert_eq!(enter.as_deref(), Some(&b"\x1b[13;1u"[..]));
+
+        let disambiguate = KeyboardEnhancements {
+            kitty_flags: 0b1,
+            ..Default::default()
+        };
+        let escape = encode_key(
+            &keyboard::Key::Named(Named::Escape),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::NONE,
+            None,
+            false,
+            disambiguate,
+        );
+        assert_eq!(escape.as_deref(), Some(&b"\x1b[27;1u"[..]));
+
+        let legacy_enter = encode_key(
+            &keyboard::Key::Named(Named::Enter),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::NONE,
+            None,
+            false,
+            disambiguate,
+        );
+        assert_eq!(legacy_enter.as_deref(), Some(&b"\r"[..]));
+
+        let ctrl_super = encode_key(
+            &keyboard::Key::Character("a".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::LOGO,
+            None,
+            false,
+            disambiguate,
+        );
+        assert_eq!(ctrl_super.as_deref(), Some(&b"\x1b[97;13u"[..]));
+    }
+
+    #[test]
+    fn modify_other_keys_handles_shifted_text_and_level_three() {
+        let shifted_symbol = encode_key(
+            &keyboard::Key::Character("1".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::SHIFT,
+            Some("!"),
+            false,
+            KeyboardEnhancements {
+                modify_other_keys: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(shifted_symbol.as_deref(), Some(&b"\x1b[27;2;33~"[..]));
+
+        let shifted_tab = encode_key(
+            &keyboard::Key::Named(Named::Tab),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::SHIFT,
+            None,
+            false,
+            KeyboardEnhancements {
+                modify_other_keys: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(shifted_tab.as_deref(), Some(&b"\x1b[27;2;9~"[..]));
+
+        let unmodified_level_three = encode_key(
+            &keyboard::Key::Character("x".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::NONE,
+            Some("x"),
+            false,
+            KeyboardEnhancements {
+                modify_other_keys: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            unmodified_level_three.as_deref(),
+            Some(&b"\x1b[27;1;120~"[..])
+        );
     }
 
     #[test]

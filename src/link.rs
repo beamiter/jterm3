@@ -1,6 +1,7 @@
 /// 链接检测和交互模块
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// OSC 8 超链接（从 ANSI 转义序列解析）
 /// Will be integrated in Phase 3
@@ -117,9 +118,12 @@ impl LinkDetector {
             r"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b"
         ).unwrap();
 
-        // 文件路径正则：以 / 开头或 ./ ../，或包含路径分隔符的文本
+        // File paths: absolute, ~/..., ./..., ../..., and the relative paths
+        // commonly printed by compilers (`src/main.rs:42:7`). A colon is
+        // excluded from the first relative component so URL schemes are not
+        // reclassified as file paths.
         let file_path_regex = Regex::new(
-            r"(?:^|[\s])(?:(?:/[^\s<>\[\]{}|\\^`()]*)|(?:\./[^\s<>\[\]{}|\\^`()]*)|(?:\.\./[^\s<>\[\]{}|\\^`()]*))"
+            r"(?:^|\s)(?:(?:/|\./|\.\./|~/)[^\s<>\[\]{}|\\^`()]*|[^/:\s<>\[\]{}|\\^`()]+(?:/[^/\s<>\[\]{}|\\^`()]+)+)"
         ).unwrap();
 
         Self {
@@ -186,7 +190,10 @@ impl LinkDetector {
         if self.config.detect_file_paths {
             for mat in self.file_path_regex.find_iter(line) {
                 let raw = mat.as_str();
-                let matched_text = raw.trim();
+                let matched_text = raw.trim().trim_end_matches([',', ';', '!', '?']);
+                if matched_text.is_empty() {
+                    continue;
+                }
                 // The regex captures a leading `^|\s` boundary; skip it so the
                 // highlight columns cover only the path, not the preceding space.
                 let lead_ws = raw.len() - raw.trim_start().len();
@@ -219,19 +226,23 @@ impl LinkDetector {
     fn is_valid_file_path(text: &str) -> bool {
         let trimmed = text.trim();
 
-        if trimmed.is_empty() || matches!(trimmed, "/" | "//" | "./" | "../") {
+        if trimmed.is_empty() || matches!(trimmed, "/" | "//" | "./" | "../" | "~/") {
             return false;
         }
 
-        if trimmed.chars().all(|ch| matches!(ch, '/' | '.')) {
+        if trimmed.starts_with("//")
+            || trimmed.contains("://")
+            || trimmed.chars().all(|ch| matches!(ch, '/' | '.'))
+        {
             return false;
         }
 
-        // 必须以 / 或 ./ 或 ../ 开头
+        // Must be rooted explicitly or contain at least one relative separator.
         trimmed.starts_with('/')
             || trimmed.starts_with("./")
             || trimmed.starts_with("../")
-            || (!trimmed.is_empty() && trimmed.chars().next().unwrap().is_alphabetic())
+            || trimmed.starts_with("~/")
+            || trimmed.contains('/')
     }
 
     /// 在整个网格中检测链接（带缓存）
@@ -338,13 +349,13 @@ impl LinkDetector {
 }
 
 /// 打开链接
-pub fn open_link(link: &Link) -> Result<(), Box<dyn std::error::Error>> {
+pub fn open_link(link: &Link, cwd: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
     match link.link_type {
         LinkType::Url => {
             open_url(&link.text)?;
         }
         LinkType::FilePath => {
-            open_file_path(&link.text)?;
+            open_file_path(&link.text, cwd)?;
         }
         LinkType::IpAddress => {
             // IP 地址可以用浏览器打开或显示 whois 信息
@@ -377,8 +388,8 @@ fn open_url(url: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 /// 打开文件路径（使用系统默认应用）
 #[cfg(target_os = "linux")]
-fn open_file_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let expanded_path = expand_path(path);
+fn open_file_path(path: &str, cwd: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+    let expanded_path = resolve_existing_file_path(path, cwd)?;
 
     std::process::Command::new("xdg-open")
         .arg(&expanded_path)
@@ -387,8 +398,8 @@ fn open_file_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(target_os = "macos")]
-fn open_file_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let expanded_path = expand_path(path);
+fn open_file_path(path: &str, cwd: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+    let expanded_path = resolve_existing_file_path(path, cwd)?;
     std::process::Command::new("open")
         .arg(&expanded_path)
         .spawn()?;
@@ -396,22 +407,71 @@ fn open_file_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(target_os = "windows")]
-fn open_file_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let expanded_path = expand_path(path);
+fn open_file_path(path: &str, cwd: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+    let expanded_path = resolve_existing_file_path(path, cwd)?;
     std::process::Command::new("explorer")
         .arg(&expanded_path)
         .spawn()?;
     Ok(())
 }
 
-/// 扩展路径（~/ 变量替换等）
-fn expand_path(path: &str) -> String {
-    if path.starts_with("~/") {
+/// Expand a leading `~/` without invoking a shell.
+fn expand_path(path: &str) -> PathBuf {
+    if let Some(relative) = path.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
-            return format!("{}{}", home.display(), &path[1..]);
+            return home.join(relative);
         }
     }
-    path.to_string()
+    PathBuf::from(path)
+}
+
+/// Drop a conventional compiler/editor source location (`:line` or
+/// `:line:column`) while leaving arbitrary colons alone.
+fn strip_source_location(path: &str) -> Option<&str> {
+    let (without_last, last) = path.rsplit_once(':')?;
+    if last.is_empty() || !last.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if let Some((without_line, line)) = without_last.rsplit_once(':') {
+        if !line.is_empty() && line.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Some(without_line);
+        }
+    }
+    Some(without_last)
+}
+
+fn absolutize_file_path(path: PathBuf, cwd: Option<&Path>) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else if let Some(cwd) = cwd {
+        cwd.join(path)
+    } else {
+        path
+    }
+}
+
+/// Resolve a link exactly as displayed first. If that path does not exist,
+/// retry after removing a trailing source location. Relative paths are scoped
+/// to the focused terminal's cwd instead of jterm3's launcher directory.
+fn resolve_existing_file_path(
+    path: &str,
+    cwd: Option<&Path>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let exact = absolutize_file_path(expand_path(path), cwd);
+    if exact.exists() {
+        return Ok(exact);
+    }
+    if let Some(source_path) = strip_source_location(path) {
+        let source = absolutize_file_path(expand_path(source_path), cwd);
+        if source.exists() {
+            return Ok(source);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("file link does not exist: {}", exact.display()),
+    )
+    .into())
 }
 
 /// 复制链接到剪贴板
@@ -492,6 +552,52 @@ mod tests {
         let links = detector.detect_links_in_line(line, 0);
 
         assert!(links.iter().any(|l| l.link_type == LinkType::FilePath));
+    }
+
+    #[test]
+    fn detects_relative_and_home_file_paths_without_reclassifying_urls() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let line = "at src/main.rs:42:7 and ~/notes/todo.md; see https://example.com/a/b";
+        let links = detector.detect_links_in_line(line, 0);
+        let files: Vec<&str> = links
+            .iter()
+            .filter(|link| link.link_type == LinkType::FilePath)
+            .map(|link| link.text.as_str())
+            .collect();
+
+        assert_eq!(files, ["src/main.rs:42:7", "~/notes/todo.md"]);
+        assert_eq!(
+            links
+                .iter()
+                .filter(|link| link.link_type == LinkType::Url)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn source_locations_resolve_against_the_terminal_cwd() {
+        let unique = format!(
+            "jterm3-link-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after the Unix epoch")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let source_dir = root.join("src");
+        std::fs::create_dir_all(&source_dir).expect("create test source directory");
+        let source = source_dir.join("main.rs");
+        std::fs::write(&source, "fn main() {}\n").expect("write test source");
+
+        let resolved = resolve_existing_file_path("src/main.rs:42:7", Some(&root))
+            .expect("source location should resolve");
+        assert_eq!(resolved, source);
+        assert_eq!(strip_source_location("notes:today"), None);
+        assert_eq!(strip_source_location("src/main.rs:42"), Some("src/main.rs"));
+
+        std::fs::remove_dir_all(root).expect("remove test directory");
     }
 
     #[test]
