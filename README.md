@@ -4,7 +4,7 @@ jterm3 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 w
 
 ## 主要能力
 
-- 多标签、拖动排序、快速标签切换，以及横向/纵向双分屏
+- 多标签、拖动排序、快速标签切换，以及 tmux 风格的树状分屏（任意 pane 可再沿任一方向嵌套拆分）
 - 搜索当前屏幕与全部 scrollback，支持大小写匹配、正则和自动滚动定位
 - UTF-8、中文宽字符、True Color、256 色、鼠标报告、括号粘贴和扩展键盘协议
 - Kitty 图像直接传输（PNG、RGB、RGBA），带传输、像素、解压内存和放置数量上限
@@ -49,9 +49,9 @@ install -Dm755 target/release/jterm3 "$HOME/.local/bin/jterm3"
 | 命令面板 | `Ctrl+Shift+P` |
 | 快速切换标签 | `Ctrl+Shift+L` |
 | 标签 1–8 / 最后一个 | `Ctrl+1`…`Ctrl+8` / `Ctrl+9` |
-| 左右 / 上下分屏 | `Ctrl+Shift+E` / `Ctrl+Shift+D`（同向再按继续加 pane，最多 6 个；异向切换排列方向） |
-| 方向聚焦 Pane | `Ctrl+Alt+方向键`（边缘不回绕） |
-| 调整 Pane 大小 | `Ctrl+Alt+Shift+方向键`（双击分割线全部均分） |
+| 左右 / 上下分屏 | `Ctrl+Shift+E` / `Ctrl+Shift+D`（拆分聚焦 pane；同向并入同级，异向嵌套子分屏，最多 12 个 pane） |
+| 方向聚焦 Pane | `Ctrl+Alt+方向键`（按几何位置跨嵌套跳转，边缘不回绕） |
+| 调整 Pane 大小 | `Ctrl+Alt+Shift+方向键`（双击分割线均分该节点） |
 | Pane 缩放（临时全屏） | `Ctrl+Shift+Z` |
 | 交换相邻 Pane | `Ctrl+Shift+X` |
 | 关闭聚焦 Pane | `Ctrl+Shift+W`（其余 pane 保持分屏） |

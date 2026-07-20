@@ -25,6 +25,23 @@ pub struct SplitSnapshot {
     pub focused: usize,
 }
 
+/// tmux 风格的递归分屏布局快照。`Leaf` 显示一个会话;`Split` 沿某轴划分若干
+/// 子节点。旧的扁平 `SplitSnapshot` 仍可读取(见 `split` 字段),但新布局写入
+/// 此字段以支持任意嵌套。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum PaneTreeSnapshot {
+    /// 叶子:指向 `sessions` 的会话索引。
+    Leaf { session: usize },
+    /// 分裂:`axis` 为 "vertical"(左右)或 "horizontal"(上下)。
+    Split {
+        axis: String,
+        #[serde(default)]
+        ratios: Vec<f32>,
+        children: Vec<PaneTreeSnapshot>,
+    },
+}
+
 /// 会话列表快照。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionsSnapshot {
@@ -32,22 +49,26 @@ pub struct SessionsSnapshot {
     pub sessions: Vec<SessionSnapshot>,
     #[serde(default)]
     pub active_index: Option<usize>,
-    /// 分屏布局;`None` 表示单 pane。旧快照缺省为 `None`,向后兼容。
+    /// 旧的扁平分屏布局(单轴)。仅用于读取旧快照,新快照不再写入。
     #[serde(default)]
     pub split: Option<SplitSnapshot>,
+    /// 递归分屏布局树;`None` 表示单 pane。旧快照缺省为 `None`,向后兼容。
+    #[serde(default)]
+    pub tree: Option<PaneTreeSnapshot>,
 }
 
 impl SessionsSnapshot {
     pub fn new(
         sessions: Vec<SessionSnapshot>,
         active_index: Option<usize>,
-        split: Option<SplitSnapshot>,
+        tree: Option<PaneTreeSnapshot>,
     ) -> Self {
         SessionsSnapshot {
             version: 1,
             sessions,
             active_index,
-            split,
+            split: None,
+            tree,
         }
     }
 
@@ -130,7 +151,8 @@ mod tests {
     }
 
     #[test]
-    fn split_layout_round_trips_through_json() {
+    fn tree_layout_round_trips_through_json() {
+        // V[ 0, H[2, 1] ] — a genuinely nested tmux-style layout.
         let snap = SessionsSnapshot::new(
             vec![
                 SessionSnapshot { cwd: None },
@@ -138,33 +160,44 @@ mod tests {
                 SessionSnapshot { cwd: None },
             ],
             Some(1),
-            Some(SplitSnapshot {
-                mode: "horizontal".to_string(),
-                ratios: vec![0.5, 0.3, 0.2],
-                panes: vec![0, 2, 1],
-                focused: 1,
+            Some(PaneTreeSnapshot::Split {
+                axis: "vertical".to_string(),
+                ratios: vec![0.6, 0.4],
+                children: vec![
+                    PaneTreeSnapshot::Leaf { session: 0 },
+                    PaneTreeSnapshot::Split {
+                        axis: "horizontal".to_string(),
+                        ratios: vec![0.5, 0.5],
+                        children: vec![
+                            PaneTreeSnapshot::Leaf { session: 2 },
+                            PaneTreeSnapshot::Leaf { session: 1 },
+                        ],
+                    },
+                ],
             }),
         );
         let json = snap.to_json().unwrap();
         let back: SessionsSnapshot = serde_json::from_str(&json).unwrap();
-        let split = back.split.unwrap();
-        assert_eq!(split.mode, "horizontal");
-        assert_eq!(split.panes, vec![0, 2, 1]);
-        assert_eq!(split.focused, 1);
-        assert_eq!(split.ratios, vec![0.5, 0.3, 0.2]);
+        let PaneTreeSnapshot::Split { axis, children, .. } = back.tree.unwrap() else {
+            panic!("expected a split at the root");
+        };
+        assert_eq!(axis, "vertical");
+        assert_eq!(children.len(), 2);
+        assert!(matches!(children[0], PaneTreeSnapshot::Leaf { session: 0 }));
+        assert!(matches!(children[1], PaneTreeSnapshot::Split { .. }));
     }
 
     #[test]
-    fn split_snapshots_with_legacy_scalar_ratio_still_deserialize() {
-        // Written by the short-lived two-pane format: `ratio` instead of
-        // `ratios`. The unknown field is ignored and ratios comes back empty,
-        // which the restore path treats as "equalize".
+    fn legacy_flat_split_field_still_deserializes() {
+        // Old jterm3 snapshots stored a single-axis `split` and no `tree`. Both
+        // fields must round-trip so the restore path can fall back to `split`.
         let legacy = r#"{"version":1,"sessions":[{"cwd":null},{"cwd":null}],
             "active_index":0,
-            "split":{"mode":"vertical","ratio":0.35,"panes":[0,1],"focused":0}}"#;
+            "split":{"mode":"vertical","ratios":[0.35,0.65],"panes":[0,1],"focused":0}}"#;
         let snap: SessionsSnapshot = serde_json::from_str(legacy).unwrap();
+        assert!(snap.tree.is_none());
         let split = snap.split.unwrap();
-        assert!(split.ratios.is_empty());
         assert_eq!(split.panes, vec![0, 1]);
+        assert_eq!(split.mode, "vertical");
     }
 }

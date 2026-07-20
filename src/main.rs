@@ -41,8 +41,8 @@ const SIDEBAR_W_MIN: f32 = 120.0;
 const SIDEBAR_W_MAX: f32 = 500.0;
 /// Thickness of the divider drawn between split panes (also its drag hit area).
 const DIVIDER: f32 = 6.0;
-/// Maximum panes in a split (all along one axis).
-const MAX_PANES: usize = 6;
+/// Maximum total leaves (panes) across the whole layout tree; a PTY guard.
+const MAX_PANES: usize = 12;
 /// Minimum share of the split axis a single pane may occupy.
 const PANE_RATIO_MIN: f32 = 0.1;
 const SPLIT_RATIO_KEY_STEP: f32 = 0.05;
@@ -109,16 +109,189 @@ enum SidebarPanel {
     Tabs,
 }
 
-/// How the active view is split into panes: a single pane, or up to
-/// [`MAX_PANES`] panes laid out along one axis.
+/// The axis a split node divides its children along.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SplitMode {
-    /// A single pane filling the terminal area.
-    Single,
-    /// Panes side by side (left | right).
+enum Axis {
+    /// Children side by side (left | right), laid out in a `Row`, split along x.
     Vertical,
-    /// Panes stacked (top / bottom).
+    /// Children stacked (top / bottom), laid out in a `Column`, split along y.
     Horizontal,
+}
+
+/// tmux-style recursive pane layout. A `Leaf` shows one session; a `Split`
+/// divides the area among two or more children along one [`Axis`], each taking
+/// its aligned share of `ratios` (which sums to ~1). Nesting a `Split` inside a
+/// `Split` of the other axis is how arbitrary tiled layouts are built.
+#[derive(Debug, Clone, PartialEq)]
+enum PaneTree {
+    /// A single pane holding `sessions[usize]`.
+    Leaf(usize),
+    /// Two or more children arranged along `axis`.
+    Split {
+        axis: Axis,
+        children: Vec<PaneTree>,
+        ratios: Vec<f32>,
+    },
+}
+
+/// Identifies one divider: the child-index `path` from the root to the owning
+/// `Split` node, plus which `gap` (between children `gap` and `gap + 1`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DividerId {
+    path: Vec<usize>,
+    gap: usize,
+}
+
+impl PaneTree {
+    fn is_leaf(&self) -> bool {
+        matches!(self, PaneTree::Leaf(_))
+    }
+
+    /// Collect leaf session indices in depth-first (render) order.
+    fn collect_leaves(&self, out: &mut Vec<usize>) {
+        match self {
+            PaneTree::Leaf(s) => out.push(*s),
+            PaneTree::Split { children, .. } => {
+                for c in children {
+                    c.collect_leaves(out);
+                }
+            }
+        }
+    }
+
+    fn leaves(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        self.collect_leaves(&mut out);
+        out
+    }
+
+    fn leaf_count(&self) -> usize {
+        match self {
+            PaneTree::Leaf(_) => 1,
+            PaneTree::Split { children, .. } => children.iter().map(PaneTree::leaf_count).sum(),
+        }
+    }
+
+    fn contains_session(&self, session: usize) -> bool {
+        match self {
+            PaneTree::Leaf(s) => *s == session,
+            PaneTree::Split { children, .. } => {
+                children.iter().any(|c| c.contains_session(session))
+            }
+        }
+    }
+
+    /// Rewrite every leaf's session index (used after the `sessions` Vec shifts).
+    fn remap_sessions(&mut self, f: &dyn Fn(usize) -> usize) {
+        match self {
+            PaneTree::Leaf(s) => *s = f(*s),
+            PaneTree::Split { children, .. } => {
+                for c in children.iter_mut() {
+                    c.remap_sessions(f);
+                }
+            }
+        }
+    }
+
+    /// Child-index path from the root to the leaf showing `session`.
+    fn path_to_session(&self, session: usize) -> Option<Vec<usize>> {
+        fn walk(node: &PaneTree, session: usize, acc: &mut Vec<usize>) -> bool {
+            match node {
+                PaneTree::Leaf(s) => *s == session,
+                PaneTree::Split { children, .. } => {
+                    for (i, c) in children.iter().enumerate() {
+                        acc.push(i);
+                        if walk(c, session, acc) {
+                            return true;
+                        }
+                        acc.pop();
+                    }
+                    false
+                }
+            }
+        }
+        let mut acc = Vec::new();
+        walk(self, session, &mut acc).then_some(acc)
+    }
+
+    fn node_at_path_mut(&mut self, path: &[usize]) -> Option<&mut PaneTree> {
+        let mut node = self;
+        for &i in path {
+            match node {
+                PaneTree::Split { children, .. } => node = children.get_mut(i)?,
+                PaneTree::Leaf(_) => return None,
+            }
+        }
+        Some(node)
+    }
+
+    /// Split the leaf showing `target` along `axis`, inserting a new leaf for
+    /// `new`. Matches tmux: if the leaf's parent already splits along `axis` the
+    /// new pane joins as a sibling; otherwise the leaf is replaced by a fresh
+    /// two-child split of the requested axis. Returns whether the target existed.
+    fn split_leaf(&mut self, target: usize, axis: Axis, new: usize) -> bool {
+        match self {
+            PaneTree::Leaf(s) => {
+                if *s == target {
+                    *self = PaneTree::Split {
+                        axis,
+                        children: vec![PaneTree::Leaf(target), PaneTree::Leaf(new)],
+                        ratios: vec![0.5, 0.5],
+                    };
+                    true
+                } else {
+                    false
+                }
+            }
+            PaneTree::Split {
+                axis: node_axis,
+                children,
+                ratios,
+            } => {
+                if *node_axis == axis {
+                    if let Some(i) = children
+                        .iter()
+                        .position(|c| matches!(c, PaneTree::Leaf(s) if *s == target))
+                    {
+                        children.insert(i + 1, PaneTree::Leaf(new));
+                        insert_pane_share(ratios, i);
+                        return true;
+                    }
+                }
+                children.iter_mut().any(|c| c.split_leaf(target, axis, new))
+            }
+        }
+    }
+
+    /// Remove the leaf showing `target`, folding its share into a sibling and
+    /// collapsing any split left with a single child. Returns whether it was
+    /// found. The root leaf itself is never removed here (the caller handles the
+    /// last pane).
+    fn remove_leaf(&mut self, target: usize) -> bool {
+        let PaneTree::Split {
+            children, ratios, ..
+        } = self
+        else {
+            return false;
+        };
+        if let Some(i) = children
+            .iter()
+            .position(|c| matches!(c, PaneTree::Leaf(s) if *s == target))
+        {
+            children.remove(i);
+            remove_pane_share(ratios, i);
+            if children.len() == 1 {
+                *self = children.pop().unwrap();
+            }
+            return true;
+        }
+        for c in children.iter_mut() {
+            if c.remove_leaf(target) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +300,21 @@ enum PaneDirection {
     Right,
     Up,
     Down,
+}
+
+impl PaneDirection {
+    /// The split axis a directional command operates on.
+    fn axis(self) -> Axis {
+        match self {
+            PaneDirection::Left | PaneDirection::Right => Axis::Vertical,
+            PaneDirection::Up | PaneDirection::Down => Axis::Horizontal,
+        }
+    }
+
+    /// Whether the direction points toward higher coordinates / later siblings.
+    fn forward(self) -> bool {
+        matches!(self, PaneDirection::Right | PaneDirection::Down)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,56 +344,6 @@ fn chrome_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Optio
         'l' => Some(ChromeShortcut::TabSwitcher),
         _ => None,
     }
-}
-
-/// Whether an arrow moves toward higher pane positions along the split axis.
-/// `None` for arrows perpendicular to the axis, which deliberately do nothing.
-fn direction_along_axis(split_mode: SplitMode, direction: PaneDirection) -> Option<bool> {
-    match (split_mode, direction) {
-        (SplitMode::Vertical, PaneDirection::Left) | (SplitMode::Horizontal, PaneDirection::Up) => {
-            Some(false)
-        }
-        (SplitMode::Vertical, PaneDirection::Right)
-        | (SplitMode::Horizontal, PaneDirection::Down) => Some(true),
-        _ => None,
-    }
-}
-
-/// Return the adjacent pane in a physical direction (no wrap at the edges).
-fn directional_pane_target(
-    split_mode: SplitMode,
-    focused_pane: usize,
-    pane_count: usize,
-    direction: PaneDirection,
-) -> Option<usize> {
-    let forward = direction_along_axis(split_mode, direction)?;
-    if forward {
-        (focused_pane + 1 < pane_count).then(|| focused_pane + 1)
-    } else {
-        focused_pane.checked_sub(1)
-    }
-}
-
-/// The divider a resize arrow moves for the focused pane: the one on the
-/// arrow's side when it exists, else the pane's other divider — so the arrow
-/// always drags a divider in its own direction. Divider `d` sits between panes
-/// `d` and `d + 1`.
-fn resize_divider_target(
-    split_mode: SplitMode,
-    focused_pane: usize,
-    pane_count: usize,
-    direction: PaneDirection,
-) -> Option<usize> {
-    if pane_count < 2 {
-        return None;
-    }
-    let forward = direction_along_axis(split_mode, direction)?;
-    let divider = if forward {
-        focused_pane.min(pane_count - 2)
-    } else {
-        focused_pane.saturating_sub(1)
-    };
-    Some(divider)
 }
 
 /// Set pane `d`'s share of the pair it forms with pane `d + 1`, keeping the
@@ -262,8 +400,233 @@ fn equalize_shares(ratios: &mut [f32]) {
     }
 }
 
+/// One leaf's session index and the pixel rectangle it occupies.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PaneRect {
+    session: usize,
+    rect: iced::Rectangle,
+}
+
+/// Subdivide `rect` across the tree, pushing each leaf's rectangle in
+/// depth-first (render/mouse) order. `DIVIDER` pixels are reserved between
+/// adjacent children, matching the widget tree the view builds.
+fn collect_pane_rects(node: &PaneTree, rect: iced::Rectangle, out: &mut Vec<PaneRect>) {
+    match node {
+        PaneTree::Leaf(session) => out.push(PaneRect {
+            session: *session,
+            rect,
+        }),
+        PaneTree::Split {
+            axis,
+            children,
+            ratios,
+        } => {
+            let n = children.len().max(1);
+            let gaps = DIVIDER * n.saturating_sub(1) as f32;
+            let even = 1.0 / n as f32;
+            match axis {
+                Axis::Vertical => {
+                    let avail = (rect.width - gaps).max(0.0);
+                    let mut x = rect.x;
+                    for (i, child) in children.iter().enumerate() {
+                        let w = avail * ratios.get(i).copied().unwrap_or(even);
+                        let child_rect = iced::Rectangle {
+                            x,
+                            y: rect.y,
+                            width: w,
+                            height: rect.height,
+                        };
+                        collect_pane_rects(child, child_rect, out);
+                        x += w + DIVIDER;
+                    }
+                }
+                Axis::Horizontal => {
+                    let avail = (rect.height - gaps).max(0.0);
+                    let mut y = rect.y;
+                    for (i, child) in children.iter().enumerate() {
+                        let h = avail * ratios.get(i).copied().unwrap_or(even);
+                        let child_rect = iced::Rectangle {
+                            x: rect.x,
+                            y,
+                            width: rect.width,
+                            height: h,
+                        };
+                        collect_pane_rects(child, child_rect, out);
+                        y += h + DIVIDER;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The axis and pixel rectangle of the split node reached by `path`, within an
+/// outer `root` rectangle. Used to convert a divider drag into a fraction of
+/// its own node's extent. Returns `None` if the path does not land on a `Split`.
+fn split_node_rect(
+    root: &PaneTree,
+    path: &[usize],
+    rect: iced::Rectangle,
+) -> Option<(Axis, iced::Rectangle)> {
+    match root {
+        PaneTree::Leaf(_) => None,
+        PaneTree::Split {
+            axis,
+            children,
+            ratios,
+        } => {
+            let Some((&head, tail)) = path.split_first() else {
+                return Some((*axis, rect));
+            };
+            let n = children.len().max(1);
+            let gaps = DIVIDER * n.saturating_sub(1) as f32;
+            let even = 1.0 / n as f32;
+            // Walk to child `head`, accumulating its offset along the axis.
+            let mut offset = 0.0;
+            for i in 0..head {
+                let share = ratios.get(i).copied().unwrap_or(even);
+                offset += match axis {
+                    Axis::Vertical => (rect.width - gaps).max(0.0) * share,
+                    Axis::Horizontal => (rect.height - gaps).max(0.0) * share,
+                } + DIVIDER;
+            }
+            let share = ratios.get(head).copied().unwrap_or(even);
+            let child_rect = match axis {
+                Axis::Vertical => iced::Rectangle {
+                    x: rect.x + offset,
+                    y: rect.y,
+                    width: (rect.width - gaps).max(0.0) * share,
+                    height: rect.height,
+                },
+                Axis::Horizontal => iced::Rectangle {
+                    x: rect.x,
+                    y: rect.y + offset,
+                    width: rect.width,
+                    height: (rect.height - gaps).max(0.0) * share,
+                },
+            };
+            split_node_rect(children.get(head)?, tail, child_rect)
+        }
+    }
+}
+
 fn last_session_index(session_count: usize) -> Option<usize> {
     session_count.checked_sub(1)
+}
+
+fn axis_from_str(s: &str) -> Option<Axis> {
+    match s {
+        "vertical" => Some(Axis::Vertical),
+        "horizontal" => Some(Axis::Horizontal),
+        _ => None,
+    }
+}
+
+fn axis_to_str(axis: Axis) -> &'static str {
+    match axis {
+        Axis::Vertical => "vertical",
+        Axis::Horizontal => "horizontal",
+    }
+}
+
+/// Serialize a live layout tree for session persistence.
+fn pane_tree_to_snapshot(tree: &PaneTree) -> session_persistence::PaneTreeSnapshot {
+    match tree {
+        PaneTree::Leaf(session) => session_persistence::PaneTreeSnapshot::Leaf { session: *session },
+        PaneTree::Split {
+            axis,
+            children,
+            ratios,
+        } => session_persistence::PaneTreeSnapshot::Split {
+            axis: axis_to_str(*axis).to_string(),
+            ratios: ratios.clone(),
+            children: children.iter().map(pane_tree_to_snapshot).collect(),
+        },
+    }
+}
+
+/// Rebuild a layout tree from an (untrusted) snapshot. Ratios are normalized,
+/// falling back to an even split when unusable; unknown axes or splits with
+/// fewer than two children are rejected. Session indices are validated by the
+/// caller against the restored session count.
+fn pane_tree_from_snapshot(snap: &session_persistence::PaneTreeSnapshot) -> Option<PaneTree> {
+    match snap {
+        session_persistence::PaneTreeSnapshot::Leaf { session } => Some(PaneTree::Leaf(*session)),
+        session_persistence::PaneTreeSnapshot::Split {
+            axis,
+            ratios,
+            children,
+        } => {
+            let axis = axis_from_str(axis)?;
+            if children.len() < 2 {
+                return None;
+            }
+            let kids = children
+                .iter()
+                .map(pane_tree_from_snapshot)
+                .collect::<Option<Vec<_>>>()?;
+            let n = kids.len();
+            let mut r = ratios.clone();
+            let sum: f32 = r.iter().sum();
+            let usable = r.len() == n
+                && r.iter().all(|x| x.is_finite() && *x > 0.0)
+                && sum > f32::EPSILON;
+            if usable {
+                for x in r.iter_mut() {
+                    *x /= sum;
+                }
+            } else {
+                r = vec![1.0 / n as f32; n];
+            }
+            Some(PaneTree::Split {
+                axis,
+                children: kids,
+                ratios: r,
+            })
+        }
+    }
+}
+
+/// Convert a legacy single-axis split snapshot into a depth-1 tree so older
+/// session files keep restoring their layout.
+fn pane_tree_from_legacy(split: &session_persistence::SplitSnapshot) -> Option<PaneTree> {
+    let axis = axis_from_str(&split.mode)?;
+    let n = split.panes.len();
+    if n < 2 {
+        return None;
+    }
+    let mut ratios = split.ratios.clone();
+    let sum: f32 = ratios.iter().sum();
+    let usable = ratios.len() == n
+        && ratios.iter().all(|x| x.is_finite() && *x > 0.0)
+        && sum > f32::EPSILON;
+    if usable {
+        for x in ratios.iter_mut() {
+            *x /= sum;
+        }
+    } else {
+        ratios = vec![1.0 / n as f32; n];
+    }
+    Some(PaneTree::Split {
+        axis,
+        children: split.panes.iter().map(|&s| PaneTree::Leaf(s)).collect(),
+        ratios,
+    })
+}
+
+/// Validate a candidate restored layout: every leaf session must be in range and
+/// appear at most once, and the total pane count must stay within `MAX_PANES`.
+fn valid_restored_layout(tree: &PaneTree, session_count: usize) -> bool {
+    let leaves = tree.leaves();
+    let n = leaves.len();
+    if !(2..=MAX_PANES).contains(&n) {
+        return false;
+    }
+    if leaves.iter().any(|&s| s >= session_count) {
+        return false;
+    }
+    let distinct = leaves.iter().collect::<std::collections::HashSet<_>>().len();
+    distinct == n
 }
 
 /// Linear blend between two colors (t=0 → a, t=1 → b); result is fully opaque.
@@ -335,7 +698,7 @@ enum Message {
     /// and committed text.
     Ime(iced::advanced::input_method::Event),
     ModifiersChanged(keyboard::Modifiers),
-    /// A mouse interaction within pane `usize` (index into `panes`).
+    /// A mouse interaction within the pane showing session `usize`.
     MousePane(usize, MouseInput),
     /// Clipboard result scoped to the stable session that requested the paste.
     Pasted(usize, Option<String>),
@@ -367,11 +730,11 @@ enum Message {
     SidebarDragEnd,
     SidebarToggleNode(std::path::PathBuf),
     SidebarInsertPath(std::path::PathBuf),
-    /// Press on the divider between panes `usize` and `usize + 1`.
-    DividerDragStart(usize),
+    /// Press on a divider (identified by its owning split node + gap).
+    DividerDragStart(DividerId),
     DividerDragMove(iced::Point),
     DividerDragEnd,
-    DividerHover(Option<usize>),
+    DividerHover(Option<DividerId>),
     SearchToggleRegex,
     SearchToggleCase,
     SearchInput(String),
@@ -813,13 +1176,10 @@ struct Jterm {
     /// to derive a throughput figure for profiling.
     last_ingest_us: u128,
     last_ingest_bytes: usize,
-    /// Current pane layout of the active view.
-    split_mode: SplitMode,
-    /// Session indices shown as panes (length 1 in `Single`, else 2..=MAX_PANES
-    /// along the split axis). Invariant: `panes[focused_pane] == active`.
-    panes: Vec<usize>,
-    /// Which pane currently has keyboard focus (index into `panes`).
-    focused_pane: usize,
+    /// tmux-style recursive pane layout of the active view. `Leaf(active)` when
+    /// unsplit. Invariant: the focused leaf is the one showing `active`, and
+    /// each session appears in at most one leaf.
+    layout: PaneTree,
     /// Active custom-theme editor overlay, or `None` when closed.
     theme_editor: Option<ThemeEditState>,
     /// File-tree sidebar (left panel) and whether it is currently shown.
@@ -831,18 +1191,13 @@ struct Jterm {
     dock_width: f32,
     /// Whether the sidebar-resize divider is being dragged.
     dragging_sidebar: bool,
-    /// Per-pane share of the split axis, aligned with `panes` (sums to ~1.0;
-    /// `vec![1.0]` when single). Adjusted by dragging a divider or with the
-    /// resize shortcuts.
-    pane_ratios: Vec<f32>,
-    /// Divider being dragged (between panes `d` and `d + 1`); the layout axis
-    /// is implied by `split_mode`.
-    dragging_divider: Option<usize>,
+    /// Divider being dragged, identified by its owning split node's path + gap.
+    dragging_divider: Option<DividerId>,
     /// Divider under the pointer (drives its hover highlight).
-    hovered_divider: Option<usize>,
-    /// Last divider press (time + divider index), for double-click detection
-    /// (double-click equalizes all panes).
-    last_divider_press: Option<(std::time::Instant, usize)>,
+    hovered_divider: Option<DividerId>,
+    /// Last divider press (time + divider id), for double-click detection
+    /// (double-click equalizes the panes of that divider's node).
+    last_divider_press: Option<(std::time::Instant, DividerId)>,
     /// Focused pane temporarily expanded to the full terminal area (tmux-style
     /// zoom). Only meaningful while split; cleared when the split collapses.
     pane_zoomed: bool,
@@ -904,7 +1259,7 @@ impl Jterm {
 
         // Restore prior tabs (their cwds + active index) when enabled and we are
         // the first instance; otherwise start with a single default session.
-        let (sessions, active, next_id, saved_split) =
+        let (sessions, active, next_id, saved_tree, saved_split) =
             Self::restore_or_spawn(&config, cols, rows, is_first_instance);
 
         // In Side mode the dock hosts the tab list and starts open (there is no
@@ -952,16 +1307,13 @@ impl Jterm {
             session_dirty: true,
             last_ingest_us: 0,
             last_ingest_bytes: 0,
-            split_mode: SplitMode::Single,
-            panes: vec![active],
-            focused_pane: 0,
+            layout: PaneTree::Leaf(active),
             theme_editor: None,
             sidebar: sidebar::Sidebar::new(),
             sidebar_open,
             sidebar_panel,
             dock_width: SIDEBAR_W,
             dragging_sidebar: false,
-            pane_ratios: vec![1.0],
             dragging_divider: None,
             hovered_divider: None,
             last_divider_press: None,
@@ -978,48 +1330,24 @@ impl Jterm {
             _instance_lock: instance_lock,
             is_first_instance,
         };
-        // Re-apply a saved split layout once the sessions exist. The snapshot is
-        // external input, so every index is validated before use.
-        if let Some(split) = saved_split {
-            let mode = match split.mode.as_str() {
-                "vertical" => Some(SplitMode::Vertical),
-                "horizontal" => Some(SplitMode::Horizontal),
-                _ => None,
-            };
-            if let Some(mode) = mode {
-                let n = split.panes.len();
-                let distinct = split
-                    .panes
-                    .iter()
-                    .collect::<std::collections::HashSet<_>>()
-                    .len()
-                    == n;
-                let valid = (2..=MAX_PANES).contains(&n)
-                    && distinct
-                    && split.panes.iter().all(|&p| p < app.sessions.len())
-                    && split.focused < n;
-                if valid {
-                    // Saved shares are used when they still line up and are
-                    // sane; anything odd falls back to an even split.
-                    let sum: f32 = split.ratios.iter().sum();
-                    let mut ratios = split.ratios;
-                    let usable = ratios.len() == n
-                        && ratios.iter().all(|r| r.is_finite() && *r > 0.0)
-                        && sum > f32::EPSILON;
-                    if usable {
-                        for r in ratios.iter_mut() {
-                            *r /= sum;
-                        }
-                    } else {
-                        ratios = vec![1.0 / n as f32; n];
+        // Re-apply a saved layout once the sessions exist. The snapshot is
+        // external input, so every index is validated before use. The recursive
+        // `tree` is preferred; a legacy single-axis `split` is the fallback.
+        let restored = saved_tree
+            .as_ref()
+            .and_then(pane_tree_from_snapshot)
+            .or_else(|| saved_split.as_ref().and_then(pane_tree_from_legacy));
+        if let Some(tree) = restored {
+            if valid_restored_layout(&tree, app.sessions.len()) {
+                // Keep focus on the saved active session when it is on screen;
+                // otherwise fall back to the first leaf.
+                if !tree.contains_session(app.active) {
+                    if let Some(&first) = tree.leaves().first() {
+                        app.active = first;
                     }
-                    app.split_mode = mode;
-                    app.pane_ratios = ratios;
-                    app.panes = split.panes;
-                    app.focused_pane = split.focused;
-                    app.active = app.panes[app.focused_pane];
-                    app.relayout();
                 }
+                app.layout = tree;
+                app.relayout();
             }
         }
         (app, Task::none())
@@ -1236,12 +1564,13 @@ impl Jterm {
         Vec<Session>,
         usize,
         usize,
+        Option<session_persistence::PaneTreeSnapshot>,
         Option<session_persistence::SplitSnapshot>,
     ) {
         let default = |id_start: usize| {
             let s =
                 Session::spawn(config, id_start, cols, rows, None).expect("failed to spawn PTY");
-            (vec![s], 0usize, id_start + 1, None)
+            (vec![s], 0usize, id_start + 1, None, None)
         };
         if !config.restore_session || !is_first_instance {
             return default(0);
@@ -1277,7 +1606,7 @@ impl Jterm {
             sessions.len(),
             path.display()
         );
-        (sessions, active, next_id, snapshot.split)
+        (sessions, active, next_id, snapshot.tree, snapshot.split)
     }
 
     /// Persist the current tabs (live cwd of each + active index) when enabled.
@@ -1295,18 +1624,8 @@ impl Jterm {
             .map(|s| session_persistence::SessionSnapshot { cwd: s.cwd() })
             .collect();
         // Persist the split layout so a restart restores the same pane view.
-        let split = (self.split_mode != SplitMode::Single && self.panes.len() >= 2).then(|| {
-            session_persistence::SplitSnapshot {
-                mode: match self.split_mode {
-                    SplitMode::Horizontal => "horizontal".to_string(),
-                    _ => "vertical".to_string(),
-                },
-                ratios: self.pane_ratios.clone(),
-                panes: self.panes.clone(),
-                focused: self.focused_pane,
-            }
-        });
-        let snapshot = session_persistence::SessionsSnapshot::new(snaps, Some(self.active), split);
+        let tree = self.is_split().then(|| pane_tree_to_snapshot(&self.layout));
+        let snapshot = session_persistence::SessionsSnapshot::new(snaps, Some(self.active), tree);
         let Some(json) = snapshot.to_json() else {
             return;
         };
@@ -1362,58 +1681,48 @@ impl Jterm {
             self.tab_menu = None;
         }
         let _ = sess.pty.terminate();
-        if self.active >= self.sessions.len() {
-            self.active = self.sessions.len() - 1;
-        } else if index < self.active {
-            self.active -= 1;
-        }
-        self.prune_closed_pane(index);
+        // `prune_closed_pane` is authoritative for `active` (it must pick a
+        // neighbor leaf when the focused pane's session is the one closing).
+        let old_active = self.active;
+        self.prune_closed_pane(index, old_active);
         self.refresh_active_context();
         self.save_session_snapshot();
         Task::none()
     }
 
-    /// Reconcile the split after `sessions[index]` was removed: drop its pane
-    /// (folding the freed share into a neighbor) and shift the remaining pane
-    /// indices. The split survives while two panes remain; closing a session
-    /// that is not on screen leaves the layout untouched.
-    fn prune_closed_pane(&mut self, index: usize) {
-        if self.split_mode == SplitMode::Single {
-            self.panes = vec![self.active];
-            self.pane_ratios = vec![1.0];
-            self.focused_pane = 0;
-            return;
-        }
-        if let Some(pos) = self.panes.iter().position(|&p| p == index) {
-            self.panes.remove(pos);
-            remove_pane_share(&mut self.pane_ratios, pos);
-            if self.focused_pane > pos {
-                self.focused_pane -= 1;
-            } else if self.focused_pane == pos {
-                // Focus follows the freed space into the preceding pane.
-                self.focused_pane = pos.saturating_sub(1);
+    /// Reconcile the layout after `sessions[index]` was removed (in old index
+    /// space): drop its leaf (folding its share into a neighbor and collapsing
+    /// any split left with one child), shift the remaining leaf indices down,
+    /// and pick a new focus. When the removed pane held keyboard focus, focus
+    /// follows the freed space into the preceding leaf. `old_active` is the
+    /// focused session before removal.
+    fn prune_closed_pane(&mut self, index: usize, old_active: usize) {
+        // Neighbor of the focused leaf, computed in old index space before the
+        // tree mutates (previous leaf in render order, else the next).
+        let leaves = self.layout.leaves();
+        let removed_was_focused = old_active == index;
+        let on_screen = self.layout.remove_leaf(index);
+        let mut new_active = if removed_was_focused && on_screen {
+            let pos = leaves.iter().position(|&s| s == index).unwrap_or(0);
+            if pos > 0 {
+                leaves[pos - 1]
+            } else {
+                leaves.get(1).copied().unwrap_or(old_active)
             }
-        }
-        for p in self.panes.iter_mut() {
-            if *p > index {
-                *p -= 1;
-            }
-        }
-        if self.panes.len() < 2 {
-            // The last surviving pane becomes the plain single view.
-            if let Some(&survivor) = self.panes.first() {
-                self.active = survivor;
-            }
-            self.split_mode = SplitMode::Single;
-            self.panes = vec![self.active];
-            self.pane_ratios = vec![1.0];
-            self.focused_pane = 0;
+        } else {
+            old_active
+        };
+        // Shift indices above the removed slot down by one (sessions Vec shrank).
+        let remap = |s: usize| if s > index { s - 1 } else { s };
+        self.layout.remap_sessions(&remap);
+        new_active = remap(new_active).min(self.sessions.len().saturating_sub(1));
+        self.active = new_active;
+        if !self.is_split() {
+            // Back to a single pane showing the focused session.
+            self.layout = PaneTree::Leaf(self.active);
             self.pane_zoomed = false;
             self.hovered_divider = None;
             self.dragging_divider = None;
-        } else {
-            self.focused_pane = self.focused_pane.min(self.panes.len() - 1);
-            self.active = self.panes[self.focused_pane];
         }
         self.relayout();
     }
@@ -1451,9 +1760,8 @@ impl Jterm {
         let task = self.close_session(index);
         if let Some(id) = activate_after {
             if let Some(remaining) = self.sessions.iter().position(|session| session.id == id) {
-                if let Some(pos) = self.panes.iter().position(|&p| p == remaining) {
+                if self.layout.contains_session(remaining) {
                     // Target is still on screen: focus its pane, keep the split.
-                    self.focused_pane = pos;
                     self.active = remaining;
                 } else {
                     self.active = remaining;
@@ -1637,7 +1945,7 @@ impl Jterm {
     }
 
     /// Move `sessions[from]` to position `to`, shifting items between them.
-    /// `active` and any indices in `panes` are rewritten so the same tab stays
+    /// `active` and every leaf session index are rewritten so the same tab stays
     /// selected before/after the reorder.
     fn reorder_session(&mut self, from: usize, to: usize) {
         if from >= self.sessions.len() || to >= self.sessions.len() || from == to {
@@ -1656,40 +1964,43 @@ impl Jterm {
                 idx
             }
         };
-        self.active = remap(self.active);
-        for p in self.panes.iter_mut() {
-            *p = remap(*p);
-        }
+        let remap_ref: &dyn Fn(usize) -> usize = &remap;
+        self.active = remap_ref(self.active);
+        self.layout.remap_sessions(remap_ref);
         self.session_dirty = true;
         self.refresh_active_context();
         self.save_session_snapshot();
     }
 
-    /// Per-pane (cols, rows) for the current split mode and window size.
-    fn pane_grid(&self, pane_pos: usize) -> (usize, usize) {
-        let term_h = self.term_height();
-        let term_w = self.term_width();
-        let n = self.panes.len().max(1);
-        // Fraction of the available space this pane occupies.
-        let frac = self
-            .pane_ratios
-            .get(pane_pos)
-            .copied()
-            .unwrap_or(1.0 / n as f32);
-        let dividers = DIVIDER * n.saturating_sub(1) as f32;
-        match self.split_mode {
-            SplitMode::Single => (self.cols, self.rows),
-            SplitMode::Vertical => {
-                let pane_w = ((term_w - dividers) * frac).max(0.0);
-                self.metrics
-                    .grid_size((pane_w - terminal_view::SCROLLBAR_WIDTH).max(0.0), term_h)
-            }
-            SplitMode::Horizontal => {
-                let pane_h = ((term_h - dividers) * frac).max(0.0);
-                self.metrics
-                    .grid_size((term_w - terminal_view::SCROLLBAR_WIDTH).max(0.0), pane_h)
-            }
+    /// Whether the layout is currently split (more than one pane).
+    fn is_split(&self) -> bool {
+        !self.layout.is_leaf()
+    }
+
+    /// The whole terminal-area rectangle the pane tree is laid out within.
+    fn layout_area(&self) -> iced::Rectangle {
+        iced::Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: self.term_width(),
+            height: self.term_height(),
         }
+    }
+
+    /// Every leaf's session index and pixel rectangle, in render order.
+    fn pane_rects(&self) -> Vec<PaneRect> {
+        let mut out = Vec::new();
+        collect_pane_rects(&self.layout, self.layout_area(), &mut out);
+        out
+    }
+
+    /// The focused leaf's position in depth-first order (for status readouts).
+    fn focused_pane_pos(&self) -> usize {
+        self.layout
+            .leaves()
+            .iter()
+            .position(|&s| s == self.active)
+            .unwrap_or(0)
     }
 
     fn grid_pixel_size(&self, cols: usize, rows: usize) -> (u32, u32) {
@@ -1720,10 +2031,11 @@ impl Jterm {
     /// pane renders full-size and unzooming is a plain relayout.
     fn relayout(&mut self) {
         let mut targets = vec![(self.cols, self.rows); self.sessions.len()];
-        if self.split_mode != SplitMode::Single && !self.pane_zoomed {
-            for (position, index) in self.panes.iter().copied().enumerate() {
-                if index < targets.len() {
-                    targets[index] = self.pane_grid(position);
+        if self.is_split() && !self.pane_zoomed {
+            for pane in self.pane_rects() {
+                if pane.session < targets.len() {
+                    let w = (pane.rect.width - terminal_view::SCROLLBAR_WIDTH).max(0.0);
+                    targets[pane.session] = self.metrics.grid_size(w, pane.rect.height);
                 }
             }
         }
@@ -1742,37 +2054,22 @@ impl Jterm {
 
     /// Collapse back to a single pane showing the active session.
     fn unsplit(&mut self) {
+        let was_split = self.is_split();
         self.pane_zoomed = false;
         self.hovered_divider = None;
         self.dragging_divider = None;
-        if self.split_mode == SplitMode::Single {
-            self.panes = vec![self.active];
-            self.pane_ratios = vec![1.0];
-            self.focused_pane = 0;
-            return;
+        self.layout = PaneTree::Leaf(self.active);
+        if was_split {
+            self.relayout();
         }
-        self.split_mode = SplitMode::Single;
-        self.focused_pane = 0;
-        self.panes = vec![self.active];
-        self.pane_ratios = vec![1.0];
-        self.relayout();
     }
 
-    /// Add a pane: spawn a fresh session at the focused pane's cwd and insert
-    /// it beside that pane, halving its share. When already split the other
-    /// orientation re-flows the existing panes along the new axis instead.
-    /// Panes are closed individually (`close_focused_pane`), capped at
-    /// [`MAX_PANES`].
-    fn split(&mut self, mode: SplitMode) {
-        if self.split_mode != SplitMode::Single && self.split_mode != mode {
-            // Keep every session; just rotate the layout axis.
-            self.split_mode = mode;
-            self.relayout();
-            self.refresh_active_context();
-            self.save_session_snapshot();
-            return;
-        }
-        if self.panes.len() >= MAX_PANES {
+    /// Split the focused pane along `axis`, spawning a fresh session at its cwd
+    /// (tmux `split-window`). If the focused leaf's parent already splits along
+    /// `axis` the new pane joins as a sibling; otherwise the leaf becomes a
+    /// nested split. Capped at [`MAX_PANES`] total leaves as a PTY guard.
+    fn split(&mut self, axis: Axis) {
+        if self.layout.leaf_count() >= MAX_PANES {
             self.push_toast(
                 format!("Split limit reached ({MAX_PANES} panes)"),
                 ToastKind::Warning,
@@ -1790,16 +2087,7 @@ impl Jterm {
             self.next_id += 1;
             self.sessions.push(sess);
             let new_idx = self.sessions.len() - 1;
-            if self.split_mode == SplitMode::Single {
-                self.split_mode = mode;
-                self.panes = vec![self.active, new_idx];
-                self.pane_ratios = vec![0.5, 0.5];
-                self.focused_pane = 1;
-            } else {
-                insert_pane_share(&mut self.pane_ratios, self.focused_pane);
-                self.panes.insert(self.focused_pane + 1, new_idx);
-                self.focused_pane += 1;
-            }
+            self.layout.split_leaf(self.active, axis, new_idx);
             self.active = new_idx;
             // Splitting while zoomed lands in the new multi-pane layout.
             self.pane_zoomed = false;
@@ -1809,23 +2097,25 @@ impl Jterm {
         }
     }
 
-    /// Move keyboard focus to the next pane (wraps). No-op when not split.
+    /// Move keyboard focus to the next leaf in render order (wraps).
     fn focus_next_pane(&mut self) {
-        if self.split_mode == SplitMode::Single || self.panes.len() < 2 {
+        let leaves = self.layout.leaves();
+        if leaves.len() < 2 {
             return;
         }
-        self.focused_pane = (self.focused_pane + 1) % self.panes.len();
-        self.active = self.panes[self.focused_pane];
+        let pos = leaves.iter().position(|&s| s == self.active).unwrap_or(0);
+        self.active = leaves[(pos + 1) % leaves.len()];
         self.refresh_active_context();
     }
 
-    /// Move keyboard focus to the previous pane (wraps). No-op when not split.
+    /// Move keyboard focus to the previous leaf in render order (wraps).
     fn focus_prev_pane(&mut self) {
-        if self.split_mode == SplitMode::Single || self.panes.len() < 2 {
+        let leaves = self.layout.leaves();
+        if leaves.len() < 2 {
             return;
         }
-        self.focused_pane = (self.focused_pane + self.panes.len() - 1) % self.panes.len();
-        self.active = self.panes[self.focused_pane];
+        let pos = leaves.iter().position(|&s| s == self.active).unwrap_or(0);
+        self.active = leaves[(pos + leaves.len() - 1) % leaves.len()];
         self.refresh_active_context();
     }
 
@@ -1834,10 +2124,15 @@ impl Jterm {
     /// instead of appearing twice; the swapped-in/out sessions are re-sized for
     /// their new homes.
     fn show_session_in_focused_pane(&mut self, index: usize) {
-        if let Some(pos) = self.panes.iter().position(|&p| p == index) {
-            self.focused_pane = pos;
-        } else {
-            self.panes[self.focused_pane] = index;
+        if !self.layout.contains_session(index) {
+            // Replace the focused leaf's session in place.
+            if let Some(path) = self.layout.path_to_session(self.active) {
+                if let Some(PaneTree::Leaf(s)) = self.layout.node_at_path_mut(&path) {
+                    *s = index;
+                }
+            } else {
+                self.layout = PaneTree::Leaf(index);
+            }
         }
         self.active = index;
         self.session_dirty = true;
@@ -1845,48 +2140,108 @@ impl Jterm {
         self.refresh_active_context();
     }
 
+    /// Move keyboard focus to the pane physically adjacent in `direction`
+    /// (tmux-style spatial navigation across nesting). No wrap at the edges.
     fn focus_pane_direction(&mut self, direction: PaneDirection) {
-        let Some(target) = directional_pane_target(
-            self.split_mode,
-            self.focused_pane,
-            self.panes.len(),
-            direction,
-        ) else {
+        let rects = self.pane_rects();
+        let Some(cur) = rects.iter().find(|p| p.session == self.active).copied() else {
             return;
         };
-        self.focused_pane = target;
-        self.active = self.panes[target];
-        self.refresh_active_context();
+        let c = cur.rect;
+        let eps = 1.0;
+        let best = rects
+            .iter()
+            .filter(|p| p.session != self.active)
+            .filter_map(|p| {
+                let r = p.rect;
+                // Candidate must sit on `direction`'s side and overlap the
+                // focused pane along the perpendicular axis.
+                let (on_side, gap, perp_overlap) = match direction {
+                    PaneDirection::Left => (
+                        r.x + r.width <= c.x + eps,
+                        c.x - (r.x + r.width),
+                        (r.y + r.height).min(c.y + c.height) - r.y.max(c.y),
+                    ),
+                    PaneDirection::Right => (
+                        r.x >= c.x + c.width - eps,
+                        r.x - (c.x + c.width),
+                        (r.y + r.height).min(c.y + c.height) - r.y.max(c.y),
+                    ),
+                    PaneDirection::Up => (
+                        r.y + r.height <= c.y + eps,
+                        c.y - (r.y + r.height),
+                        (r.x + r.width).min(c.x + c.width) - r.x.max(c.x),
+                    ),
+                    PaneDirection::Down => (
+                        r.y >= c.y + c.height - eps,
+                        r.y - (c.y + c.height),
+                        (r.x + r.width).min(c.x + c.width) - r.x.max(c.x),
+                    ),
+                };
+                (on_side && perp_overlap > 0.0).then_some((p.session, gap.max(0.0), perp_overlap))
+            })
+            // Nearest along the direction; ties broken by the larger overlap.
+            .min_by(|a, b| {
+                a.1.total_cmp(&b.1)
+                    .then(b.2.total_cmp(&a.2))
+            });
+        if let Some((session, _, _)) = best {
+            self.active = session;
+            self.refresh_active_context();
+        }
     }
 
+    /// Grow/shrink the focused pane toward `direction` by nudging the divider on
+    /// that side. Walks up to the nearest ancestor split whose axis matches the
+    /// direction; no-op if there is no such divider.
     fn resize_pane_direction(&mut self, direction: PaneDirection) {
-        let Some(divider) = resize_divider_target(
-            self.split_mode,
-            self.focused_pane,
-            self.panes.len(),
-            direction,
-        ) else {
+        let Some(path) = self.layout.path_to_session(self.active) else {
             return;
         };
-        // The arrow drags the divider in its own direction: forward arrows grow
-        // the pane before the divider, backward arrows shrink it.
-        let forward = direction_along_axis(self.split_mode, direction).unwrap_or(true);
-        let step = if forward {
-            SPLIT_RATIO_KEY_STEP
-        } else {
-            -SPLIT_RATIO_KEY_STEP
-        };
-        let first = self.pane_ratios[divider] + step;
-        if set_divider_share(&mut self.pane_ratios, divider, first, false) {
-            self.relayout();
-            self.refresh_active_context();
+        let wanted = direction.axis();
+        let forward = direction.forward();
+        // From the deepest ancestor outward, find a split on the wanted axis
+        // that has a divider on `direction`'s side of the focused subtree.
+        for k in (0..path.len()).rev() {
+            let node_path = &path[..k];
+            let child = path[k];
+            let Some(PaneTree::Split {
+                axis,
+                children,
+                ratios,
+            }) = self.layout.node_at_path_mut(node_path)
+            else {
+                continue;
+            };
+            if *axis != wanted {
+                continue;
+            }
+            let gap = if forward {
+                (child + 1 < children.len()).then_some(child)
+            } else {
+                child.checked_sub(1)
+            };
+            let Some(gap) = gap else {
+                continue;
+            };
+            let step = if forward {
+                SPLIT_RATIO_KEY_STEP
+            } else {
+                -SPLIT_RATIO_KEY_STEP
+            };
+            let first = ratios[gap] + step;
+            if set_divider_share(ratios, gap, first, false) {
+                self.relayout();
+                self.refresh_active_context();
+            }
+            return;
         }
     }
 
     /// Toggle tmux-style zoom: the focused pane temporarily takes the whole
     /// terminal area without destroying the split. No-op when not split.
     fn toggle_pane_zoom(&mut self) {
-        if self.split_mode == SplitMode::Single {
+        if !self.is_split() {
             return;
         }
         self.pane_zoomed = !self.pane_zoomed;
@@ -1894,15 +2249,26 @@ impl Jterm {
         self.refresh_active_context();
     }
 
-    /// Exchange the focused pane with the next one (wrapping); geometry stays
-    /// put and focus follows the moved session, tmux-style.
+    /// Exchange the focused pane's session with the next leaf's (render order);
+    /// geometry stays put and focus follows the moved session, tmux-style.
     fn swap_panes(&mut self) {
-        if self.split_mode == SplitMode::Single || self.panes.len() < 2 {
+        let leaves = self.layout.leaves();
+        if leaves.len() < 2 {
             return;
         }
-        let other = (self.focused_pane + 1) % self.panes.len();
-        self.panes.swap(self.focused_pane, other);
-        self.focused_pane = other;
+        let pos = leaves.iter().position(|&s| s == self.active).unwrap_or(0);
+        let other = leaves[(pos + 1) % leaves.len()];
+        let (a, b) = (self.active, other);
+        self.layout.remap_sessions(&|s| {
+            if s == a {
+                b
+            } else if s == b {
+                a
+            } else {
+                s
+            }
+        });
+        // Focus follows the moved session to its new leaf.
         self.relayout();
         self.refresh_active_context();
         self.save_session_snapshot();
@@ -1911,20 +2277,20 @@ impl Jterm {
     /// Close the focused pane's session; the remaining panes keep the split
     /// (which collapses on its own once only one pane is left).
     fn close_focused_pane(&mut self) -> Task<Message> {
-        if self.split_mode == SplitMode::Single {
+        if !self.is_split() {
             return self.request_close_session(self.active);
         }
-        let victim = self.panes[self.focused_pane];
-        // Focus lands on the preceding pane (or the new first when closing the
-        // first pane), matching where the freed space goes.
-        let keep_pos = self.focused_pane.saturating_sub(1);
-        let keep = self
-            .panes
-            .iter()
-            .copied()
-            .filter(|&p| p != victim)
-            .nth(keep_pos);
-        let keep_id = keep.and_then(|idx| self.sessions.get(idx).map(|session| session.id));
+        let victim = self.active;
+        // Focus lands on the preceding leaf (or the next when closing the first),
+        // matching where the freed space goes.
+        let leaves = self.layout.leaves();
+        let pos = leaves.iter().position(|&s| s == victim).unwrap_or(0);
+        let keep = if pos > 0 {
+            leaves.get(pos - 1)
+        } else {
+            leaves.get(1)
+        };
+        let keep_id = keep.and_then(|&idx| self.sessions.get(idx).map(|session| session.id));
         self.request_close_session_then(victim, keep_id)
     }
 
@@ -2080,11 +2446,11 @@ impl Jterm {
                 Task::none()
             }
             C::TerminalSplitVertical => {
-                self.split(SplitMode::Vertical);
+                self.split(Axis::Vertical);
                 Task::none()
             }
             C::TerminalSplitHorizontal => {
-                self.split(SplitMode::Horizontal);
+                self.split(Axis::Horizontal);
                 Task::none()
             }
             C::TerminalClosePane => return Some(self.close_focused_pane()),
@@ -2728,11 +3094,11 @@ impl Jterm {
                 }
             }
             PaletteAction::SplitVertical => {
-                self.split(SplitMode::Vertical);
+                self.split(Axis::Vertical);
                 Task::none()
             }
             PaletteAction::SplitHorizontal => {
-                self.split(SplitMode::Horizontal);
+                self.split(Axis::Horizontal);
                 Task::none()
             }
             PaletteAction::FocusPaneLeft => {
@@ -3148,16 +3514,17 @@ impl Jterm {
             Message::ModifiersChanged(mods) => {
                 self.modifiers = mods;
             }
-            Message::MousePane(pane_pos, input) => {
+            Message::MousePane(session, input) => {
                 if !self.terminal_mouse_active() {
                     return Task::none();
                 }
                 // Only a press switches the focused pane. Release/Drag aren't
                 // bounds-gated in the widget, so every pane emits them — letting
                 // those move focus would let the wrong pane steal it on release.
-                if matches!(input, MouseInput::Press { .. }) && pane_pos < self.panes.len() {
-                    self.focused_pane = pane_pos;
-                    self.active = self.panes[pane_pos];
+                if matches!(input, MouseInput::Press { .. })
+                    && self.layout.contains_session(session)
+                {
+                    self.active = session;
                     self.session_dirty = true;
                     self.refresh_active_context();
                 }
@@ -3262,38 +3629,51 @@ impl Jterm {
             }
             Message::DividerDragStart(divider) => {
                 let now = std::time::Instant::now();
-                // Double-click on a divider equalizes every pane.
-                let double = self.last_divider_press.is_some_and(|(prev, d)| {
-                    d == divider
-                        && now.duration_since(prev)
+                // Double-click on a divider equalizes the panes of its node.
+                let double = self.last_divider_press.as_ref().is_some_and(|(prev, d)| {
+                    *d == divider
+                        && now.duration_since(*prev)
                             < std::time::Duration::from_millis(DIVIDER_DOUBLE_CLICK_MS)
                 });
-                self.last_divider_press = Some((now, divider));
+                self.last_divider_press = Some((now, divider.clone()));
                 if double {
-                    equalize_shares(&mut self.pane_ratios);
-                    self.relayout();
-                    self.refresh_active_context();
+                    if let Some(PaneTree::Split { ratios, .. }) =
+                        self.layout.node_at_path_mut(&divider.path)
+                    {
+                        equalize_shares(ratios);
+                        self.relayout();
+                        self.refresh_active_context();
+                    }
                 }
                 self.dragging_divider = Some(divider);
             }
             Message::DividerDragEnd => self.dragging_divider = None,
             Message::DividerHover(divider) => self.hovered_divider = divider,
             Message::DividerDragMove(pt) => {
-                if let Some(divider) = self.dragging_divider {
-                    if divider + 1 < self.pane_ratios.len() {
-                        // Pointer position as a fraction of the split axis…
-                        let frac = match self.split_mode {
-                            SplitMode::Vertical => pt.x / self.term_width().max(1.0),
-                            SplitMode::Horizontal => pt.y / self.term_height().max(1.0),
-                            SplitMode::Single => return Task::none(),
-                        };
-                        // …minus the panes before this divider gives the
-                        // dragged pane's new share of its neighbor pair.
-                        let before: f32 = self.pane_ratios[..divider].iter().sum();
-                        let first = frac - before;
-                        if set_divider_share(&mut self.pane_ratios, divider, first, true) {
-                            self.relayout();
-                            self.refresh_active_context();
+                if let Some(divider) = self.dragging_divider.clone() {
+                    // Locate the dragged divider's owning split node rectangle so
+                    // the pointer maps to a fraction of that node's own extent.
+                    let Some((axis, node_rect)) =
+                        split_node_rect(&self.layout, &divider.path, self.layout_area())
+                    else {
+                        return Task::none();
+                    };
+                    let local = match axis {
+                        Axis::Vertical => (pt.x - node_rect.x) / node_rect.width.max(1.0),
+                        Axis::Horizontal => (pt.y - node_rect.y) / node_rect.height.max(1.0),
+                    };
+                    if let Some(PaneTree::Split { ratios, .. }) =
+                        self.layout.node_at_path_mut(&divider.path)
+                    {
+                        if divider.gap + 1 < ratios.len() {
+                            // Pointer fraction minus the children before this gap
+                            // gives the dragged child's new share of its pair.
+                            let before: f32 = ratios[..divider.gap].iter().sum();
+                            let first = local - before;
+                            if set_divider_share(ratios, divider.gap, first, true) {
+                                self.relayout();
+                                self.refresh_active_context();
+                            }
                         }
                     }
                 }
@@ -4306,15 +4686,13 @@ impl Jterm {
         .spacing(14)
         .align_y(iced::Alignment::Center);
         // Split indicator: which pane is focused, and whether it is zoomed.
-        if self.split_mode != SplitMode::Single {
-            let axis = match self.split_mode {
-                SplitMode::Vertical => "│",
-                _ => "─",
-            };
+        if self.is_split() {
+            let count = self.layout.leaf_count();
+            let focused = self.focused_pane_pos() + 1;
             let label = if self.pane_zoomed {
-                format!("{axis} {}/{} zoom", self.focused_pane + 1, self.panes.len())
+                format!("⊞ {focused}/{count} zoom")
             } else {
-                format!("{axis} {}/{}", self.focused_pane + 1, self.panes.len())
+                format!("⊞ {focused}/{count}")
             };
             let accent = self.c_accent();
             right = right.push(
@@ -4353,16 +4731,15 @@ impl Jterm {
             .into()
     }
 
-    /// Build the terminal widget for the session displayed in pane `pane_pos`.
+    /// Build the terminal widget for the pane showing `sess_idx`.
     /// Overlay-style decorations (search, links, Kitty images) are only attached
-    /// to the active pane; the other pane renders plain.
-    fn pane_view(&self, pane_pos: usize) -> Element<'_, Message> {
-        let sess_idx = self.panes[pane_pos];
+    /// to the active pane; the other panes render plain.
+    fn pane_view(&self, sess_idx: usize) -> Element<'_, Message> {
         let sess = &self.sessions[sess_idx];
+        let is_active = sess_idx == self.active;
         // An open overlay input owns the keyboard and IME, so the terminal pane
         // renders unfocused (no blinking cursor, no competing IME request).
-        let focused = self.focused && pane_pos == self.focused_pane && self.terminal_input_active();
-        let is_active = sess_idx == self.active;
+        let focused = self.focused && is_active && self.terminal_input_active();
         // Only walk the grid to build per-row selection spans when a selection
         // actually exists; otherwise hand the widget an empty Vec (no highlight).
         let selection: Vec<Option<(usize, usize)>> = if sess.terminal.selection.is_some() {
@@ -4445,7 +4822,7 @@ impl Jterm {
             None
         })
         .blink_on(self.blink_on)
-        .on_mouse(move |inp| Message::MousePane(pane_pos, inp))
+        .on_mouse(move |inp| Message::MousePane(sess_idx, inp))
         .into()
     }
 
@@ -4622,10 +4999,11 @@ impl Jterm {
         }
     }
 
-    /// The draggable divider strip drawn between panes `index` and `index + 1`.
-    /// Pressing it starts a resize drag (continued via the body's `on_move`
-    /// while `dragging_divider` is set).
-    fn divider(&self, horizontal: bool, index: usize) -> Element<'_, Message> {
+    /// The draggable divider strip for one gap of a split node (identified by
+    /// `id`). Pressing it starts a resize drag (continued via the body's
+    /// `on_move` while `dragging_divider` is set).
+    fn divider(&self, axis: Axis, id: DividerId) -> Element<'_, Message> {
+        let horizontal = matches!(axis, Axis::Horizontal);
         let d = if horizontal {
             container(Space::new())
                 .width(Length::Fill)
@@ -4640,14 +5018,80 @@ impl Jterm {
         } else {
             iced::mouse::Interaction::ResizingHorizontally
         };
-        let active =
-            self.hovered_divider == Some(index) || self.dragging_divider == Some(index);
+        let active = self.hovered_divider.as_ref() == Some(&id)
+            || self.dragging_divider.as_ref() == Some(&id);
         mouse_area(d.style(self.divider_style(active)))
-            .on_press(Message::DividerDragStart(index))
-            .on_enter(Message::DividerHover(Some(index)))
+            .on_press(Message::DividerDragStart(id.clone()))
+            .on_enter(Message::DividerHover(Some(id.clone())))
             .on_exit(Message::DividerHover(None))
             .interaction(interaction)
             .into()
+    }
+
+    /// Recursively build the pane layout widget tree. `path` is the child-index
+    /// route from the root to `node`, used to tag each divider with a
+    /// [`DividerId`].
+    fn render_tree(&self, node: &PaneTree, path: &[usize]) -> Element<'_, Message> {
+        match node {
+            PaneTree::Leaf(session) => {
+                // The focus outline is only meaningful while split.
+                let focused = self.is_split() && *session == self.active;
+                container(self.pane_view(*session))
+                    .style(self.pane_frame_style(focused))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            }
+            PaneTree::Split {
+                axis,
+                children,
+                ratios,
+            } => {
+                let horizontal = matches!(axis, Axis::Horizontal);
+                let n = children.len();
+                let mut items: Vec<Element<'_, Message>> =
+                    Vec::with_capacity(2 * n.saturating_sub(1) + 1);
+                for (i, child) in children.iter().enumerate() {
+                    if i > 0 {
+                        items.push(self.divider(
+                            *axis,
+                            DividerId {
+                                path: path.to_vec(),
+                                gap: i - 1,
+                            },
+                        ));
+                    }
+                    let share = ratios.get(i).copied().unwrap_or(1.0 / n as f32);
+                    let portion = (share * 1000.0).round().max(1.0) as u16;
+                    let mut child_path = path.to_vec();
+                    child_path.push(i);
+                    let el = self.render_tree(child, &child_path);
+                    let el: Element<'_, Message> = if horizontal {
+                        container(el)
+                            .width(Length::Fill)
+                            .height(Length::FillPortion(portion))
+                            .into()
+                    } else {
+                        container(el)
+                            .width(Length::FillPortion(portion))
+                            .height(Length::Fill)
+                            .into()
+                    };
+                    items.push(el);
+                }
+                if horizontal {
+                    iced::widget::Column::with_children(items)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into()
+                } else {
+                    iced::widget::Row::with_children(items)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into()
+                }
+            }
+        }
     }
 
     /// Thin frame around a split pane: the focused pane gets an accent outline
@@ -4665,50 +5109,17 @@ impl Jterm {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        if self.panes.is_empty() || self.sessions.is_empty() {
+        if self.sessions.is_empty() {
             return container(text("no session")).into();
         }
-        let panes_body: Element<'_, Message> = if self.split_mode != SplitMode::Single
-            && self.pane_zoomed
-        {
+        let panes_body: Element<'_, Message> = if self.is_split() && self.pane_zoomed {
             // Zoomed: the focused pane fills the whole area; the hidden panes
             // keep running in the background exactly like inactive tabs.
-            self.pane_view(self.focused_pane)
-        } else if self.split_mode == SplitMode::Single {
-            self.pane_view(0)
+            self.pane_view(self.active)
         } else {
-            // Panes laid out along the split axis, a draggable divider between
-            // each adjacent pair. Integer FillPortions approximate the float
-            // shares.
-            let horizontal = self.split_mode == SplitMode::Horizontal;
-            let n = self.panes.len();
-            let mut items: Vec<Element<'_, Message>> = Vec::with_capacity(2 * n - 1);
-            for pos in 0..n {
-                if pos > 0 {
-                    items.push(self.divider(horizontal, pos - 1));
-                }
-                let share = self.pane_ratios.get(pos).copied().unwrap_or(1.0 / n as f32);
-                let portion = (share * 1000.0).round().max(1.0) as u16;
-                let pane = container(self.pane_view(pos))
-                    .style(self.pane_frame_style(self.focused_pane == pos));
-                let pane = if horizontal {
-                    pane.width(Length::Fill).height(Length::FillPortion(portion))
-                } else {
-                    pane.width(Length::FillPortion(portion)).height(Length::Fill)
-                };
-                items.push(pane.into());
-            }
-            if horizontal {
-                iced::widget::Column::with_children(items)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .into()
-            } else {
-                iced::widget::Row::with_children(items)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .into()
-            }
+            // Recursive tiled layout with a draggable divider between each pair
+            // of siblings. Integer FillPortions approximate the float shares.
+            self.render_tree(&self.layout, &[])
         };
         // While dragging the divider, wrap the panes in a mouse_area so pointer
         // moves drive the resize and release ends it. The handler is attached
@@ -5335,14 +5746,14 @@ impl Jterm {
             .push(stat("Active", format!("#{}", self.active + 1)))
             .push(stat(
                 "Split",
-                match self.split_mode {
-                    SplitMode::Single => "Single".to_string(),
-                    SplitMode::Vertical => {
-                        format!("V {}/{}", self.focused_pane + 1, self.panes.len())
-                    }
-                    SplitMode::Horizontal => {
-                        format!("H {}/{}", self.focused_pane + 1, self.panes.len())
-                    }
+                if self.is_split() {
+                    format!(
+                        "{}/{} panes",
+                        self.focused_pane_pos() + 1,
+                        self.layout.leaf_count()
+                    )
+                } else {
+                    "Single".to_string()
                 },
             ));
         if let Some(sess) = self.sessions.get(self.active) {
@@ -5446,7 +5857,7 @@ impl Jterm {
         // to animate blinking cells. Run it only while focused AND when a visible
         // pane actually has blinking text — the common case (no blink, or
         // unfocused) then stays fully idle.
-        let has_blink = self.panes.iter().any(|&idx| {
+        let has_blink = self.layout.leaves().iter().any(|&idx| {
             self.sessions.get(idx).is_some_and(|s| {
                 s.terminal
                     .grid
@@ -6230,75 +6641,97 @@ mod tests {
     }
 
     #[test]
-    fn pane_focus_is_axis_aware_and_never_wraps_at_an_edge() {
-        assert_eq!(
-            directional_pane_target(SplitMode::Vertical, 0, 3, PaneDirection::Right),
-            Some(1)
-        );
-        assert_eq!(
-            directional_pane_target(SplitMode::Vertical, 2, 3, PaneDirection::Left),
-            Some(1)
-        );
-        assert_eq!(
-            directional_pane_target(SplitMode::Horizontal, 0, 2, PaneDirection::Down),
-            Some(1)
-        );
-        assert_eq!(
-            directional_pane_target(SplitMode::Horizontal, 1, 2, PaneDirection::Up),
-            Some(0)
-        );
-
-        assert_eq!(
-            directional_pane_target(SplitMode::Vertical, 0, 3, PaneDirection::Left),
-            None,
-            "left edge must not wrap"
-        );
-        assert_eq!(
-            directional_pane_target(SplitMode::Horizontal, 2, 3, PaneDirection::Down),
-            None,
-            "bottom edge must not wrap"
-        );
-        assert_eq!(
-            directional_pane_target(SplitMode::Vertical, 0, 2, PaneDirection::Down),
-            None,
-            "perpendicular direction must not change focus"
-        );
-        assert_eq!(
-            directional_pane_target(SplitMode::Single, 0, 1, PaneDirection::Right),
-            None
-        );
+    fn split_leaf_joins_same_axis_and_nests_across_axes() {
+        // A lone leaf becomes a two-child split of the requested axis.
+        let mut t = PaneTree::Leaf(0);
+        assert!(t.split_leaf(0, Axis::Vertical, 1));
+        assert_eq!(t.leaves(), vec![0, 1]);
+        // Splitting an existing sibling along the SAME axis joins it flat.
+        assert!(t.split_leaf(1, Axis::Vertical, 2));
+        assert_eq!(t.leaves(), vec![0, 1, 2]);
+        assert_eq!(t.leaf_count(), 3);
+        // Splitting along the OTHER axis nests a new split at that leaf.
+        assert!(t.split_leaf(1, Axis::Horizontal, 3));
+        assert_eq!(t.leaves(), vec![0, 1, 3, 2]);
+        // The nested node really is horizontal.
+        assert_eq!(t.path_to_session(3), Some(vec![1, 1]));
+        // Splitting a session that does not exist is a no-op.
+        assert!(!t.split_leaf(99, Axis::Vertical, 4));
     }
 
     #[test]
-    fn resize_arrows_pick_the_divider_on_their_own_side() {
-        // Middle pane of three: right arrow moves its right divider (1), left
-        // arrow moves its left divider (0).
-        assert_eq!(
-            resize_divider_target(SplitMode::Vertical, 1, 3, PaneDirection::Right),
-            Some(1)
-        );
-        assert_eq!(
-            resize_divider_target(SplitMode::Vertical, 1, 3, PaneDirection::Left),
-            Some(0)
-        );
-        // Edge panes fall back to their only divider so the arrow still works.
-        assert_eq!(
-            resize_divider_target(SplitMode::Vertical, 2, 3, PaneDirection::Right),
-            Some(1)
-        );
-        assert_eq!(
-            resize_divider_target(SplitMode::Vertical, 0, 3, PaneDirection::Left),
-            Some(0)
-        );
-        // Perpendicular arrows and single panes do nothing.
-        assert_eq!(
-            resize_divider_target(SplitMode::Vertical, 0, 3, PaneDirection::Up),
-            None
-        );
-        assert_eq!(
-            resize_divider_target(SplitMode::Horizontal, 0, 1, PaneDirection::Down),
-            None
-        );
+    fn remove_leaf_folds_share_and_collapses_single_child_parents() {
+        // V[ 0, H[1, 3], 2 ]  — remove 3 collapses the H node into Leaf(1).
+        let mut t = PaneTree::Split {
+            axis: Axis::Vertical,
+            children: vec![
+                PaneTree::Leaf(0),
+                PaneTree::Split {
+                    axis: Axis::Horizontal,
+                    children: vec![PaneTree::Leaf(1), PaneTree::Leaf(3)],
+                    ratios: vec![0.5, 0.5],
+                },
+                PaneTree::Leaf(2),
+            ],
+            ratios: vec![0.3, 0.4, 0.3],
+        };
+        assert!(t.remove_leaf(3));
+        assert_eq!(t.leaves(), vec![0, 1, 2]);
+        // The middle child is now a plain leaf, not a split.
+        assert_eq!(t.path_to_session(1), Some(vec![1]));
+        // Removing down to one child collapses the whole tree to a leaf.
+        assert!(t.remove_leaf(0));
+        assert!(t.remove_leaf(1));
+        assert_eq!(t, PaneTree::Leaf(2));
+        // A root leaf is never removed here (the caller handles the last pane).
+        assert!(!t.remove_leaf(2));
+    }
+
+    #[test]
+    fn collect_pane_rects_partitions_the_area_along_each_axis() {
+        let area = iced::Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0 + DIVIDER,
+            height: 60.0,
+        };
+        let tree = PaneTree::Split {
+            axis: Axis::Vertical,
+            children: vec![PaneTree::Leaf(0), PaneTree::Leaf(1)],
+            ratios: vec![0.5, 0.5],
+        };
+        let mut rects = Vec::new();
+        collect_pane_rects(&tree, area, &mut rects);
+        assert_eq!(rects.len(), 2);
+        // Two 50-wide panes with a DIVIDER gap between them.
+        assert_eq!(rects[0].session, 0);
+        assert!((rects[0].rect.width - 50.0).abs() < 1e-3);
+        assert!((rects[1].rect.x - (50.0 + DIVIDER)).abs() < 1e-3);
+        assert!((rects[1].rect.width - 50.0).abs() < 1e-3);
+        // Every pane spans the full perpendicular extent.
+        assert!(rects.iter().all(|p| (p.rect.height - 60.0).abs() < 1e-3));
+    }
+
+    #[test]
+    fn pane_tree_snapshot_round_trips() {
+        let tree = PaneTree::Split {
+            axis: Axis::Vertical,
+            children: vec![
+                PaneTree::Leaf(0),
+                PaneTree::Split {
+                    axis: Axis::Horizontal,
+                    children: vec![PaneTree::Leaf(1), PaneTree::Leaf(2)],
+                    ratios: vec![0.5, 0.5],
+                },
+            ],
+            ratios: vec![0.6, 0.4],
+        };
+        let snap = pane_tree_to_snapshot(&tree);
+        let back = pane_tree_from_snapshot(&snap).unwrap();
+        assert_eq!(back, tree);
+        assert!(valid_restored_layout(&back, 3));
+        // Out-of-range session indices are rejected.
+        assert!(!valid_restored_layout(&back, 2));
     }
 
     #[test]
