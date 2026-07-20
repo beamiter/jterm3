@@ -23,6 +23,8 @@ pub enum PaletteAction {
     ResizePaneUp,
     ResizePaneDown,
     ClosePane,
+    ZoomPane,
+    SwapPanes,
     ToggleSidebar,
     OpenSettings,
     QuickTabSwitch,
@@ -112,13 +114,13 @@ impl PaletteState {
             },
             PaletteItem {
                 name: "Split Right",
-                description: "Split the terminal into left and right panes",
+                description: "Add a pane beside the focused one (left | right)",
                 shortcut: "Ctrl+Shift+E",
                 action: PaletteAction::SplitVertical,
             },
             PaletteItem {
                 name: "Split Down",
-                description: "Split the terminal into top and bottom panes",
+                description: "Add a pane below the focused one (top / bottom)",
                 shortcut: "Ctrl+Shift+D",
                 action: PaletteAction::SplitHorizontal,
             },
@@ -169,6 +171,18 @@ impl PaletteState {
                 description: "Move the split divider downward",
                 shortcut: "Ctrl+Alt+Shift+Down",
                 action: PaletteAction::ResizePaneDown,
+            },
+            PaletteItem {
+                name: "Zoom Pane",
+                description: "Temporarily expand the focused pane to full size",
+                shortcut: "Ctrl+Shift+Z",
+                action: PaletteAction::ZoomPane,
+            },
+            PaletteItem {
+                name: "Swap Panes",
+                description: "Exchange the focused pane with the next one",
+                shortcut: "Ctrl+Shift+X",
+                action: PaletteAction::SwapPanes,
             },
             PaletteItem {
                 name: "Close Focused Pane",

@@ -47,6 +47,8 @@ pub enum Command {
     PaneResizeRight,
     PaneResizeUp,
     PaneResizeDown,
+    PaneZoomToggle,
+    PaneSwap,
 
     // === 窗口操作 ===
     WindowClose,
@@ -98,6 +100,8 @@ impl std::fmt::Display for Command {
             Command::PaneResizeRight => write!(f, "pane:resize_right"),
             Command::PaneResizeUp => write!(f, "pane:resize_up"),
             Command::PaneResizeDown => write!(f, "pane:resize_down"),
+            Command::PaneZoomToggle => write!(f, "pane:zoom_toggle"),
+            Command::PaneSwap => write!(f, "pane:swap"),
             Command::WindowClose => write!(f, "window:close"),
             Command::ConfigOpen => write!(f, "config:open"),
             Command::ConfigClose => write!(f, "config:close"),
@@ -146,6 +150,8 @@ impl std::str::FromStr for Command {
             "pane:resize_right" => Ok(Command::PaneResizeRight),
             "pane:resize_up" => Ok(Command::PaneResizeUp),
             "pane:resize_down" => Ok(Command::PaneResizeDown),
+            "pane:zoom_toggle" => Ok(Command::PaneZoomToggle),
+            "pane:swap" => Ok(Command::PaneSwap),
             "window:close" => Ok(Command::WindowClose),
             "config:open" => Ok(Command::ConfigOpen),
             "config:close" => Ok(Command::ConfigClose),
@@ -411,6 +417,12 @@ impl KeyBindings {
                 .bindings
                 .insert(format!("ctrl+shift+alt+{key}"), command.to_string());
         }
+        bindings
+            .bindings
+            .insert("ctrl+shift+z".to_string(), "pane:zoom_toggle".to_string());
+        bindings
+            .bindings
+            .insert("ctrl+shift+x".to_string(), "pane:swap".to_string());
 
         // 搜索操作
         bindings
@@ -560,6 +572,8 @@ mod tests {
             ("ctrl+backslash", Command::SidebarToggle),
             ("ctrl+shift+e", Command::TerminalSplitVertical),
             ("ctrl+shift+d", Command::TerminalSplitHorizontal),
+            ("ctrl+shift+z", Command::PaneZoomToggle),
+            ("ctrl+shift+x", Command::PaneSwap),
             ("ctrl+=", Command::FontZoomIn),
             ("ctrl+-", Command::FontZoomOut),
             ("ctrl+0", Command::FontZoomReset),

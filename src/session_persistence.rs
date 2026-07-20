@@ -10,6 +10,21 @@ pub struct SessionSnapshot {
     pub cwd: Option<String>,
 }
 
+/// 分屏布局快照:重启后恢复分屏方向、各 pane 占比与对应的会话。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitSnapshot {
+    /// "vertical"(左右)或 "horizontal"(上下)。
+    pub mode: String,
+    /// 每个 pane 的占比(与 `panes` 一一对应,总和约为 1)。
+    /// 缺失或长度不符时恢复端回退为均分。
+    #[serde(default)]
+    pub ratios: Vec<f32>,
+    /// 各 pane 对应的会话索引(指向 `sessions`)。
+    pub panes: Vec<usize>,
+    /// 拥有键盘焦点的 pane(索引进 `panes`)。
+    pub focused: usize,
+}
+
 /// 会话列表快照。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionsSnapshot {
@@ -17,14 +32,22 @@ pub struct SessionsSnapshot {
     pub sessions: Vec<SessionSnapshot>,
     #[serde(default)]
     pub active_index: Option<usize>,
+    /// 分屏布局;`None` 表示单 pane。旧快照缺省为 `None`,向后兼容。
+    #[serde(default)]
+    pub split: Option<SplitSnapshot>,
 }
 
 impl SessionsSnapshot {
-    pub fn new(sessions: Vec<SessionSnapshot>, active_index: Option<usize>) -> Self {
+    pub fn new(
+        sessions: Vec<SessionSnapshot>,
+        active_index: Option<usize>,
+        split: Option<SplitSnapshot>,
+    ) -> Self {
         SessionsSnapshot {
             version: 1,
             sessions,
             active_index,
+            split,
         }
     }
 
@@ -48,7 +71,7 @@ impl SessionsSnapshot {
     /// 从文件加载；文件不存在时返回空快照。
     pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         if !path.exists() {
-            return Ok(SessionsSnapshot::new(Vec::new(), None));
+            return Ok(SessionsSnapshot::new(Vec::new(), None, None));
         }
         let content = std::fs::read_to_string(path)?;
         Ok(serde_json::from_str(&content)?)
@@ -91,5 +114,57 @@ pub fn try_acquire_instance_lock() -> Option<std::fs::File> {
         Some(file)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshots_without_split_field_still_deserialize() {
+        let legacy = r#"{"version":1,"sessions":[{"cwd":"/tmp"}],"active_index":0}"#;
+        let snap: SessionsSnapshot = serde_json::from_str(legacy).unwrap();
+        assert!(snap.split.is_none());
+        assert_eq!(snap.sessions.len(), 1);
+    }
+
+    #[test]
+    fn split_layout_round_trips_through_json() {
+        let snap = SessionsSnapshot::new(
+            vec![
+                SessionSnapshot { cwd: None },
+                SessionSnapshot { cwd: None },
+                SessionSnapshot { cwd: None },
+            ],
+            Some(1),
+            Some(SplitSnapshot {
+                mode: "horizontal".to_string(),
+                ratios: vec![0.5, 0.3, 0.2],
+                panes: vec![0, 2, 1],
+                focused: 1,
+            }),
+        );
+        let json = snap.to_json().unwrap();
+        let back: SessionsSnapshot = serde_json::from_str(&json).unwrap();
+        let split = back.split.unwrap();
+        assert_eq!(split.mode, "horizontal");
+        assert_eq!(split.panes, vec![0, 2, 1]);
+        assert_eq!(split.focused, 1);
+        assert_eq!(split.ratios, vec![0.5, 0.3, 0.2]);
+    }
+
+    #[test]
+    fn split_snapshots_with_legacy_scalar_ratio_still_deserialize() {
+        // Written by the short-lived two-pane format: `ratio` instead of
+        // `ratios`. The unknown field is ignored and ratios comes back empty,
+        // which the restore path treats as "equalize".
+        let legacy = r#"{"version":1,"sessions":[{"cwd":null},{"cwd":null}],
+            "active_index":0,
+            "split":{"mode":"vertical","ratio":0.35,"panes":[0,1],"focused":0}}"#;
+        let snap: SessionsSnapshot = serde_json::from_str(legacy).unwrap();
+        let split = snap.split.unwrap();
+        assert!(split.ratios.is_empty());
+        assert_eq!(split.panes, vec![0, 1]);
     }
 }
