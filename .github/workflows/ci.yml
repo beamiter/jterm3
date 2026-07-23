@@ -28,8 +28,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.97.0 toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt
 
@@ -64,8 +64,8 @@ jobs:
             libegl1-mesa-dev \
             libgl1-mesa-dev
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.97.0 toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: clippy
 
@@ -105,8 +105,8 @@ jobs:
             libegl1-mesa-dev \
             libgl1-mesa-dev
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.97.0 toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
 
       - name: Cache Rust build data
         uses: Swatinem/rust-cache@v2
@@ -144,8 +144,8 @@ jobs:
             libegl1-mesa-dev \
             libgl1-mesa-dev
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.97.0 toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
 
       - name: Cache Rust build data
         uses: Swatinem/rust-cache@v2

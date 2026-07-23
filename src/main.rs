@@ -68,6 +68,14 @@ const PTY_WRITE_DRAIN_BUDGET: usize = 256 * 1024;
 /// Never reflect an unexpectedly huge host clipboard through a terminal escape.
 const MAX_CLIPBOARD_RESPONSE_BYTES: usize = 1024 * 1024;
 
+/// Keep the physical viewport fixed while the application-level UI scale
+/// changes. iced updates its logical viewport for this case without emitting a
+/// window `Resized` event, so the terminal must mirror that conversion itself.
+fn logical_viewport_after_scale(size: Size, old_scale: f32, new_scale: f32) -> Size {
+    let ratio = old_scale / new_scale;
+    Size::new(size.width * ratio, size.height * ratio)
+}
+
 /// Stable widget ids so the overlays' text inputs can be focused on open.
 static SEARCH_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-search-input"));
@@ -212,6 +220,26 @@ impl PaneTree {
         }
         let mut acc = Vec::new();
         walk(self, session, &mut acc).then_some(acc)
+    }
+
+    /// Prepare `target` to receive focus without changing the pane topology.
+    ///
+    /// If the target is already visible, the tree is left untouched so focusing
+    /// another pane can never duplicate that session. Otherwise the focused leaf
+    /// is replaced in place, preserving every split axis and ratio. Returns
+    /// `false` only when `focused` is not a leaf in this tree.
+    fn focus_or_replace_session(&mut self, focused: usize, target: usize) -> bool {
+        if self.contains_session(target) {
+            return true;
+        }
+        let Some(path) = self.path_to_session(focused) else {
+            return false;
+        };
+        let Some(PaneTree::Leaf(session)) = self.node_at_path_mut(&path) else {
+            return false;
+        };
+        *session = target;
+        true
     }
 
     fn node_at_path_mut(&mut self, path: &[usize]) -> Option<&mut PaneTree> {
@@ -532,7 +560,9 @@ fn axis_to_str(axis: Axis) -> &'static str {
 /// Serialize a live layout tree for session persistence.
 fn pane_tree_to_snapshot(tree: &PaneTree) -> session_persistence::PaneTreeSnapshot {
     match tree {
-        PaneTree::Leaf(session) => session_persistence::PaneTreeSnapshot::Leaf { session: *session },
+        PaneTree::Leaf(session) => {
+            session_persistence::PaneTreeSnapshot::Leaf { session: *session }
+        }
         PaneTree::Split {
             axis,
             children,
@@ -568,9 +598,8 @@ fn pane_tree_from_snapshot(snap: &session_persistence::PaneTreeSnapshot) -> Opti
             let n = kids.len();
             let mut r = ratios.clone();
             let sum: f32 = r.iter().sum();
-            let usable = r.len() == n
-                && r.iter().all(|x| x.is_finite() && *x > 0.0)
-                && sum > f32::EPSILON;
+            let usable =
+                r.len() == n && r.iter().all(|x| x.is_finite() && *x > 0.0) && sum > f32::EPSILON;
             if usable {
                 for x in r.iter_mut() {
                     *x /= sum;
@@ -597,9 +626,8 @@ fn pane_tree_from_legacy(split: &session_persistence::SplitSnapshot) -> Option<P
     }
     let mut ratios = split.ratios.clone();
     let sum: f32 = ratios.iter().sum();
-    let usable = ratios.len() == n
-        && ratios.iter().all(|x| x.is_finite() && *x > 0.0)
-        && sum > f32::EPSILON;
+    let usable =
+        ratios.len() == n && ratios.iter().all(|x| x.is_finite() && *x > 0.0) && sum > f32::EPSILON;
     if usable {
         for x in ratios.iter_mut() {
             *x /= sum;
@@ -625,7 +653,10 @@ fn valid_restored_layout(tree: &PaneTree, session_count: usize) -> bool {
     if leaves.iter().any(|&s| s >= session_count) {
         return false;
     }
-    let distinct = leaves.iter().collect::<std::collections::HashSet<_>>().len();
+    let distinct = leaves
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
     distinct == n
 }
 
@@ -665,7 +696,9 @@ fn resolve_optional_font(family: Option<&str>) -> Option<iced::Font> {
 
 fn main() -> iced::Result {
     env_logger::init();
-    let config = Config::load();
+    let config_load = Config::load_with_diagnostics();
+    let config_diagnostic = config_load.diagnostic;
+    let config = config_load.config;
     let win = iced::window::Settings {
         size: Size::new(config.initial_width, config.initial_height),
         // Route window-manager close requests through our foreground-job guard.
@@ -673,13 +706,14 @@ fn main() -> iced::Result {
         ..Default::default()
     };
     iced::application(
-        move || Jterm::new(config.clone()),
+        move || Jterm::new(config.clone(), config_diagnostic.clone()),
         Jterm::update,
         Jterm::view,
     )
     .title(Jterm::title)
     .subscription(Jterm::subscription)
     .theme(Jterm::iced_theme)
+    .scale_factor(Jterm::scale_factor)
     // MSAA forces wgpu down the multisample path; on Intel/Mesa that triggers
     // the "manual shader clears for srgb textures" path, which flashes the whole
     // surface on heavy redraws (e.g. multi-line `ls` output). Glyph and quad
@@ -730,6 +764,9 @@ enum Message {
     SidebarDragEnd,
     SidebarToggleNode(std::path::PathBuf),
     SidebarInsertPath(std::path::PathBuf),
+    SidebarGoParent,
+    SidebarRefresh,
+    SidebarLoaded(sidebar::DirectoryResult),
     /// Press on a divider (identified by its owning split node + gap).
     DividerDragStart(DividerId),
     DividerDragMove(iced::Point),
@@ -743,6 +780,7 @@ enum Message {
     ToggleConfigPanel,
     SetTheme(String),
     SetFontSize(f32),
+    SetUiScale(f32),
     SetLineSpacing(f32),
     SetPadding(f32),
     SetScrollback(u32),
@@ -870,16 +908,16 @@ impl Session {
         cols: usize,
         rows: usize,
         cwd: Option<&str>,
-    ) -> Option<Session> {
-        let pty = Pty::new_with_cwd(cols, rows, cwd, None, config.shell.as_deref()).ok()?;
+    ) -> anyhow::Result<Session> {
+        let pty = Pty::new_with_cwd(cols, rows, cwd, None, config.shell.as_deref())
+            .map_err(|error| anyhow::anyhow!("cannot create terminal session: {error}"))?;
         let master_fd = pty.master_fd();
         let reader_fd = unsafe { libc::fcntl(master_fd, libc::F_DUPFD_CLOEXEC, 0) };
         if reader_fd < 0 {
-            log::error!(
-                "[PTY] failed to duplicate reader fd: {}",
+            return Err(anyhow::anyhow!(
+                "cannot duplicate PTY reader: {}",
                 std::io::Error::last_os_error()
-            );
-            return None;
+            ));
         }
         // SAFETY: `fcntl(F_DUPFD_CLOEXEC)` returned a fresh owned descriptor.
         let reader_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(reader_fd) });
@@ -889,7 +927,7 @@ impl Session {
         let grid = terminal.get_visible_cells();
         let cursor = terminal.get_cursor_pos();
         let cursor_visible = terminal.is_cursor_visible();
-        Some(Session {
+        Ok(Session {
             id,
             terminal,
             pty,
@@ -1129,6 +1167,9 @@ struct Jterm {
     config: Config,
     theme: Theme,
     metrics: Metrics,
+    /// Ephemeral font zoom applied by Ctrl+/- and Ctrl+wheel. The configured
+    /// font size remains the durable baseline and Ctrl+0 returns to it.
+    font_zoom: f32,
     sessions: Vec<Session>,
     active: usize,
     next_id: usize,
@@ -1153,9 +1194,17 @@ struct Jterm {
     /// Blink clock phase, toggled by a timer; drives blinking-attribute cells.
     blink_on: bool,
     win_size: Size,
+    /// Last observed config-file timestamp, including failed reload attempts.
     config_mtime: Option<std::time::SystemTime>,
-    /// Font-size changes are live-applied immediately and persisted on the next
-    /// config tick so restart restores the latest zoom level.
+    config_diagnostic: Option<String>,
+    /// A malformed/unreadable user config must never be overwritten by
+    /// background auto-save. Explicit Reset is the recovery escape hatch.
+    config_write_blocked: bool,
+    keybindings_mtime: Option<std::time::SystemTime>,
+    keybindings_diagnostics: Vec<String>,
+    session_diagnostic: Option<String>,
+    /// Persistent settings-panel changes are live-applied immediately and saved
+    /// on the next config tick. Ephemeral font zoom never sets this flag.
     config_dirty: bool,
     link_detector: link::LinkDetector,
     links: Vec<link::Link>,
@@ -1235,13 +1284,15 @@ struct Jterm {
 }
 
 impl Jterm {
-    fn new(config: Config) -> (Self, Task<Message>) {
+    fn new(config: Config, config_diagnostic: Option<String>) -> (Self, Task<Message>) {
         let theme = Theme::get_theme(&config.theme).unwrap_or_default();
         let metrics = Metrics::new(config.font_size, config.line_spacing, config.padding);
         let cols = config.cols.max(1);
         let rows = config.rows.max(1);
         let win_size = Size::new(config.initial_width, config.initial_height);
         let config_mtime = Config::config_mtime();
+        let keybindings_load = keybindings::KeyBindings::load_with_diagnostics();
+        let keybindings_mtime = keybindings::KeyBindings::config_mtime();
 
         // Single-instance lock: a second instance starts fresh and never writes
         // the session snapshot, so it cannot clobber the first instance's history.
@@ -1259,7 +1310,7 @@ impl Jterm {
 
         // Restore prior tabs (their cwds + active index) when enabled and we are
         // the first instance; otherwise start with a single default session.
-        let (sessions, active, next_id, saved_tree, saved_split) =
+        let (sessions, active, next_id, saved_tree, saved_split, session_diagnostic) =
             Self::restore_or_spawn(&config, cols, rows, is_first_instance);
 
         // In Side mode the dock hosts the tab list and starts open (there is no
@@ -1276,6 +1327,7 @@ impl Jterm {
             config,
             theme,
             metrics,
+            font_zoom: 0.0,
             sessions,
             active,
             next_id,
@@ -1291,13 +1343,18 @@ impl Jterm {
             search: search::SearchState::new(),
             search_dirty: false,
             palette: command_palette::PaletteState::new(),
-            keybindings: load_keybindings(),
+            keybindings: keybindings_load.bindings,
             config_panel_open: false,
             help_open: false,
             debug_open: false,
             blink_on: true,
             win_size,
             config_mtime,
+            config_write_blocked: config_diagnostic.is_some(),
+            config_diagnostic,
+            keybindings_mtime,
+            keybindings_diagnostics: keybindings_load.diagnostics,
+            session_diagnostic,
             config_dirty: false,
             link_detector: link::LinkDetector::new(link::LinkDetectionConfig::default()),
             links: Vec::new(),
@@ -1374,6 +1431,14 @@ impl Jterm {
         )
     }
 
+    fn scale_factor(&self) -> f32 {
+        self.config.ui_scale.unwrap_or(1.0)
+    }
+
+    fn effective_font_size(&self) -> f32 {
+        Config::clamp_font_size(self.config.font_size + self.font_zoom)
+    }
+
     /// Single re-apply path for live config changes (Set*, Reset, hot reload):
     /// re-resolve the theme, rebuild metrics, and regrid every session.
     fn apply_config(&mut self) {
@@ -1384,7 +1449,7 @@ impl Jterm {
         self.math_symbol = resolve_optional_font(Config::math_symbol_font_family());
         self.nerd_symbol = resolve_optional_font(Config::nerd_symbol_font_family());
         self.metrics = Metrics::new(
-            self.config.font_size,
+            self.effective_font_size(),
             self.config.line_spacing,
             self.config.padding,
         );
@@ -1422,27 +1487,25 @@ impl Jterm {
     }
 
     fn adjust_font_size(&mut self, delta: f32) {
-        let next = Config::clamp_font_size(self.config.font_size + delta);
-        if (next - self.config.font_size).abs() < f32::EPSILON {
+        let current = self.effective_font_size();
+        let next = Config::clamp_font_size(current + delta);
+        if (next - current).abs() < f32::EPSILON {
             return;
         }
-        self.config.font_size = next;
-        self.config_dirty = true;
+        self.font_zoom = next - self.config.font_size;
         self.apply_config();
     }
 
     fn reset_font_size(&mut self) {
-        let next = Config::clamp_font_size(14.0);
-        if (next - self.config.font_size).abs() < f32::EPSILON {
+        if self.font_zoom.abs() < f32::EPSILON {
             return;
         }
-        self.config.font_size = next;
-        self.config_dirty = true;
+        self.font_zoom = 0.0;
         self.apply_config();
     }
 
     fn persist_live_config(&mut self) {
-        if !self.config_dirty {
+        if !self.config_dirty || self.config_write_blocked {
             return;
         }
         match self.config.save() {
@@ -1490,18 +1553,23 @@ impl Jterm {
     /// Toggle the left dock and refresh its file root when it becomes visible.
     /// Keeping this in one place makes the toolbar, shortcut, and command
     /// palette behave identically.
-    fn toggle_sidebar(&mut self) {
+    fn toggle_sidebar(&mut self) -> Task<Message> {
         self.sidebar_open = !self.sidebar_open;
-        if self.sidebar_open {
+        let request = if self.sidebar_open && self.sidebar_panel == SidebarPanel::Files {
             if let Some(cwd) = self
                 .sessions
                 .get(self.active)
                 .and_then(|s| s.cwd_cache.clone().or_else(|| s.cwd()))
             {
-                self.sidebar.set_current_dir(std::path::PathBuf::from(cwd));
+                Some(self.sidebar.set_current_dir(std::path::PathBuf::from(cwd)))
+            } else {
+                Some(self.sidebar.refresh())
             }
-        }
+        } else {
+            None
+        };
         self.apply_config();
+        request.map_or_else(Task::none, sidebar_load_task)
     }
 
     /// Terminal area height: window minus the tab bar and status bar. The top bar
@@ -1566,11 +1634,18 @@ impl Jterm {
         usize,
         Option<session_persistence::PaneTreeSnapshot>,
         Option<session_persistence::SplitSnapshot>,
+        Option<String>,
     ) {
-        let default = |id_start: usize| {
-            let s =
-                Session::spawn(config, id_start, cols, rows, None).expect("failed to spawn PTY");
-            (vec![s], 0usize, id_start + 1, None, None)
+        let default = |id_start: usize| match Session::spawn(config, id_start, cols, rows, None) {
+            Ok(session) => (vec![session], 0usize, id_start + 1, None, None, None),
+            Err(error) => (
+                Vec::new(),
+                0usize,
+                id_start,
+                None,
+                None,
+                Some(error.to_string()),
+            ),
         };
         if !config.restore_session || !is_first_instance {
             return default(0);
@@ -1584,6 +1659,7 @@ impl Jterm {
         };
         let mut sessions = Vec::new();
         let mut next_id = 0usize;
+        let mut restore_warnings = Vec::new();
         if snapshot.sessions.len() > MAX_RESTORED_SESSIONS {
             log::warn!(
                 "[SessionPersistence] Snapshot has {} sessions; restoring only the first {}",
@@ -1592,9 +1668,31 @@ impl Jterm {
             );
         }
         for snap in snapshot.sessions.iter().take(MAX_RESTORED_SESSIONS) {
-            if let Some(sess) = Session::spawn(config, next_id, cols, rows, snap.cwd.as_deref()) {
-                sessions.push(sess);
-                next_id += 1;
+            match Session::spawn(config, next_id, cols, rows, snap.cwd.as_deref()) {
+                Ok(session) => {
+                    sessions.push(session);
+                    next_id += 1;
+                }
+                Err(error) if snap.cwd.is_some() => {
+                    let cwd = snap.cwd.as_deref().unwrap_or_default();
+                    log::warn!(
+                        "[SessionPersistence] Cannot restore cwd {cwd:?}: {error}; using default cwd"
+                    );
+                    match Session::spawn(config, next_id, cols, rows, None) {
+                        Ok(session) => {
+                            restore_warnings.push(format!(
+                                "Restored missing cwd {cwd:?} in the default folder"
+                            ));
+                            sessions.push(session);
+                            next_id += 1;
+                        }
+                        Err(fallback_error) => restore_warnings
+                            .push(format!("Cannot restore terminal session: {fallback_error}")),
+                    }
+                }
+                Err(error) => {
+                    restore_warnings.push(format!("Cannot restore terminal session: {error}"));
+                }
             }
         }
         if sessions.is_empty() {
@@ -1606,7 +1704,14 @@ impl Jterm {
             sessions.len(),
             path.display()
         );
-        (sessions, active, next_id, snapshot.tree, snapshot.split)
+        (
+            sessions,
+            active,
+            next_id,
+            snapshot.tree,
+            snapshot.split,
+            (!restore_warnings.is_empty()).then(|| restore_warnings.join("\n")),
+        )
     }
 
     /// Persist the current tabs (live cwd of each + active index) when enabled.
@@ -1615,7 +1720,7 @@ impl Jterm {
         // Reconciling current state now; clear the dirty flag so an idle app does
         // not re-walk every tab's cwd on each periodic tick.
         self.session_dirty = false;
-        if !self.config.restore_session || !self.is_first_instance {
+        if self.sessions.is_empty() || !self.config.restore_session || !self.is_first_instance {
             return;
         }
         let snaps: Vec<session_persistence::SessionSnapshot> = self
@@ -1641,20 +1746,29 @@ impl Jterm {
 
     fn new_session(&mut self) {
         let cwd = self.sessions.get(self.active).and_then(|s| s.cwd());
-        if let Some(sess) = Session::spawn(
+        match Session::spawn(
             &self.config,
             self.next_id,
             self.cols,
             self.rows,
             cwd.as_deref(),
         ) {
-            self.next_id += 1;
-            let insert = (self.active + 1).min(self.sessions.len());
-            self.sessions.insert(insert, sess);
-            self.active = insert;
-            self.unsplit();
-            self.refresh_active_context();
-            self.save_session_snapshot();
+            Ok(session) => {
+                self.session_diagnostic = None;
+                self.next_id += 1;
+                let insert = (self.active + 1).min(self.sessions.len());
+                self.sessions.insert(insert, session);
+                self.active = insert;
+                self.unsplit();
+                self.refresh_active_context();
+                self.save_session_snapshot();
+            }
+            Err(error) => {
+                let message = error.to_string();
+                log::error!("[PTY] {message}");
+                self.session_diagnostic = Some(message.clone());
+                self.push_toast(message, ToastKind::Warning);
+            }
         }
     }
 
@@ -1795,30 +1909,23 @@ impl Jterm {
     }
 
     fn next_session(&mut self) {
-        if !self.sessions.is_empty() {
-            self.active = (self.active + 1) % self.sessions.len();
-            self.session_dirty = true;
-            self.unsplit();
-            self.refresh_active_context();
+        if let Some(target) =
+            (!self.sessions.is_empty()).then(|| (self.active + 1) % self.sessions.len())
+        {
+            self.activate_session(target);
         }
     }
 
     fn prev_session(&mut self) {
-        if !self.sessions.is_empty() {
-            self.active = (self.active + self.sessions.len() - 1) % self.sessions.len();
-            self.session_dirty = true;
-            self.unsplit();
-            self.refresh_active_context();
+        if let Some(target) = (!self.sessions.is_empty())
+            .then(|| (self.active + self.sessions.len() - 1) % self.sessions.len())
+        {
+            self.activate_session(target);
         }
     }
 
     fn jump_session(&mut self, index: usize) {
-        if index < self.sessions.len() {
-            self.active = index;
-            self.session_dirty = true;
-            self.unsplit();
-            self.refresh_active_context();
-        }
+        self.activate_session(index);
     }
 
     /// Push a transient bottom-right toast. Auto-expires; dismissable.
@@ -1923,21 +2030,30 @@ impl Jterm {
                     .sessions
                     .get(i)
                     .and_then(|s| s.cwd_cache.clone().or_else(|| s.cwd()));
-                if let Some(sess) = Session::spawn(
+                match Session::spawn(
                     &self.config,
                     self.next_id,
                     self.cols,
                     self.rows,
                     cwd.as_deref(),
                 ) {
-                    self.next_id += 1;
-                    let insert = (i + 1).min(self.sessions.len());
-                    self.sessions.insert(insert, sess);
-                    self.active = insert;
-                    self.unsplit();
-                    self.refresh_active_context();
-                    self.save_session_snapshot();
-                    self.push_toast("Duplicated tab", ToastKind::Success);
+                    Ok(session) => {
+                        self.session_diagnostic = None;
+                        self.next_id += 1;
+                        let insert = (i + 1).min(self.sessions.len());
+                        self.sessions.insert(insert, session);
+                        self.active = insert;
+                        self.unsplit();
+                        self.refresh_active_context();
+                        self.save_session_snapshot();
+                        self.push_toast("Duplicated tab", ToastKind::Success);
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        log::error!("[PTY] {message}");
+                        self.session_diagnostic = Some(message.clone());
+                        self.push_toast(message, ToastKind::Warning);
+                    }
                 }
                 Task::none()
             }
@@ -2077,23 +2193,32 @@ impl Jterm {
             return;
         }
         let cwd = self.sessions.get(self.active).and_then(|s| s.cwd());
-        if let Some(sess) = Session::spawn(
+        match Session::spawn(
             &self.config,
             self.next_id,
             self.cols,
             self.rows,
             cwd.as_deref(),
         ) {
-            self.next_id += 1;
-            self.sessions.push(sess);
-            let new_idx = self.sessions.len() - 1;
-            self.layout.split_leaf(self.active, axis, new_idx);
-            self.active = new_idx;
-            // Splitting while zoomed lands in the new multi-pane layout.
-            self.pane_zoomed = false;
-            self.relayout();
-            self.refresh_active_context();
-            self.save_session_snapshot();
+            Ok(session) => {
+                self.session_diagnostic = None;
+                self.next_id += 1;
+                self.sessions.push(session);
+                let new_idx = self.sessions.len() - 1;
+                self.layout.split_leaf(self.active, axis, new_idx);
+                self.active = new_idx;
+                // Splitting while zoomed lands in the new multi-pane layout.
+                self.pane_zoomed = false;
+                self.relayout();
+                self.refresh_active_context();
+                self.save_session_snapshot();
+            }
+            Err(error) => {
+                let message = error.to_string();
+                log::error!("[PTY] {message}");
+                self.session_diagnostic = Some(message.clone());
+                self.push_toast(message, ToastKind::Warning);
+            }
         }
     }
 
@@ -2119,20 +2244,13 @@ impl Jterm {
         self.refresh_active_context();
     }
 
-    /// Display `sessions[index]` in the focused pane (tab switcher while
-    /// split). A session already visible in another pane gets focused there
-    /// instead of appearing twice; the swapped-in/out sessions are re-sized for
-    /// their new homes.
-    fn show_session_in_focused_pane(&mut self, index: usize) {
-        if !self.layout.contains_session(index) {
-            // Replace the focused leaf's session in place.
-            if let Some(path) = self.layout.path_to_session(self.active) {
-                if let Some(PaneTree::Leaf(s)) = self.layout.node_at_path_mut(&path) {
-                    *s = index;
-                }
-            } else {
-                self.layout = PaneTree::Leaf(index);
-            }
+    /// Activate `sessions[index]` through the single tab/session switching path.
+    /// A visible target is focused in its existing pane; a hidden target replaces
+    /// the focused leaf in place. Split topology and ratios are never discarded.
+    fn activate_session(&mut self, index: usize) {
+        if index >= self.sessions.len() || !self.layout.focus_or_replace_session(self.active, index)
+        {
+            return;
         }
         self.active = index;
         self.session_dirty = true;
@@ -2181,10 +2299,7 @@ impl Jterm {
                 (on_side && perp_overlap > 0.0).then_some((p.session, gap.max(0.0), perp_overlap))
             })
             // Nearest along the direction; ties broken by the larger overlap.
-            .min_by(|a, b| {
-                a.1.total_cmp(&b.1)
-                    .then(b.2.total_cmp(&a.2))
-            });
+            .min_by(|a, b| a.1.total_cmp(&b.1).then(b.2.total_cmp(&a.2)));
         if let Some((session, _, _)) = best {
             self.active = session;
             self.refresh_active_context();
@@ -2514,10 +2629,7 @@ impl Jterm {
                 self.config_panel_open = !self.config_panel_open;
                 Task::none()
             }
-            C::SidebarToggle => {
-                self.toggle_sidebar();
-                Task::none()
-            }
+            C::SidebarToggle => self.toggle_sidebar(),
             C::FontZoomIn => {
                 self.adjust_font_size(1.0);
                 Task::none()
@@ -2599,7 +2711,7 @@ impl Jterm {
                 self.tab_switcher = None;
                 if let Some(i) = target {
                     if i < self.sessions.len() && i != self.active {
-                        self.show_session_in_focused_pane(i);
+                        self.activate_session(i);
                     }
                 }
                 return Some(Task::none());
@@ -3142,10 +3254,7 @@ impl Jterm {
                 Task::none()
             }
             PaletteAction::ClosePane => self.close_focused_pane(),
-            PaletteAction::ToggleSidebar => {
-                self.toggle_sidebar();
-                Task::none()
-            }
+            PaletteAction::ToggleSidebar => self.toggle_sidebar(),
             PaletteAction::OpenSettings => {
                 self.config_panel_open = true;
                 Task::none()
@@ -3691,9 +3800,7 @@ impl Jterm {
                     }
                 }
             }
-            Message::ToggleSidebar => {
-                self.toggle_sidebar();
-            }
+            Message::ToggleSidebar => return self.toggle_sidebar(),
             Message::SetSidebarPanel(panel) => {
                 self.sidebar_panel = panel;
                 // Opening the file tree should reflect the active tab's cwd.
@@ -3703,8 +3810,10 @@ impl Jterm {
                         .get(self.active)
                         .and_then(|s| s.cwd_cache.clone().or_else(|| s.cwd()))
                     {
-                        self.sidebar.set_current_dir(std::path::PathBuf::from(cwd));
+                        let request = self.sidebar.set_current_dir(std::path::PathBuf::from(cwd));
+                        return sidebar_load_task(request);
                     }
+                    return sidebar_load_task(self.sidebar.refresh());
                 }
             }
             Message::SetTabPosition(pos) => {
@@ -3717,7 +3826,11 @@ impl Jterm {
                     self.apply_config();
                 }
             }
-            Message::SidebarToggleNode(path) => self.sidebar.toggle_node(&path),
+            Message::SidebarToggleNode(path) => {
+                if let Some(request) = self.sidebar.toggle_node(&path) {
+                    return sidebar_load_task(request);
+                }
+            }
             Message::SidebarInsertPath(path) => {
                 // Type the (shell-quoted) path into the active terminal so the
                 // sidebar doubles as a path picker.
@@ -3727,6 +3840,24 @@ impl Jterm {
                     sess.write_pty(quoted.as_bytes());
                     sess.refresh();
                 }
+            }
+            Message::SidebarGoParent => {
+                if let Some(parent) = self
+                    .sidebar
+                    .current_dir
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+                {
+                    let request = self.sidebar.set_current_dir(parent);
+                    return sidebar_load_task(request);
+                }
+            }
+            Message::SidebarRefresh => {
+                let request = self.sidebar.refresh();
+                return sidebar_load_task(request);
+            }
+            Message::SidebarLoaded(result) => {
+                self.sidebar.apply_load(result);
             }
             Message::SearchToggleRegex => {
                 self.search.toggle_regex();
@@ -3809,6 +3940,15 @@ impl Jterm {
             }
             Message::SetFontSize(v) => {
                 self.config.font_size = Config::clamp_font_size(v);
+                self.font_zoom = 0.0;
+                self.config_dirty = true;
+                self.apply_config();
+            }
+            Message::SetUiScale(v) => {
+                let old_scale = self.scale_factor();
+                let new_scale = v.clamp(0.5, 4.0);
+                self.win_size = logical_viewport_after_scale(self.win_size, old_scale, new_scale);
+                self.config.ui_scale = Some(new_scale);
                 self.config_dirty = true;
                 self.apply_config();
             }
@@ -3940,22 +4080,39 @@ impl Jterm {
                     self.apply_config();
                 }
             }
-            Message::ConfigSave => match self.config.save() {
-                Ok(()) => {
-                    self.config_mtime = Config::config_mtime();
-                    self.config_dirty = false;
-                    self.push_toast("Config saved", ToastKind::Success);
+            Message::ConfigSave => {
+                if self.config_write_blocked {
+                    self.push_toast(
+                        "Config not saved: fix the file error or Reset explicitly",
+                        ToastKind::Warning,
+                    );
+                } else {
+                    match self.config.save() {
+                        Ok(()) => {
+                            self.config_mtime = Config::config_mtime();
+                            self.config_dirty = false;
+                            self.push_toast("Config saved", ToastKind::Success);
+                        }
+                        Err(e) => {
+                            self.push_toast(format!("Save failed: {}", e), ToastKind::Warning)
+                        }
+                    }
                 }
-                Err(e) => self.push_toast(format!("Save failed: {}", e), ToastKind::Warning),
-            },
+            }
             Message::ConfigReset => {
+                let old_scale = self.scale_factor();
                 self.config = Config::default();
+                self.win_size =
+                    logical_viewport_after_scale(self.win_size, old_scale, self.scale_factor());
+                self.font_zoom = 0.0;
                 self.sync_tab_position_ui();
                 self.apply_config();
                 match self.config.save() {
                     Ok(()) => {
                         self.config_mtime = Config::config_mtime();
                         self.config_dirty = false;
+                        self.config_write_blocked = false;
+                        self.config_diagnostic = None;
                         self.push_toast("Config reset to defaults", ToastKind::Info);
                     }
                     Err(error) => {
@@ -3975,14 +4132,60 @@ impl Jterm {
                     if m != self.config_mtime {
                         self.config_mtime = m;
                         if let Ok(path) = Config::config_path() {
-                            if let Ok(content) = std::fs::read_to_string(&path) {
-                                if let Ok(c) = Config::from_toml(&content) {
-                                    self.config = c;
+                            match Config::load_path(&path) {
+                                Ok(config) => {
+                                    let recovered = self.config_diagnostic.take().is_some();
+                                    let old_scale = self.scale_factor();
+                                    self.config = config;
+                                    self.win_size = logical_viewport_after_scale(
+                                        self.win_size,
+                                        old_scale,
+                                        self.scale_factor(),
+                                    );
                                     self.config_dirty = false;
+                                    self.config_write_blocked = false;
                                     self.sync_tab_position_ui();
                                     self.apply_config();
+                                    if recovered {
+                                        self.push_toast(
+                                            "Config fixed and reloaded",
+                                            ToastKind::Success,
+                                        );
+                                    }
+                                }
+                                Err(error) => {
+                                    let changed =
+                                        self.config_diagnostic.as_deref() != Some(error.as_str());
+                                    self.config_write_blocked = true;
+                                    self.config_diagnostic = Some(error.clone());
+                                    if changed {
+                                        self.push_toast(
+                                            "Config reload failed; keeping last-known-good values",
+                                            ToastKind::Warning,
+                                        );
+                                    }
                                 }
                             }
+                        }
+                    }
+                }
+                let keybindings_mtime = keybindings::KeyBindings::config_mtime();
+                if keybindings_mtime != self.keybindings_mtime {
+                    self.keybindings_mtime = keybindings_mtime;
+                    let loaded = keybindings::KeyBindings::load_with_diagnostics();
+                    if loaded.usable {
+                        self.keybindings = loaded.bindings;
+                    }
+                    let changed = loaded.diagnostics != self.keybindings_diagnostics;
+                    self.keybindings_diagnostics = loaded.diagnostics;
+                    if changed {
+                        if self.keybindings_diagnostics.is_empty() {
+                            self.push_toast("Keybindings reloaded", ToastKind::Success);
+                        } else {
+                            self.push_toast(
+                                "Some keybindings could not be loaded",
+                                ToastKind::Warning,
+                            );
                         }
                     }
                 }
@@ -4031,7 +4234,7 @@ impl Jterm {
                 self.tab_switcher = None;
                 if let Some(index) = self.sessions.iter().position(|session| session.id == id) {
                     if index != self.active {
-                        self.show_session_in_focused_pane(index);
+                        self.activate_session(index);
                     }
                 }
             }
@@ -4565,6 +4768,65 @@ impl Jterm {
             .into()
     }
 
+    /// Persistent load diagnostics. Unlike transient toasts, these remain
+    /// visible until the user fixes the underlying file (or explicitly resets
+    /// the main config), so a fallback can never look like a successful load.
+    fn diagnostics_overlay(&self) -> Element<'_, Message> {
+        let mut content = column![text("jterm3 needs attention").size(13)]
+            .spacing(4)
+            .width(Length::Fill);
+        if let Some(error) = &self.config_diagnostic {
+            content = content.push(
+                text(error.clone())
+                    .size(11)
+                    .wrapping(text::Wrapping::Word)
+                    .style(text::warning),
+            );
+            content = content.push(
+                text("Auto-save is paused to preserve the file. Fix it externally or use Reset.")
+                    .size(10)
+                    .wrapping(text::Wrapping::Word)
+                    .style(text::secondary),
+            );
+        }
+        if let Some(error) = &self.session_diagnostic {
+            content = content.push(
+                text(error.clone())
+                    .size(11)
+                    .wrapping(text::Wrapping::Word)
+                    .style(text::danger),
+            );
+        }
+        for diagnostic in self.keybindings_diagnostics.iter().take(3) {
+            content = content.push(
+                text(diagnostic.clone())
+                    .size(11)
+                    .wrapping(text::Wrapping::Word)
+                    .style(text::warning),
+            );
+        }
+        if self.keybindings_diagnostics.len() > 3 {
+            content = content.push(
+                text(format!(
+                    "…and {} more keybinding issue(s)",
+                    self.keybindings_diagnostics.len() - 3
+                ))
+                .size(10)
+                .style(text::secondary),
+            );
+        }
+        let panel_width = (self.win_size.width - 32.0).clamp(240.0, 520.0);
+        let panel = container(content)
+            .width(Length::Fixed(panel_width))
+            .padding([8, 12])
+            .style(container::dark);
+        container(panel)
+            .align_right(Length::Fill)
+            .align_top(Length::Fill)
+            .padding([40, 8])
+            .into()
+    }
+
     /// Ctrl+Shift+L fuzzy tab switcher overlay (palette-style).
     fn tab_switcher_view(&self, state: &TabSwitcherState) -> Element<'_, Message> {
         let filtered = tab_switcher_filtered(&self.sessions, &state.query);
@@ -4880,17 +5142,54 @@ impl Jterm {
             .and_then(|n| n.to_str())
             .unwrap_or("/")
             .to_string();
-        let mut rows: Vec<Element<'_, Message>> =
-            vec![container(text(title).size(12).font(iced::Font {
-                weight: iced::font::Weight::Bold,
-                ..iced::Font::DEFAULT
-            }))
-            .padding([4, 6])
-            .into()];
-        if let Some(root) = &self.sidebar.root {
-            for child in &root.children {
-                self.collect_sidebar_nodes(child, 0, &mut rows);
-            }
+        let mut up = button(text("↑").size(12))
+            .padding([2, 6])
+            .style(self.ghost_btn_style());
+        if self.sidebar.current_dir.parent().is_some() {
+            up = up.on_press(Message::SidebarGoParent);
+        }
+        let header = row![
+            up,
+            text(title)
+                .size(12)
+                .font(iced::Font {
+                    weight: iced::font::Weight::Bold,
+                    ..iced::Font::DEFAULT
+                })
+                .width(Length::Fill),
+            button(text("↻").size(12))
+                .on_press(Message::SidebarRefresh)
+                .padding([2, 6])
+                .style(self.ghost_btn_style()),
+        ]
+        .spacing(4)
+        .align_y(iced::Alignment::Center);
+        let mut rows: Vec<Element<'_, Message>> = vec![container(header).padding([4, 6]).into()];
+        match &self.sidebar.root.state {
+            sidebar::DirectoryState::Loading => rows.push(
+                container(text("Loading…").size(11).style(text::secondary))
+                    .padding([4, 8])
+                    .into(),
+            ),
+            sidebar::DirectoryState::Error(error) => rows.push(
+                container(
+                    text(error.clone())
+                        .size(11)
+                        .wrapping(text::Wrapping::Word)
+                        .style(text::danger),
+                )
+                .padding([4, 8])
+                .into(),
+            ),
+            sidebar::DirectoryState::Loaded if self.sidebar.root.children.is_empty() => rows.push(
+                container(text("Empty directory").size(11).style(text::secondary))
+                    .padding([4, 8])
+                    .into(),
+            ),
+            _ => {}
+        }
+        for child in &self.sidebar.root.children {
+            self.collect_sidebar_nodes(child, 0, &mut rows);
         }
         let list = iced::widget::Column::with_children(rows).spacing(1);
         scrollable(list).height(Length::Fill).into()
@@ -4964,14 +5263,20 @@ impl Jterm {
         out: &mut Vec<Element<'a, Message>>,
     ) {
         let indent = 6.0 + depth as f32 * 12.0;
-        let icon = if node.is_dir {
-            if node.expanded {
-                "▾"
-            } else {
-                "▸"
-            }
-        } else {
+        let icon = if !node.is_dir {
             "·"
+        } else {
+            match &node.state {
+                sidebar::DirectoryState::Loading => "◌",
+                sidebar::DirectoryState::Error(_) => "!",
+                sidebar::DirectoryState::Unloaded | sidebar::DirectoryState::Loaded => {
+                    if node.expanded {
+                        "▾"
+                    } else {
+                        "▸"
+                    }
+                }
+            }
         };
         let label = row![
             Space::new().width(Length::Fixed(indent)),
@@ -4993,6 +5298,18 @@ impl Jterm {
                 .into(),
         );
         if node.is_dir && node.expanded {
+            if let sidebar::DirectoryState::Error(error) = &node.state {
+                out.push(
+                    container(
+                        text(error.clone())
+                            .size(10)
+                            .wrapping(text::Wrapping::Word)
+                            .style(text::danger),
+                    )
+                    .padding([2, (20.0 + depth as f32 * 12.0) as u16])
+                    .into(),
+                );
+            }
             for child in &node.children {
                 self.collect_sidebar_nodes(child, depth + 1, out);
             }
@@ -5110,7 +5427,31 @@ impl Jterm {
 
     fn view(&self) -> Element<'_, Message> {
         if self.sessions.is_empty() {
-            return container(text("no session")).into();
+            let message = self
+                .session_diagnostic
+                .as_deref()
+                .unwrap_or("No terminal session is available");
+            let panel_width = (self.win_size.width - 48.0).clamp(240.0, 520.0);
+            let empty: Element<'_, Message> = container(
+                column![
+                    text("Terminal could not start").size(20),
+                    text(message.to_string())
+                        .size(12)
+                        .wrapping(text::Wrapping::Word)
+                        .style(text::danger),
+                    button(text("Retry").size(13)).on_press(Message::NewSession),
+                ]
+                .spacing(12)
+                .width(Length::Fixed(panel_width)),
+            )
+            .center(Length::Fill)
+            .padding(24)
+            .into();
+            return if self.config_diagnostic.is_some() || !self.keybindings_diagnostics.is_empty() {
+                stack![empty, self.diagnostics_overlay()].into()
+            } else {
+                empty
+            };
         }
         let panes_body: Element<'_, Message> = if self.is_split() && self.pane_zoomed {
             // Zoomed: the focused pane fills the whole area; the hidden panes
@@ -5198,6 +5539,14 @@ impl Jterm {
         };
         let root: Element<'_, Message> = if let Some((id, process, _)) = &self.tab_close_confirm {
             stack![root, self.tab_close_confirm_view(*id, process)].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if self.config_diagnostic.is_some()
+            || self.session_diagnostic.is_some()
+            || !self.keybindings_diagnostics.is_empty()
+        {
+            stack![root, self.diagnostics_overlay()].into()
         } else {
             root
         };
@@ -5426,9 +5775,26 @@ impl Jterm {
         let font_size = responsive_slider_row(
             compact,
             "Font Size",
-            format!("{:.0}", self.config.font_size),
+            if self.font_zoom.abs() >= f32::EPSILON {
+                format!(
+                    "{:.0} (live {:.0})",
+                    self.config.font_size,
+                    self.effective_font_size()
+                )
+            } else {
+                format!("{:.0}", self.config.font_size)
+            },
             slider(8.0..=72.0, self.config.font_size, Message::SetFontSize)
-                .step(1.0)
+                .step(1.0_f32)
+                .into(),
+        );
+        let ui_scale_value = self.config.ui_scale.unwrap_or(1.0);
+        let ui_scale = responsive_slider_row(
+            compact,
+            "UI Scale",
+            format!("{:.0}%", ui_scale_value * 100.0),
+            slider(0.5..=4.0, ui_scale_value, Message::SetUiScale)
+                .step(0.05_f32)
                 .into(),
         );
         let line_spacing = responsive_slider_row(
@@ -5436,7 +5802,7 @@ impl Jterm {
             "Line Spacing",
             format!("{:.2}", self.config.line_spacing),
             slider(0.8..=3.0, self.config.line_spacing, Message::SetLineSpacing)
-                .step(0.05)
+                .step(0.05_f32)
                 .into(),
         );
         let padding = responsive_slider_row(
@@ -5444,7 +5810,7 @@ impl Jterm {
             "Padding",
             format!("{:.0}", self.config.padding),
             slider(0.0..=20.0, self.config.padding, Message::SetPadding)
-                .step(1.0)
+                .step(1.0_f32)
                 .into(),
         );
         let scrollback = responsive_slider_row(
@@ -5553,6 +5919,7 @@ impl Jterm {
             theme_row,
             font_family_row,
             font_size,
+            ui_scale,
             line_spacing,
             padding,
             scrollback,
@@ -5916,6 +6283,13 @@ fn slider_row<'a>(
     .into()
 }
 
+fn sidebar_load_task(request: sidebar::DirectoryRequest) -> Task<Message> {
+    Task::perform(
+        async move { sidebar::load_directory(request) },
+        Message::SidebarLoaded,
+    )
+}
+
 /// Score and sort tabs against the switcher query. Empty query returns all in
 /// declaration order; otherwise returns matches highest score first as
 /// `(filtered_position, session_index)` tuples. Used by both the renderer and
@@ -6173,23 +6547,6 @@ fn pty_stream(key: PtySubscriptionKey) -> impl iced::futures::Stream<Item = Mess
             }
         },
     )
-}
-
-/// Load keybindings from disk (merged onto defaults), logging any load error or
-/// invalid binding so a malformed config degrades gracefully to the defaults.
-fn load_keybindings() -> keybindings::KeyBindings {
-    match keybindings::KeyBindings::load() {
-        Ok(kb) => {
-            for issue in kb.check_conflicts() {
-                log::warn!("[keybindings] {issue}");
-            }
-            kb
-        }
-        Err(e) => {
-            log::warn!("[keybindings] failed to load, using defaults: {e}");
-            keybindings::KeyBindings::default()
-        }
-    }
 }
 
 /// Build the normalized binding string (e.g. `"ctrl+shift+t"`) for a key event,
@@ -6579,6 +6936,37 @@ mod tests {
     use iced::keyboard::key::Named;
 
     #[test]
+    fn ui_scale_change_resizes_logical_viewport_and_terminal_grid() {
+        let old_viewport = Size::new(1200.0, 800.0);
+        let old_scale = 1.0;
+        let new_scale = 2.0;
+        let new_viewport = logical_viewport_after_scale(old_viewport, old_scale, new_scale);
+
+        assert_eq!(new_viewport, Size::new(600.0, 400.0));
+        assert_eq!(
+            new_viewport.width * new_scale,
+            old_viewport.width * old_scale
+        );
+        assert_eq!(
+            new_viewport.height * new_scale,
+            old_viewport.height * old_scale
+        );
+
+        let metrics = Metrics::new(10.0, 1.0, 0.0);
+        let old_grid = metrics.grid_size(
+            old_viewport.width - terminal_view::SCROLLBAR_WIDTH,
+            old_viewport.height - TAB_BAR_H - STATUS_BAR_H,
+        );
+        let new_grid = metrics.grid_size(
+            new_viewport.width - terminal_view::SCROLLBAR_WIDTH,
+            new_viewport.height - TAB_BAR_H - STATUS_BAR_H,
+        );
+        assert!(new_grid.0 < old_grid.0);
+        assert!(new_grid.1 < old_grid.1);
+        assert_eq!(new_grid, (98, 29));
+    }
+
+    #[test]
     fn app_chrome_shortcuts_keep_palette_help_switcher_and_f12_contract() {
         let ctrl_shift = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
         let character = |s: &str| keyboard::Key::Character(s.into());
@@ -6657,6 +7045,73 @@ mod tests {
         assert_eq!(t.path_to_session(3), Some(vec![1, 1]));
         // Splitting a session that does not exist is a no-op.
         assert!(!t.split_leaf(99, Axis::Vertical, 4));
+    }
+
+    #[test]
+    fn activation_focuses_a_visible_session_without_changing_the_tree() {
+        let mut tree = PaneTree::Split {
+            axis: Axis::Vertical,
+            children: vec![
+                PaneTree::Leaf(0),
+                PaneTree::Split {
+                    axis: Axis::Horizontal,
+                    children: vec![PaneTree::Leaf(1), PaneTree::Leaf(2)],
+                    ratios: vec![0.35, 0.65],
+                },
+            ],
+            ratios: vec![0.4, 0.6],
+        };
+        let before = tree.clone();
+
+        assert!(tree.focus_or_replace_session(0, 2));
+        assert_eq!(tree, before);
+        assert_eq!(tree.leaves().iter().filter(|&&s| s == 2).count(), 1);
+    }
+
+    #[test]
+    fn activation_replaces_only_the_focused_leaf_for_a_hidden_session() {
+        let mut tree = PaneTree::Split {
+            axis: Axis::Vertical,
+            children: vec![
+                PaneTree::Leaf(0),
+                PaneTree::Split {
+                    axis: Axis::Horizontal,
+                    children: vec![PaneTree::Leaf(1), PaneTree::Leaf(2)],
+                    ratios: vec![0.35, 0.65],
+                },
+            ],
+            ratios: vec![0.4, 0.6],
+        };
+
+        assert!(tree.focus_or_replace_session(1, 3));
+        assert_eq!(
+            tree,
+            PaneTree::Split {
+                axis: Axis::Vertical,
+                children: vec![
+                    PaneTree::Leaf(0),
+                    PaneTree::Split {
+                        axis: Axis::Horizontal,
+                        children: vec![PaneTree::Leaf(3), PaneTree::Leaf(2)],
+                        ratios: vec![0.35, 0.65],
+                    },
+                ],
+                ratios: vec![0.4, 0.6],
+            }
+        );
+        assert_eq!(tree.leaves(), vec![0, 3, 2]);
+        assert_eq!(tree.leaves().iter().filter(|&&s| s == 3).count(), 1);
+    }
+
+    #[test]
+    fn activation_preserves_single_pane_behavior_and_rejects_missing_focus() {
+        let mut single = PaneTree::Leaf(0);
+        assert!(single.focus_or_replace_session(0, 4));
+        assert_eq!(single, PaneTree::Leaf(4));
+
+        let before = single.clone();
+        assert!(!single.focus_or_replace_session(99, 5));
+        assert_eq!(single, before);
     }
 
     #[test]

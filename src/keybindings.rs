@@ -334,6 +334,15 @@ pub struct KeyBindings {
     pub bindings: HashMap<String, String>, // "ctrl+shift+a" => "command:name"
 }
 
+#[derive(Clone, Debug)]
+pub struct KeyBindingsLoad {
+    pub bindings: KeyBindings,
+    pub diagnostics: Vec<String>,
+    /// False when the file itself could not be read or parsed. Callers doing a
+    /// live reload should retain their last-known-good table in that case.
+    pub usable: bool,
+}
+
 impl KeyBindings {
     pub fn new() -> Self {
         Self {
@@ -468,6 +477,7 @@ impl KeyBindings {
     }
 
     /// 检测快捷键冲突
+    #[cfg(test)]
     pub fn check_conflicts(&self) -> Vec<String> {
         let mut conflicts = Vec::new();
 
@@ -483,30 +493,89 @@ impl KeyBindings {
         conflicts
     }
 
-    /// 加载配置文件，与默认配置合并
-    pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
+    /// Merge user TOML over defaults while retaining every valid entry. Invalid
+    /// bindings are diagnosed individually instead of discarding the entire
+    /// custom table.
+    pub fn from_toml_with_diagnostics(content: &str) -> Result<KeyBindingsLoad, toml::de::Error> {
         let mut bindings = Self::default_bindings();
+        let mut diagnostics = Vec::new();
+        let user_bindings: KeyBindings = toml::from_str(content)?;
+        for (key, value) in user_bindings.bindings {
+            let Some(canonical) = KeyBinding::canonical(&key) else {
+                diagnostics.push(format!("Invalid shortcut \"{key}\""));
+                continue;
+            };
+            if let Err(error) = value.parse::<Command>() {
+                diagnostics.push(format!("Invalid command for \"{key}\": {error}"));
+                continue;
+            }
+            bindings.bindings.insert(canonical, value);
+        }
+        Ok(KeyBindingsLoad {
+            bindings,
+            diagnostics,
+            usable: true,
+        })
+    }
 
-        let path = Self::config_path()?;
-        if path.exists() {
-            let content = std::fs::read_to_string(&path)?;
-            let user_bindings: KeyBindings = toml::from_str(&content)?;
-            // 合并用户配置到默认配置，用户配置会覆盖默认值。
-            // Canonicalize each user key so a different modifier order or an
-            // alias (cmd/option/…) still overrides the matching default.
-            for (key, value) in user_bindings.bindings {
-                let key = KeyBinding::canonical(&key).unwrap_or(key);
-                bindings.bindings.insert(key, value);
+    /// Load the user file with path-rich, UI-ready diagnostics.
+    pub fn load_with_diagnostics() -> KeyBindingsLoad {
+        let mut fallback = KeyBindingsLoad {
+            bindings: Self::default_bindings(),
+            diagnostics: Vec::new(),
+            usable: true,
+        };
+        let path = match Self::config_path() {
+            Ok(path) => path,
+            Err(error) => {
+                fallback
+                    .diagnostics
+                    .push(format!("Cannot locate keybindings config: {error}"));
+                fallback.usable = false;
+                return fallback;
+            }
+        };
+        if !path.exists() {
+            return fallback;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) => {
+                fallback
+                    .diagnostics
+                    .push(format!("Cannot read {}: {error}", path.display()));
+                fallback.usable = false;
+                return fallback;
+            }
+        };
+        match Self::from_toml_with_diagnostics(&content) {
+            Ok(mut loaded) => {
+                for diagnostic in &mut loaded.diagnostics {
+                    *diagnostic = format!("{}: {diagnostic}", path.display());
+                }
+                loaded
+            }
+            Err(error) => {
+                fallback
+                    .diagnostics
+                    .push(format!("Cannot parse {}: {error}", path.display()));
+                fallback.usable = false;
+                fallback
             }
         }
-
-        Ok(bindings)
     }
 
     /// 获取配置文件路径
     pub fn config_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
         let config_dir = dirs::config_dir().ok_or("Could not determine config directory")?;
         Ok(config_dir.join("jterm3/keybindings.toml"))
+    }
+
+    pub fn config_mtime() -> Option<std::time::SystemTime> {
+        Self::config_path()
+            .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|metadata| metadata.modified().ok())
     }
 }
 
@@ -631,6 +700,32 @@ mod tests {
             conflicts.is_empty(),
             "Default bindings should have no conflicts"
         );
+    }
+
+    #[test]
+    fn invalid_user_entries_do_not_discard_valid_overrides() {
+        let loaded = KeyBindings::from_toml_with_diagnostics(
+            r#"
+"shift+ctrl+k" = "session:new"
+"ctrl+shift+broken" = "command:does-not-exist"
+"ctrl++x" = "edit:copy"
+"#,
+        )
+        .expect("valid TOML");
+
+        assert_eq!(
+            loaded.bindings.get_command("ctrl+shift+k"),
+            Some(Command::SessionNew)
+        );
+        assert_eq!(loaded.diagnostics.len(), 2);
+        assert!(loaded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("Invalid command")));
+        assert!(loaded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("Invalid shortcut")));
     }
 
     #[test]

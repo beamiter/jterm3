@@ -9,13 +9,16 @@ jterm3 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 w
 - UTF-8、中文宽字符、True Color、256 色、鼠标报告、括号粘贴和扩展键盘协议
 - Kitty 图像直接传输（PNG、RGB、RGBA），带传输、像素、解压内存和放置数量上限
 - 文件侧栏、路径插入、链接识别、命令面板、主题编辑和实时设置
+- 文件侧栏按目录异步懒加载，支持返回上级与刷新；慢盘、NFS/FUSE 不再阻塞主界面
 - 自动保存标签工作目录并恢复会话；多实例之间不会互相覆盖恢复数据
 - OSC 10/11/12 动态颜色、OSC 52/5522 剪贴板和桌面通知
 - 有界 PTY 输入/输出队列、稳定会话身份校验和繁忙进程关闭保护
+- PTY 启动采用 fork→exec 错误握手；无效目录、shell/exec 失败会显示可重试诊断而不是崩溃
+- 配置与快捷键热重载采用 last-known-good；坏文件会显示路径/行列并暂停自动写回
 
 ## 构建与运行
 
-目前支持 Linux。需要稳定版 Rust、Fontconfig，以及 Wayland/X11 和 OpenGL/EGL 的开发库。Ubuntu/Debian 可安装：
+目前支持 Linux。项目固定使用 Rust 1.97.0（`rust-toolchain.toml` 会由 rustup 自动选择），并需要 Fontconfig、Wayland/X11 和 OpenGL/EGL 的开发库。Ubuntu/Debian 可安装：
 
 ```bash
 sudo apt-get install pkg-config libfontconfig1-dev libwayland-dev \
@@ -27,6 +30,7 @@ sudo apt-get install pkg-config libfontconfig1-dev libwayland-dev \
 然后构建：
 
 ```bash
+rustup toolchain install 1.97.0 --profile minimal --component rustfmt --component clippy
 cargo build --release --locked
 ./target/release/jterm3
 ```
@@ -54,11 +58,10 @@ install -Dm755 target/release/jterm3 "$HOME/.local/bin/jterm3"
 | 调整 Pane 大小 | `Ctrl+Alt+Shift+方向键`（双击分割线均分该节点） |
 | Pane 缩放（临时全屏） | `Ctrl+Shift+Z` |
 | 交换相邻 Pane | `Ctrl+Shift+X` |
-| 关闭聚焦 Pane | `Ctrl+Shift+W`（其余 pane 保持分屏） |
-| 关闭当前标签或 pane | `Ctrl+Shift+W` |
+| 关闭聚焦 Pane / 当前标签 | `Ctrl+Shift+W`（分屏时其余 pane 保持） |
 | 文件/标签侧栏 | `Ctrl+\` |
 | 设置 | `Ctrl+Shift+O` |
-| 放大 / 缩小 / 重置字体 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
+| 临时放大 / 缩小 / 恢复配置字号 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
 
 快捷键从 `$XDG_CONFIG_HOME/jterm3/keybindings.toml`（通常是 `~/.config/jterm3/keybindings.toml`）加载，并与默认绑定合并。
 
@@ -71,6 +74,7 @@ font_family = "JetBrains Mono Nerd Font"
 font_size = 14.0
 line_spacing = 1.0
 padding = 2.0
+ui_scale = 1.0
 scrollback_lines = 20000
 scroll_speed = 3
 theme = "tokyo-night"
@@ -84,6 +88,10 @@ shell = "/bin/bash"
 # 安全默认值。开启后，SSH 中的程序也能读取宿主剪贴板。
 allow_clipboard_read = false
 ```
+
+`Ctrl+=`、`Ctrl+-` 和 `Ctrl+滚轮` 只调整当前运行时字号，不再改写配置；`Ctrl+0` 回到 `font_size`。`ui_scale` 会统一缩放标签栏、状态栏、设置面板和命中区域。设置面板中的持久修改仍会自动保存。
+
+如果 `config.toml` 或 `keybindings.toml` 编辑出错，jterm3 会保留最后一次可用配置并在窗口内显示诊断。主配置有错误时自动保存会暂停，避免默认值覆盖原文件；修正文件后会自动恢复热重载。
 
 内置主题包括 Dark、Light、Monokai、Dracula、Nord、Gruvbox Dark、Tokyo Night、One Dark、Catppuccin Mocha 和 Solarized Light。自定义主题保存在 `~/.config/jterm3/themes/`。
 
@@ -101,3 +109,5 @@ cargo build --release --all-features --locked
 ```
 
 CI 对格式、零警告 Clippy、全量测试和 release 构建分别设有独立质量门槛。
+
+调试构建可设置 `JTERM3_DEBUG=1` 输出有界的协议字节预览。

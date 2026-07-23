@@ -359,7 +359,7 @@ pub fn open_link(link: &Link, cwd: Option<&Path>) -> Result<(), Box<dyn std::err
         }
         LinkType::IpAddress => {
             // IP 地址可以用浏览器打开或显示 whois 信息
-            open_url(&format!("http://{}", &link.text))?;
+            open_url(&format!("http://{}", link.text))?;
         }
     }
     Ok(())

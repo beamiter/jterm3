@@ -682,16 +682,20 @@ impl ScrollbackLine {
                 }
             }
 
-            // Format: [char_len:1][char_bytes][fg][bg][flags:1][wide_bits:1][run:1]
+            // Format:
+            // [char_len:1][char_bytes][fg][bg][style_flags:1][extra_flags:1][run:1]
+            // style_flags uses every bit, so blink shares extra_flags with the
+            // two wide-character markers.
             buf.push(ch_bytes.len() as u8);
             buf.extend_from_slice(ch_bytes);
             Self::encode_color(&cell.foreground, &mut buf);
             Self::encode_color(&cell.background, &mut buf);
             let f = Self::encode_flags(&cell.flags);
             buf.push(f);
-            let wide_bits = if cell.flags.wide() { 1u8 } else { 0 }
-                | if cell.flags.wide_continuation() { 2 } else { 0 };
-            buf.push(wide_bits);
+            let extra_flags = if cell.flags.wide() { 1u8 } else { 0 }
+                | if cell.flags.wide_continuation() { 2 } else { 0 }
+                | if cell.flags.blink() { 4 } else { 0 };
+            buf.push(extra_flags);
             buf.push(run);
 
             i += run as usize;
@@ -718,14 +722,15 @@ impl ScrollbackLine {
             let bg = Self::decode_color(data, &mut pos);
             let f = data.get(pos).copied().unwrap_or(0);
             pos += 1;
-            let wide_bits = data.get(pos).copied().unwrap_or(0);
+            let extra_flags = data.get(pos).copied().unwrap_or(0);
             pos += 1;
             let run = data.get(pos).copied().unwrap_or(1).max(1);
             pos += 1;
 
             let mut flags = Self::decode_flags(f);
-            flags.set_wide(wide_bits & 1 != 0);
-            flags.set_wide_continuation(wide_bits & 2 != 0);
+            flags.set_wide(extra_flags & 1 != 0);
+            flags.set_wide_continuation(extra_flags & 2 != 0);
+            flags.set_blink(extra_flags & 4 != 0);
 
             let cell = TerminalCell {
                 character: ch,
@@ -3210,10 +3215,10 @@ impl TerminalState {
                 }
             }
             'p' => {
-                if intermediates == [b'!'] && private_prefix.is_none() {
+                if intermediates == *b"!" && private_prefix.is_none() {
                     // DECSTR (CSI ! p) - soft terminal reset.
                     self.soft_reset();
-                } else if private_prefix == Some(b'?') && intermediates == [b'$'] {
+                } else if private_prefix == Some(b'?') && intermediates == *b"$" {
                     for &mode in params {
                         self.report_private_mode_status(mode);
                     }
@@ -3326,7 +3331,7 @@ impl TerminalState {
                 }
 
                 // DECSCUSR - Set cursor style
-                if private_prefix.is_none() && intermediates == [b' '] {
+                if private_prefix.is_none() && intermediates == *b" " {
                     let shape = params.first().copied().unwrap_or(0) as u8;
                     self.cursor_shape = match shape {
                         0..=2 => CursorShape::Block,
@@ -4895,6 +4900,39 @@ mod tests {
         ClipboardReadKind, Color, CursorShape, ScrollbackLine, TerminalCell, TerminalState,
         MAX_TERMINAL_TITLE_CHARS,
     };
+
+    #[test]
+    fn scrollback_compression_round_trips_blink_style() {
+        let mut cells = vec![TerminalCell::default(); 4];
+        cells[0].character = 'A';
+        cells[0].foreground = Color::BrightCyan;
+        cells[0].flags.set_blink(true);
+        cells[1] = cells[0];
+        cells[2].character = 'B';
+        cells[2].flags.set_strikethrough(true);
+
+        let restored = ScrollbackLine::compress(&cells, false).decompress();
+
+        assert_eq!(restored.len(), cells.len());
+        for (column, (actual, expected)) in restored.iter().zip(&cells).enumerate() {
+            assert_eq!(
+                actual.character, expected.character,
+                "character differs at column {column}"
+            );
+            assert_eq!(
+                actual.foreground, expected.foreground,
+                "foreground differs at column {column}"
+            );
+            assert_eq!(
+                actual.background, expected.background,
+                "background differs at column {column}"
+            );
+            assert_eq!(
+                actual.flags, expected.flags,
+                "flags differ at column {column}"
+            );
+        }
+    }
 
     #[test]
     fn resize_preserves_full_screen_scroll_region() {

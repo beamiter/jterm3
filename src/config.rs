@@ -4,6 +4,15 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// A configuration load outcome keeps the usable value separate from any
+/// diagnostic. This lets the application start with safe defaults while also
+/// preventing a malformed user file from being silently overwritten.
+#[derive(Debug, Clone)]
+pub struct ConfigLoad {
+    pub config: Config,
+    pub diagnostic: Option<String>,
+}
+
 // Nerd Font priority list
 const NERD_FONT_CANDIDATES: &[&str] = &[
     "SauceCodePro Nerd Font",
@@ -404,30 +413,53 @@ impl Config {
         self
     }
 
-    pub fn load() -> Self {
-        if let Ok(config_path) = Self::config_path() {
-            if config_path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&config_path) {
-                    match Self::from_toml(&content) {
-                        Ok(config) => {
-                            eprintln!("[Config] Loaded from {}", config_path.display());
-                            eprintln!("[Config] Font: {}", config.font_family);
-                            return config;
-                        }
-                        Err(error) => {
-                            eprintln!(
-                                "[Config] Failed to parse {}: {error}",
-                                config_path.display()
-                            );
-                        }
-                    }
+    pub fn load_with_diagnostics() -> ConfigLoad {
+        let config_path = match Self::config_path() {
+            Ok(path) => path,
+            Err(error) => {
+                let diagnostic = format!("Cannot locate the jterm3 config directory: {error}");
+                eprintln!("[Config] {diagnostic}");
+                return ConfigLoad {
+                    config: Self::default(),
+                    diagnostic: Some(diagnostic),
+                };
+            }
+        };
+
+        if !config_path.exists() {
+            eprintln!("[Config] Using default configuration");
+            return ConfigLoad {
+                config: Self::default(),
+                diagnostic: None,
+            };
+        }
+
+        match Self::load_path(&config_path) {
+            Ok(config) => {
+                eprintln!("[Config] Loaded from {}", config_path.display());
+                eprintln!("[Config] Font: {}", config.font_family);
+                ConfigLoad {
+                    config,
+                    diagnostic: None,
+                }
+            }
+            Err(error) => {
+                eprintln!("[Config] {error}");
+                ConfigLoad {
+                    config: Self::default(),
+                    diagnostic: Some(error),
                 }
             }
         }
-        eprintln!("[Config] Using default configuration");
-        let config = Self::default();
-        eprintln!("[Config] Font: {}", config.font_family);
-        config
+    }
+
+    /// Read and validate one configuration file with path-rich errors suitable
+    /// for an in-app diagnostic.
+    pub fn load_path(path: &std::path::Path) -> Result<Self, String> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
+        Self::from_toml(&content)
+            .map_err(|error| format!("Cannot parse {}: {error}", path.display()))
     }
 
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -595,5 +627,18 @@ mod tests {
 
         assert_eq!(normalized.theme, default_theme());
         assert_eq!(normalized.shell, None);
+    }
+
+    #[test]
+    fn load_path_reports_the_path_and_parse_location() {
+        let path =
+            std::env::temp_dir().join(format!("jterm3-config-{}.toml", uuid::Uuid::new_v4()));
+        std::fs::write(&path, "font_size = [not-valid]\n").expect("write malformed config");
+
+        let error = Config::load_path(&path).expect_err("malformed TOML should fail");
+
+        assert!(error.contains(&path.display().to_string()));
+        assert!(error.contains("font_size"));
+        std::fs::remove_file(path).expect("remove malformed config");
     }
 }
