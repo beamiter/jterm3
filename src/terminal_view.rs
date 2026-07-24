@@ -445,6 +445,18 @@ fn terminal_glyph_font(
     }
 }
 
+/// Basic shaping never falls back to another font, so any glyph the routed
+/// family lacks renders as the .notdef box. Non-ASCII cells use Advanced
+/// shaping, which searches every loaded system font for the glyph; ASCII
+/// stays on the cheaper Basic shaper.
+fn glyph_shaping(content: &str) -> text::Shaping {
+    if content.is_ascii() {
+        text::Shaping::Basic
+    } else {
+        text::Shaping::Advanced
+    }
+}
+
 fn solid_quad(bounds: Rectangle) -> Quad {
     Quad {
         bounds,
@@ -458,9 +470,23 @@ fn solid_quad(bounds: Rectangle) -> Quad {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        should_use_cjk_fallback_font, should_use_math_symbol_fallback_font,
+        glyph_shaping, should_use_cjk_fallback_font, should_use_math_symbol_fallback_font,
         should_use_nerd_symbol_fallback_font, should_use_symbol_fallback_font, terminal_glyph_font,
     };
+
+    #[test]
+    fn non_ascii_glyphs_use_advanced_shaping_for_font_fallback() {
+        use iced::advanced::text::Shaping;
+        // ASCII stays on the fast path.
+        assert_eq!(glyph_shaping("A"), Shaping::Basic);
+        assert_eq!(glyph_shaping("ls -la"), Shaping::Basic);
+        // Symbols the routed fallback font may lack (e.g. U+23BF `⎿` is
+        // missing from DejaVu Sans Mono) need Advanced shaping so
+        // cosmic-text can fall back across the system font database.
+        assert_eq!(glyph_shaping("⎿"), Shaping::Advanced);
+        assert_eq!(glyph_shaping("※"), Shaping::Advanced);
+        assert_eq!(glyph_shaping("中"), Shaping::Advanced);
+    }
 
     #[test]
     fn terminal_symbols_use_fallback_font() {
@@ -940,16 +966,18 @@ where
                     return;
                 }
                 let rx = ox + start as f32 * cw;
+                let content = std::mem::take(text);
+                let shaping = glyph_shaping(&content);
                 renderer.fill_text(
                     Text {
-                        content: std::mem::take(text),
+                        content,
                         bounds: Size::new(cw * *len as f32, ch),
                         size: Pixels(font_size),
                         line_height: text::LineHeight::Absolute(Pixels(ch)),
                         font: run_font,
                         align_x: text::Alignment::Left,
                         align_y: iced::alignment::Vertical::Center,
-                        shaping: text::Shaping::Basic,
+                        shaping,
                         wrapping: text::Wrapping::None,
                     },
                     Point::new(rx, y + ch / 2.0),
@@ -1062,16 +1090,18 @@ where
                         run_font,
                     );
                     if printable {
+                        let content = glyph.to_string();
+                        let shaping = glyph_shaping(&content);
                         renderer.fill_text(
                             Text {
-                                content: glyph.to_string(),
+                                content,
                                 bounds: Size::new(cw * span, ch),
                                 size: Pixels(font_size),
                                 line_height: text::LineHeight::Absolute(Pixels(ch)),
                                 font: glyph_font,
                                 align_x: text::Alignment::Center,
                                 align_y: iced::alignment::Vertical::Center,
-                                shaping: text::Shaping::Basic,
+                                shaping,
                                 wrapping: text::Wrapping::None,
                             },
                             Point::new(x + cw * span / 2.0, y + ch / 2.0),
@@ -1163,9 +1193,11 @@ where
                     if let Some(cell) = cursor_cell {
                         let glyph = cell.character;
                         if glyph != ' ' && glyph != '\0' {
+                            let content = glyph.to_string();
+                            let shaping = glyph_shaping(&content);
                             renderer.fill_text(
                                 Text {
-                                    content: glyph.to_string(),
+                                    content,
                                     bounds: Size::new(cursor_w, ch),
                                     size: Pixels(self.metrics.font_size),
                                     line_height: text::LineHeight::Absolute(Pixels(ch)),
@@ -1180,7 +1212,7 @@ where
                                     ),
                                     align_x: text::Alignment::Center,
                                     align_y: iced::alignment::Vertical::Center,
-                                    shaping: text::Shaping::Basic,
+                                    shaping,
                                     wrapping: text::Wrapping::None,
                                 },
                                 Point::new(x + cursor_w / 2.0, y + ch / 2.0),
